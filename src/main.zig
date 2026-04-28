@@ -3185,29 +3185,54 @@ fn runOutdated(alloc: std.mem.Allocator) void {
     defer if (installed_debs.len > 0) alloc.free(installed_debs);
 
     if (installed_debs.len > 0) deb_check: {
-        // Quick index fetch to compare versions
-        const distro_info = nb.deb_distro.detect(alloc);
+        // Fetch indices from every configured APT source so we honour custom
+        // mirrors and PPAs the user has set up via /etc/apt/sources.list[.d/*].
         const deb_arch = platform.deb_arch;
+
+        var sources_buf: std.ArrayList(EffectiveSource) = .empty;
+        defer sources_buf.deinit(alloc);
+        var maybe_discovered: ?nb.deb_sources.Sources = null;
+        defer if (maybe_discovered) |*s| s.deinit();
+        discoverInstallSources(alloc, deb_arch, &sources_buf, &maybe_discovered);
+        if (sources_buf.items.len == 0) break :deb_check;
 
         var client: std.http.Client = .{ .allocator = alloc, .io = g_io };
         defer client.deinit();
 
-        var url_buf: [512]u8 = undefined;
-        const index_url = std.fmt.bufPrint(&url_buf, "{s}/dists/{s}/main/binary-{s}/Packages.gz", .{
-            distro_info.mirror, distro_info.codename, deb_arch,
-        }) catch break :deb_check;
+        var all_pkgs_list: std.ArrayList(nb.deb_index.DebPackage) = .empty;
+        defer all_pkgs_list.deinit(alloc);
 
-        const index_gz = httpGetToMemory(alloc, &client, index_url) orelse break :deb_check;
-        defer alloc.free(index_gz);
+        var outdated_parsed: std.ArrayList(nb.deb_index.ParsedIndex) = .empty;
+        defer {
+            for (outdated_parsed.items) |*pi| pi.deinit();
+            outdated_parsed.deinit(alloc);
+        }
 
-        const index_data = nb.deb_extract.decompressGzip(alloc, index_gz) catch break :deb_check;
-        defer alloc.free(index_data);
+        for (sources_buf.items) |src| {
+            for (src.components) |component| {
+                var url_buf: [768]u8 = undefined;
+                const index_url = std.fmt.bufPrint(&url_buf, "{s}/dists/{s}/{s}/binary-{s}/Packages.gz", .{
+                    src.mirror, src.suite, component, deb_arch,
+                }) catch continue;
 
-        var parsed = nb.deb_index.parsePackagesIndex(alloc, index_data) catch break :deb_check;
-        defer parsed.deinit();
-        const pkgs = parsed.packages;
+                const index_gz = httpGetToMemory(alloc, &client, index_url) orelse continue;
+                defer alloc.free(index_gz);
 
-        var idx = nb.deb_index.buildIndex(alloc, pkgs) catch break :deb_check;
+                const index_data = nb.deb_extract.decompressGzip(alloc, index_gz) catch continue;
+                defer alloc.free(index_data);
+
+                var parsed = nb.deb_index.parsePackagesIndexFromMirror(alloc, index_data, src.mirror) catch continue;
+                for (parsed.packages) |pkg| all_pkgs_list.append(alloc, pkg) catch continue;
+                outdated_parsed.append(alloc, parsed) catch {
+                    parsed.deinit();
+                    continue;
+                };
+            }
+        }
+
+        if (all_pkgs_list.items.len == 0) break :deb_check;
+
+        var idx = nb.deb_index.buildIndex(alloc, all_pkgs_list.items) catch break :deb_check;
         defer idx.deinit();
 
         for (installed_debs) |deb| {
@@ -3613,6 +3638,66 @@ const DebInstallOptions = struct {
     no_verify: bool = false,
 };
 
+/// One row in the resolved set of APT sources to fetch from.
+const EffectiveSource = struct {
+    mirror: []const u8,
+    suite: []const u8,
+    components: []const []const u8,
+};
+
+/// Discover effective APT sources for a `nb --deb` operation:
+///   1. Parse `/etc/apt/sources.list` and `/etc/apt/sources.list.d/*` and use
+///      every enabled `deb` row whose `Architectures` list contains the
+///      current target arch (or is empty / unspecified).
+///   2. If discovery yields zero rows (non-Linux, missing files, parse
+///      errors, no match for our arch), fall back to the hardcoded
+///      distro defaults from `/etc/os-release`.
+///
+/// On success, the caller owns the returned slice (free with `alloc.free`)
+/// and the optional `discovered_out` (call `.deinit()` to free the parse
+/// arena that backs every string referenced by the slice).
+fn discoverInstallSources(
+    alloc: std.mem.Allocator,
+    arch: []const u8,
+    sources_out: *std.ArrayList(EffectiveSource),
+    discovered_out: *?nb.deb_sources.Sources,
+) void {
+    if (nb.deb_sources.discover(alloc)) |discovered_val| {
+        var discovered = discovered_val;
+        var kept: usize = 0;
+        for (discovered.repositories) |repo| {
+            if (repo.architectures.len > 0) {
+                var arch_match = false;
+                for (repo.architectures) |a| if (std.mem.eql(u8, a, arch)) {
+                    arch_match = true;
+                    break;
+                };
+                if (!arch_match) continue;
+            }
+            sources_out.append(alloc, .{
+                .mirror = repo.uri,
+                .suite = repo.suite,
+                .components = repo.components,
+            }) catch continue;
+            kept += 1;
+        }
+        if (kept == 0) {
+            discovered.deinit();
+        } else {
+            discovered_out.* = discovered;
+        }
+    } else |_| {}
+
+    if (sources_out.items.len == 0) {
+        const distro = nb.deb_distro.detect(alloc);
+        sources_out.append(alloc, .{
+            .mirror = distro.mirror,
+            .suite = distro.codename,
+            .components = nb.deb_distro.getComponents(distro.id),
+        }) catch {};
+    }
+}
+
 
 /// Install .deb packages from Ubuntu/Debian repositories (Linux only).
 fn runDebInstall(alloc: std.mem.Allocator, packages: []const []const u8, repo_spec: ?[]const u8, opts: DebInstallOptions) void {
@@ -3630,62 +3715,70 @@ fn runDebInstall(alloc: std.mem.Allocator, packages: []const []const u8, repo_sp
     const t_start = milliTimestamp();
     stdout.print("==> Fetching package index...\n", .{}) catch {};
 
-    // Use --repo override or auto-detect distro
-    var mirror: []const u8 = undefined;
-    var dist: []const u8 = undefined;
-    var distro_id: []const u8 = "ubuntu";
     const arch = platform.deb_arch;
-    var components: []const []const u8 = undefined;
+
+    // Resolve sources: --repo override → /etc/apt/sources.list[.d/*] → distro defaults.
+    var sources_buf: std.ArrayList(EffectiveSource) = .empty;
+    defer sources_buf.deinit(alloc);
+
+    var maybe_discovered: ?nb.deb_sources.Sources = null;
+    defer if (maybe_discovered) |*s| s.deinit();
+
+    var fallback_components_storage: [2][]const u8 = .{ "main", "universe" };
 
     if (repo_spec) |spec| {
         // Parse repo spec: "http://mirror/path codename comp1 comp2"
         var parts = std.mem.splitScalar(u8, spec, ' ');
-        mirror = parts.next() orelse {
+        const m = parts.next() orelse {
             stderr.print("nb: invalid --repo spec (expected: mirror codename component...)\n", .{}) catch {};
             return;
         };
-        dist = parts.next() orelse "noble";
+        const d = parts.next() orelse "noble";
         var comp_list: std.ArrayList([]const u8) = .empty;
         defer comp_list.deinit(alloc);
-        while (parts.next()) |comp| {
-            comp_list.append(alloc, comp) catch {};
-        }
-        components = if (comp_list.items.len > 0)
-            (comp_list.toOwnedSlice(alloc) catch &.{ "main", "universe" })
+        while (parts.next()) |comp| comp_list.append(alloc, comp) catch {};
+        const comps_slice: []const []const u8 = if (comp_list.items.len > 0)
+            (comp_list.toOwnedSlice(alloc) catch fallback_components_storage[0..])
         else
-            &.{ "main", "universe" };
+            fallback_components_storage[0..];
+        sources_buf.append(alloc, .{ .mirror = m, .suite = d, .components = comps_slice }) catch return;
     } else {
-        const distro = nb.deb_distro.detect(alloc);
-        distro_id = distro.id;
-        mirror = distro.mirror;
-        dist = distro.codename;
-        components = nb.deb_distro.getComponents(distro.id);
+        discoverInstallSources(alloc, arch, &sources_buf, &maybe_discovered);
     }
 
-    // Validate mirror URL
-    if (!std.mem.startsWith(u8, mirror, "http://") and !std.mem.startsWith(u8, mirror, "https://")) {
-        stderr.print("nb: invalid mirror URL (must start with http:// or https://): {s}\n", .{mirror}) catch {};
+    if (sources_buf.items.len == 0) {
+        stderr.print("nb: no usable APT sources found\n", .{}) catch {};
         return;
     }
-    for (mirror) |c| {
-        if (c < 0x20 or c == 0x7f) {
-            stderr.print("nb: invalid mirror URL (contains control characters)\n", .{}) catch {};
+
+    // Validate every mirror URL.
+    for (sources_buf.items) |*src| {
+        if (!std.mem.startsWith(u8, src.mirror, "http://") and !std.mem.startsWith(u8, src.mirror, "https://")) {
+            stderr.print("nb: invalid mirror URL (must start with http:// or https://): {s}\n", .{src.mirror}) catch {};
             return;
         }
-    }
-    // Strip trailing slashes
-    while (mirror.len > 0 and mirror[mirror.len - 1] == '/') {
-        mirror = mirror[0 .. mirror.len - 1];
+        for (src.mirror) |c| {
+            if (c < 0x20 or c == 0x7f) {
+                stderr.print("nb: invalid mirror URL (contains control characters)\n", .{}) catch {};
+                return;
+            }
+        }
+        while (src.mirror.len > 0 and src.mirror[src.mirror.len - 1] == '/') {
+            src.mirror = src.mirror[0 .. src.mirror.len - 1];
+        }
     }
 
-    stdout.print("    mirror={s} codename={s} arch={s}\n", .{ mirror, dist, arch }) catch {};
+    stdout.print("    arch={s} sources={d}\n", .{ arch, sources_buf.items.len }) catch {};
+    for (sources_buf.items) |src| {
+        stdout.print("      {s} {s} ({d} comp)\n", .{ src.mirror, src.suite, src.components.len }) catch {};
+    }
 
     // Native HTTP client — shared across all .deb downloads (connection reuse)
     // (Index fetch uses per-thread clients since std.http.Client is not thread-safe)
     var client: std.http.Client = .{ .allocator = alloc, .io = g_io };
     defer client.deinit();
 
-    // Fetch and merge package indices from all components
+    // Fetch and merge package indices from all (source, component) pairs.
     var all_pkgs_list: std.ArrayList(nb.deb_index.DebPackage) = .empty;
     defer all_pkgs_list.deinit(alloc);
 
@@ -3696,54 +3789,51 @@ fn runDebInstall(alloc: std.mem.Allocator, packages: []const []const u8, repo_sp
         parsed_indices.deinit(alloc);
     }
 
-    for (components) |component| {
-        // Try binary cache first (instant deserialization, no HTTP/gzip/parse)
-        if (nb.deb_index.readCachedBinaryIndex(alloc, distro_id, dist, component, arch)) |cached| {
-            stdout.print("    {s}: cache hit ({d} pkgs)\n", .{ component, cached.packages.len }) catch {};
-            var parsed = cached;
-            for (parsed.packages) |pkg| {
-                all_pkgs_list.append(alloc, pkg) catch continue;
+    for (sources_buf.items) |src| {
+        for (src.components) |component| {
+            const key = nb.deb_index.cacheKeyForSource(src.mirror, src.suite, component, arch);
+
+            if (nb.deb_index.readCachedBinaryIndexForSource(alloc, &key, src.suite, component, arch)) |cached| {
+                stdout.print("    {s} {s}/{s}: cache hit ({d} pkgs)\n", .{ src.mirror, src.suite, component, cached.packages.len }) catch {};
+                var parsed = cached;
+                for (parsed.packages) |pkg| all_pkgs_list.append(alloc, pkg) catch continue;
+                parsed_indices.append(alloc, parsed) catch {
+                    parsed.deinit();
+                    continue;
+                };
+                continue;
             }
+            stdout.print("    {s} {s}/{s}: fetching...\n", .{ src.mirror, src.suite, component }) catch {};
+
+            var url_buf: [768]u8 = undefined;
+            const index_url = std.fmt.bufPrint(&url_buf, "{s}/dists/{s}/{s}/binary-{s}/Packages.gz", .{
+                src.mirror, src.suite, component, arch,
+            }) catch continue;
+
+            const index_gz = httpGetToMemory(alloc, &client, index_url) orelse {
+                stderr.print("nb: warning: failed to fetch {s} {s}/{s}\n", .{ src.mirror, src.suite, component }) catch {};
+                continue;
+            };
+            defer alloc.free(index_gz);
+
+            const index_data = nb.deb_extract.decompressGzip(alloc, index_gz) catch {
+                stderr.print("nb: warning: failed to decompress {s} {s}/{s}\n", .{ src.mirror, src.suite, component }) catch {};
+                continue;
+            };
+            defer alloc.free(index_data);
+
+            var parsed = nb.deb_index.parsePackagesIndexFromMirror(alloc, index_data, src.mirror) catch continue;
+
+            nb.deb_index.writeCachedBinaryIndexForSource(&key, src.suite, component, arch, alloc, parsed.packages);
+
+            for (parsed.packages) |pkg| all_pkgs_list.append(alloc, pkg) catch continue;
             parsed_indices.append(alloc, parsed) catch {
                 parsed.deinit();
                 continue;
             };
-            continue;
         }
-        stdout.print("    {s}: cache miss, fetching...\n", .{component}) catch {};
-
-        // Cache miss — fetch from mirror
-        var url_buf: [512]u8 = undefined;
-        const index_url = std.fmt.bufPrint(&url_buf, "{s}/dists/{s}/{s}/binary-{s}/Packages.gz", .{
-            mirror, dist, component, arch,
-        }) catch continue;
-
-        const index_gz = httpGetToMemory(alloc, &client, index_url) orelse {
-            stderr.print("nb: warning: failed to fetch {s} index\n", .{component}) catch {};
-            continue;
-        };
-        defer alloc.free(index_gz);
-
-        const index_data = nb.deb_extract.decompressGzip(alloc, index_gz) catch {
-            stderr.print("nb: warning: failed to decompress {s} index\n", .{component}) catch {};
-            continue;
-        };
-        defer alloc.free(index_data);
-
-        var parsed = nb.deb_index.parsePackagesIndex(alloc, index_data) catch continue;
-
-        // Write binary cache for next time
-        nb.deb_index.writeCachedBinaryIndex(distro_id, dist, component, arch, alloc, parsed.packages);
-
-        for (parsed.packages) |pkg| {
-            all_pkgs_list.append(alloc, pkg) catch continue;
-        }
-
-        parsed_indices.append(alloc, parsed) catch {
-            parsed.deinit();
-            continue;
-        };
     }
+
     if (all_pkgs_list.items.len == 0) {
         stderr.print("nb: failed to fetch any package index\n", .{}) catch {};
         return;
@@ -3817,7 +3907,8 @@ fn runDebInstall(alloc: std.mem.Allocator, packages: []const []const u8, repo_sp
             } else |_| {}
 
             var url_buf: [1024]u8 = undefined;
-            const dl_url = std.fmt.bufPrint(&url_buf, "{s}/{s}", .{ mirror, pkg.filename }) catch continue;
+            const pkg_mirror = if (pkg.mirror.len > 0) pkg.mirror else sources_buf.items[0].mirror;
+            const dl_url = std.fmt.bufPrint(&url_buf, "{s}/{s}", .{ pkg_mirror, pkg.filename }) catch continue;
 
             var item: DebDlItem = undefined;
             @memcpy(item.url_storage[0..dl_url.len], dl_url);
@@ -4112,12 +4203,17 @@ fn runDebUpgrade(alloc: std.mem.Allocator) void {
         return;
     }
 
-    // Re-fetch package index to compare versions
-    const distro = nb.deb_distro.detect(alloc);
-    const mirror = distro.mirror;
-    const dist = distro.codename;
+    // Re-fetch package indices from every configured APT source.
     const arch = platform.deb_arch;
-    const components = nb.deb_distro.getComponents(distro.id);
+    var sources_buf: std.ArrayList(EffectiveSource) = .empty;
+    defer sources_buf.deinit(alloc);
+    var maybe_discovered: ?nb.deb_sources.Sources = null;
+    defer if (maybe_discovered) |*s| s.deinit();
+    discoverInstallSources(alloc, arch, &sources_buf, &maybe_discovered);
+    if (sources_buf.items.len == 0) {
+        stderr.print("nb: no usable APT sources found\n", .{}) catch {};
+        return;
+    }
 
     var client: std.http.Client = .{ .allocator = alloc, .io = g_io };
     defer client.deinit();
@@ -4131,28 +4227,27 @@ fn runDebUpgrade(alloc: std.mem.Allocator) void {
         upgrade_parsed.deinit(alloc);
     }
 
-    for (components) |component| {
-        var url_buf: [512]u8 = undefined;
-        const index_url = std.fmt.bufPrint(&url_buf, "{s}/dists/{s}/{s}/binary-{s}/Packages.gz", .{
-            mirror, dist, component, arch,
-        }) catch continue;
+    for (sources_buf.items) |src| {
+        for (src.components) |component| {
+            var url_buf: [768]u8 = undefined;
+            const index_url = std.fmt.bufPrint(&url_buf, "{s}/dists/{s}/{s}/binary-{s}/Packages.gz", .{
+                src.mirror, src.suite, component, arch,
+            }) catch continue;
 
-        const index_gz = httpGetToMemory(alloc, &client, index_url) orelse continue;
-        defer alloc.free(index_gz);
+            const index_gz = httpGetToMemory(alloc, &client, index_url) orelse continue;
+            defer alloc.free(index_gz);
 
-        const index_data = nb.deb_extract.decompressGzip(alloc, index_gz) catch continue;
-        defer alloc.free(index_data);
+            const index_data = nb.deb_extract.decompressGzip(alloc, index_gz) catch continue;
+            defer alloc.free(index_data);
 
-        var parsed = nb.deb_index.parsePackagesIndex(alloc, index_data) catch continue;
+            var parsed = nb.deb_index.parsePackagesIndexFromMirror(alloc, index_data, src.mirror) catch continue;
 
-        for (parsed.packages) |pkg| {
-            all_pkgs_list.append(alloc, pkg) catch continue;
+            for (parsed.packages) |pkg| all_pkgs_list.append(alloc, pkg) catch continue;
+            upgrade_parsed.append(alloc, parsed) catch {
+                parsed.deinit();
+                continue;
+            };
         }
-
-        upgrade_parsed.append(alloc, parsed) catch {
-            parsed.deinit();
-            continue;
-        };
     }
 
     var index_map = nb.deb_index.buildIndex(alloc, all_pkgs_list.items) catch {

@@ -18,6 +18,9 @@ pub const DebPackage = struct {
     sha256: []const u8,
     size: u64,
     description: []const u8,
+    /// Mirror base URL the package was discovered on. Empty means "use the
+    /// caller's default mirror" (legacy parses / hand-built test fixtures).
+    mirror: []const u8 = "",
 
     /// Legacy per-field deinit — only needed when packages were NOT parsed via arena.
     pub fn deinit(self: DebPackage, alloc: std.mem.Allocator) void {
@@ -28,6 +31,7 @@ pub const DebPackage = struct {
         alloc.free(self.filename);
         alloc.free(self.sha256);
         alloc.free(self.description);
+        if (self.mirror.len > 0) alloc.free(self.mirror);
     }
 };
 
@@ -46,9 +50,22 @@ pub const ParsedIndex = struct {
 /// All string data is allocated from an internal ArenaAllocator — call
 /// result.deinit() to free everything at once.
 pub fn parsePackagesIndex(alloc: std.mem.Allocator, data: []const u8) !ParsedIndex {
+    return parsePackagesIndexFromMirror(alloc, data, "");
+}
+
+/// Same as `parsePackagesIndex` but tags every parsed package with the mirror
+/// base URL it came from, so the install pipeline can route downloads to the
+/// correct repository when multiple sources are merged into one index.
+pub fn parsePackagesIndexFromMirror(
+    alloc: std.mem.Allocator,
+    data: []const u8,
+    mirror: []const u8,
+) !ParsedIndex {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
+
+    const mirror_owned = if (mirror.len == 0) "" else try arena_alloc.dupe(u8, mirror);
 
     var packages: std.ArrayList(DebPackage) = .empty;
 
@@ -57,7 +74,9 @@ pub fn parsePackagesIndex(alloc: std.mem.Allocator, data: []const u8) !ParsedInd
     while (blocks.next()) |block| {
         if (block.len == 0) continue;
         if (parseOnePackage(arena_alloc, block)) |pkg| {
-            packages.append(arena_alloc, pkg) catch continue;
+            var with_mirror = pkg;
+            with_mirror.mirror = mirror_owned;
+            packages.append(arena_alloc, with_mirror) catch continue;
         }
     }
 
@@ -182,12 +201,80 @@ pub fn buildProvidesMap(alloc: std.mem.Allocator, packages: []const DebPackage) 
 const paths = @import("../platform/paths.zig");
 const cache_max_age_ns: i128 = 3600 * std.time.ns_per_s; // 1 hour
 const NBIX_MAGIC = [4]u8{ 'N', 'B', 'I', 'X' };
-const NBIX_VERSION: u32 = 2; // v2: u32 field lengths (v1 used u16, could overflow)
+const NBIX_VERSION: u32 = 3; // v3: adds per-package mirror URL (multi-source support)
 
 fn binaryCachePath(buf: []u8, distro_id: []const u8, codename: []const u8, component: []const u8, arch: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}-{s}-{s}-{s}.nbix", .{
         paths.APT_CACHE_DIR, distro_id, codename, component, arch,
     }) catch null;
+}
+
+/// Stable 16-char hex hash of (mirror, codename, component, arch). Used as
+/// the cache key when the same machine pulls indices from multiple sources
+/// (e.g. archive.ubuntu.com + a third-party PPA).
+pub fn cacheKeyForSource(mirror: []const u8, codename: []const u8, component: []const u8, arch: []const u8) [16]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(mirror);
+    hasher.update("|");
+    hasher.update(codename);
+    hasher.update("|");
+    hasher.update(component);
+    hasher.update("|");
+    hasher.update(arch);
+    const h = hasher.final();
+    var out: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&out, "{x:0>16}", .{h}) catch unreachable;
+    return out;
+}
+
+fn sourceCachePath(buf: []u8, key: []const u8, codename: []const u8, component: []const u8, arch: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/src-{s}-{s}-{s}-{s}.nbix", .{
+        paths.APT_CACHE_DIR, key, codename, component, arch,
+    }) catch null;
+}
+
+/// Per-source variant of `readCachedBinaryIndex`. `cache_key` should come from
+/// `cacheKeyForSource`.
+pub fn readCachedBinaryIndexForSource(alloc: std.mem.Allocator, cache_key: []const u8, codename: []const u8, component: []const u8, arch: []const u8) ?ParsedIndex {
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [512]u8 = undefined;
+    const cache_file = sourceCachePath(&path_buf, cache_key, codename, component, arch) orelse return null;
+
+    const file = std.Io.Dir.openFileAbsolute(lib_io, cache_file, .{}) catch return null;
+    defer file.close(lib_io);
+
+    const stat = file.stat(lib_io) catch return null;
+    const size = stat.size;
+    if (size < 12 or size > 100 * 1024 * 1024) return null;
+
+    const data = alloc.alloc(u8, @intCast(size)) catch return null;
+    defer alloc.free(data);
+
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const n = file.readPositional(lib_io, &.{data[offset..]}, @intCast(offset)) catch return null;
+        if (n == 0) break;
+        offset += n;
+    }
+    if (offset != @as(usize, @intCast(size))) return null;
+
+    return deserializeIndex(alloc, data) catch null;
+}
+
+/// Per-source variant of `writeCachedBinaryIndex`.
+pub fn writeCachedBinaryIndexForSource(cache_key: []const u8, codename: []const u8, component: []const u8, arch: []const u8, alloc: std.mem.Allocator, packages: []const DebPackage) void {
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    ensureCacheDir();
+
+    var path_buf: [512]u8 = undefined;
+    const cache_file = sourceCachePath(&path_buf, cache_key, codename, component, arch) orelse return;
+
+    const serialized = serializeIndex(alloc, packages) catch return;
+    defer alloc.free(serialized);
+
+    const file = std.Io.Dir.createFileAbsolute(lib_io, cache_file, .{}) catch return;
+    defer file.close(lib_io);
+    file.writeStreamingAll(lib_io, serialized) catch {};
 }
 
 fn ensureCacheDir() void {
@@ -214,6 +301,7 @@ pub fn serializeIndex(alloc: std.mem.Allocator, packages: []const DebPackage) ![
         total += 4 + pkg.sha256.len;
         total += 8; // size u64
         total += 4 + pkg.description.len;
+        total += 4 + pkg.mirror.len;
     }
 
     const buf = try alloc.alloc(u8, total);
@@ -242,6 +330,11 @@ pub fn serializeIndex(alloc: std.mem.Allocator, packages: []const DebPackage) ![
         pos += 4;
         @memcpy(buf[pos..][0..pkg.description.len], pkg.description);
         pos += pkg.description.len;
+        // mirror (added in NBIX_VERSION 3)
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(pkg.mirror.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..pkg.mirror.len], pkg.mirror);
+        pos += pkg.mirror.len;
     }
 
     return buf;
@@ -288,6 +381,14 @@ pub fn deserializeIndex(alloc: std.mem.Allocator, data: []const u8) !ParsedIndex
         pos += 4;
         if (pos + desc_len > data.len) return error.InvalidFormat;
         pkg.description = try a.dupe(u8, data[pos..][0..desc_len]);
+        pos += desc_len;
+
+        // mirror (added in NBIX_VERSION 3)
+        if (pos + 4 > data.len) return error.InvalidFormat;
+        const mirror_len = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4;
+        if (pos + mirror_len > data.len) return error.InvalidFormat;
+        pkg.mirror = try a.dupe(u8, data[pos..][0..mirror_len]);
         pos += desc_len;
 
         packages[i] = pkg;
