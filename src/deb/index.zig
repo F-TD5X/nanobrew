@@ -389,7 +389,7 @@ pub fn deserializeIndex(alloc: std.mem.Allocator, data: []const u8) !ParsedIndex
         pos += 4;
         if (pos + mirror_len > data.len) return error.InvalidFormat;
         pkg.mirror = try a.dupe(u8, data[pos..][0..mirror_len]);
-        pos += desc_len;
+        pos += mirror_len;
 
         packages[i] = pkg;
     }
@@ -509,4 +509,66 @@ test "buildProvidesMap - strips arch qualifier from provides" {
     defer pmap.deinit();
 
     try testing.expectEqualStrings("zlib1g", pmap.get("libz1").?);
+}
+
+test "serializeIndex/deserializeIndex round-trip preserves mirror across multiple packages" {
+    const alloc = testing.allocator;
+
+    // Construct a multi-package index with non-empty, *differing-length*
+    // mirror strings so any offset drift in the deserializer corrupts the
+    // second iteration's length-prefixed reads.
+    const pkgs_in = [_]DebPackage{
+        .{
+            .name = "alpha",
+            .version = "1.0",
+            .depends = "libc6",
+            .provides = "",
+            .filename = "pool/main/a/alpha.deb",
+            .sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+            .size = 1234,
+            .description = "first package",
+            .mirror = "http://archive.ubuntu.com/ubuntu",
+        },
+        .{
+            .name = "beta",
+            .version = "2.0",
+            .depends = "alpha",
+            .provides = "virt-foo",
+            .filename = "pool/main/b/beta.deb",
+            .sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+            .size = 5678,
+            .description = "second package — different mirror length",
+            .mirror = "https://deb.nodesource.com/node_20.x",
+        },
+        .{
+            .name = "gamma",
+            .version = "3.0",
+            .depends = "",
+            .provides = "",
+            .filename = "pool/main/g/gamma.deb",
+            .sha256 = "2222222222222222222222222222222222222222222222222222222222222222",
+            .size = 0,
+            .description = "third package, empty mirror (legacy)",
+            .mirror = "",
+        },
+    };
+
+    const blob = try serializeIndex(alloc, &pkgs_in);
+    defer alloc.free(blob);
+
+    var parsed = try deserializeIndex(alloc, blob);
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, pkgs_in.len), parsed.packages.len);
+    for (pkgs_in, parsed.packages) |expected, got| {
+        try testing.expectEqualStrings(expected.name, got.name);
+        try testing.expectEqualStrings(expected.version, got.version);
+        try testing.expectEqualStrings(expected.depends, got.depends);
+        try testing.expectEqualStrings(expected.provides, got.provides);
+        try testing.expectEqualStrings(expected.filename, got.filename);
+        try testing.expectEqualStrings(expected.sha256, got.sha256);
+        try testing.expectEqual(expected.size, got.size);
+        try testing.expectEqualStrings(expected.description, got.description);
+        try testing.expectEqualStrings(expected.mirror, got.mirror);
+    }
 }
