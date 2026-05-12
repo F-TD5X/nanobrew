@@ -593,7 +593,7 @@ fn caskBlobCacheEnabled(sha256: []const u8) bool {
 fn mountDmg(alloc: std.mem.Allocator, io: std.Io, dmg_path: []const u8, out_buf: []u8) ![]const u8 {
     const lib_io = io;
     const result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "hdiutil", "attach", "-nobrowse", "-noautoopen", "-plist", dmg_path },
+        .argv = &.{ "hdiutil", "attach", "-nobrowse", "-noautoopen", "-noverify", "-noautofsck", "-readonly", "-plist", dmg_path },
         .stdout_limit = .limited(64 * 1024),
     }) catch return error.MountFailed;
     defer alloc.free(result.stdout);
@@ -626,7 +626,7 @@ fn mountDmg(alloc: std.mem.Allocator, io: std.Io, dmg_path: []const u8, out_buf:
 fn unmountDmg(alloc: std.mem.Allocator, io: std.Io, mount_point: []const u8) void {
     const lib_io = io;
     const result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "hdiutil", "detach", mount_point, "-quiet" },
+        .argv = &.{ "hdiutil", "detach", "-force", "-quiet", mount_point },
         .stdout_limit = .limited(1024),
     }) catch return;
     alloc.free(result.stdout);
