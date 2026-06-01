@@ -6,6 +6,29 @@ All notable changes to nanobrew are documented here.
 
 _No unreleased changes yet._
 
+## [0.1.195] - 2026-06-02
+
+### Added
+- **`nb install <pkg>@<version>`** — versioned installs resolved from GHCR/OCI bottle tags, with automatic pinning and an "offer latest" fallback when the requested version has no bottle for the current platform. (#300)
+
+### Fixed
+- **Post-install SIGSEGV on versioned install** — the daily update check now runs on a dedicated single-threaded HTTP client and `nb` exits cleanly, eliminating the crash during runtime teardown. (#298)
+- **Relocate literal Homebrew paths in Mach-O binaries** — embedded `/opt/homebrew` and `/usr/local` paths are rewritten so relocated kegs work outside the default prefix, fixing packages such as imagemagick and libheif. (#297)
+- **Misnamed binary inside release tarballs** — the notarize/packaging step stages the binary as `nb`, and the install / `nb update` paths fall back to an `nb-<arch>` entry when present. (#293, #296)
+- **Linker shim promotion** — kegs that ship `libexec/git-core` are auto-promoted to a shim wrapper.
+
+### Performance
+- **GHCR pull token fetched once per versioned install** — a single anonymous pull token is reused across tag listing, manifest, and blob download, removing two cold round-trips per versioned install.
+
+### Docs
+- Documented the package-manager CLI policy in the upstream registry docs. (#253)
+
+## [0.1.194] - 2026-05-25
+
+### Fixed
+- Tap symlink creation, the update banner, the `git` shim, and Linux CI. (#292)
+- `nb update` now falls back to curl/wget for the SHA256 download when the primary fetch fails.
+
 ## [0.1.193] - 2026-05-11
 
 ### Added
