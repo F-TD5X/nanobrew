@@ -107,7 +107,7 @@ fn milliTimestamp() i64 {
 
 const ROOT = paths.ROOT;
 const PREFIX = paths.PREFIX;
-const VERSION = "0.1.194";
+const VERSION = "0.1.195";
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
@@ -169,6 +169,14 @@ pub fn main(init: std.process.Init) !void {
     // Check for updates (once per day, non-blocking); skip after self-update
     // to avoid a spurious banner from the stale in-memory VERSION constant.
     if (cmd != .update) checkForUpdate(alloc);
+
+    // Terminate immediately on success. Returning from main lets the Zig
+    // runtime tear down the global `std.Io.Threaded` instance, and its
+    // worker-pool future cancellation can SIGSEGV during group teardown on
+    // Zig 0.16.0 (the crash reported in #298 fires *after* "Done"). All of our
+    // output is written unbuffered straight to the underlying file, so there
+    // is nothing to flush before exit.
+    std.process.exit(0);
 }
 fn parseCommand(arg: []const u8) ?Command {
     const cmds = .{
@@ -437,6 +445,154 @@ fn runLocalRbInstall(alloc: std.mem.Allocator, path: []const u8) void {
 
 // ── nb install ──
 
+/// A version spec looks like a version if it starts with a digit and contains
+/// only version-ish characters. Distinguishes `hexyl@0.17.0` (version pin) from
+/// arbitrary `@` usage. Note: real versioned formulae like `python@3.11` also
+/// satisfy this — they're disambiguated separately by probing the formula API.
+fn looksLikeVersion(spec: []const u8) bool {
+    if (spec.len == 0 or !std.ascii.isDigit(spec[0])) return false;
+    for (spec) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '_' and c != '+' and c != '-') return false;
+    }
+    return true;
+}
+
+/// Build a Formula for a version-pinned bottle: bottle URL/sha/version come from
+/// the GHCR resolver, while dependencies/metadata are taken from the *current*
+/// formula (see the dep-drift caveat in docs/design/versioned-install.md).
+/// Returned Formula owns all fields; free with `Formula.deinit`.
+fn buildPinnedFormula(
+    alloc: std.mem.Allocator,
+    base: []const u8,
+    bottle: nb.ghcr.VersionedBottle,
+    cur: nb.formula.Formula,
+) !nb.formula.Formula {
+    const deps = try alloc.alloc([]const u8, cur.dependencies.len);
+    var filled: usize = 0;
+    errdefer {
+        for (deps[0..filled]) |d| alloc.free(d);
+        alloc.free(deps);
+    }
+    for (cur.dependencies, 0..) |d, k| {
+        deps[k] = try alloc.dupe(u8, d);
+        filled = k + 1;
+    }
+    return .{
+        .name = try alloc.dupe(u8, base),
+        .version = try alloc.dupe(u8, bottle.version),
+        .revision = 0,
+        .rebuild = 0,
+        .desc = try alloc.dupe(u8, cur.desc),
+        .homepage = try alloc.dupe(u8, cur.homepage),
+        .license = try alloc.dupe(u8, cur.license),
+        .dependencies = deps,
+        .bottle_url = try alloc.dupe(u8, bottle.url),
+        .bottle_sha256 = try alloc.dupe(u8, bottle.sha256),
+        .source_url = try alloc.dupe(u8, ""),
+        .source_sha256 = try alloc.dupe(u8, ""),
+        .build_deps = try alloc.alloc([]const u8, 0),
+        .caveats = try alloc.dupe(u8, cur.caveats),
+        .post_install_defined = cur.post_install_defined,
+    };
+}
+
+/// Print the "version not available, here's what is" message for a failed
+/// version pin, then return (caller exits). Best-effort — lists tags from GHCR
+/// and the latest version from the formula API.
+fn offerLatest(
+    alloc: std.mem.Allocator,
+    client: *std.http.Client,
+    base: []const u8,
+    requested: []const u8,
+) void {
+    const stderr = StderrWriter{};
+    stderr.print("nb: {s} {s} is not available as a bottle for this platform.\n", .{ base, requested }) catch {};
+
+    if (nb.ghcr.listTags(alloc, client, base)) |tags| {
+        defer {
+            for (tags) |t| alloc.free(t);
+            alloc.free(tags);
+        }
+        if (tags.len > 0) {
+            // Show the most recent handful (tags are returned oldest-first).
+            const show: usize = @min(tags.len, 12);
+            stderr.print("    available versions: ", .{}) catch {};
+            for (tags[tags.len - show ..], 0..) |t, i| {
+                if (i > 0) stderr.print(", ", .{}) catch {};
+                stderr.print("{s}", .{t}) catch {};
+            }
+            stderr.print("\n", .{}) catch {};
+        }
+    } else |_| {}
+
+    if (nb.api_client.fetchFormula(alloc, base)) |f| {
+        defer f.deinit(alloc);
+        stderr.print("    latest is {s}; install it with:  nb install {s}\n", .{ f.version, base }) catch {};
+    } else |_| {}
+}
+
+/// Handle a `name@version` argument as a version pin. Returns the base name
+/// (a slice of `arg`) if `arg` was a version pin that has now been injected into
+/// `resolver`; returns null if `arg` is not a version pin and should follow the
+/// normal resolution path. Exits the process on hard errors (version/bottle not
+/// found, OOM) after printing guidance.
+fn resolveVersionPin(
+    alloc: std.mem.Allocator,
+    resolver: *nb.deps.DepResolver,
+    arg: []const u8,
+) ?[]const u8 {
+    const stderr = StderrWriter{};
+    const stdout = StdoutWriter{};
+
+    const at = std.mem.indexOfScalar(u8, arg, '@') orelse return null;
+    // Tap refs (user/tap/formula) are out of scope for version pinning.
+    if (std.mem.indexOfScalar(u8, arg, '/') != null) return null;
+    const base = arg[0..at];
+    const spec = arg[at + 1 ..];
+    if (base.len == 0 or !looksLikeVersion(spec)) return null;
+
+    const client: *std.http.Client = if (resolver.client != null) &resolver.client.? else return null;
+
+    // Disambiguate: if `name@spec` resolves as a real (versioned) formula, this
+    // is not a version pin — let normal resolution handle it (e.g. python@3.11).
+    if (nb.api_client.fetchFormulaWithClient(alloc, client, arg)) |vf| {
+        vf.deinit(alloc);
+        return null;
+    } else |_| {}
+
+    // Version pin: resolve this platform's bottle for the requested version.
+    const bottle = nb.ghcr.resolveBottle(alloc, client, base, spec) catch |err| switch (err) {
+        error.BottleVersionNotFound, error.NoBottleForPlatform => {
+            offerLatest(alloc, client, base, spec);
+            std.process.exit(1);
+        },
+        else => {
+            stderr.print("nb: failed to resolve {s}@{s} from registry: {}\n", .{ base, spec, err }) catch {};
+            std.process.exit(1);
+        },
+    };
+    defer bottle.deinit(alloc);
+
+    // Dependencies/metadata come from the current formula (dep-drift caveat).
+    const cur = nb.api_client.fetchFormulaWithClient(alloc, client, base) catch {
+        stderr.print("nb: formula not found: '{s}'\n", .{base}) catch {};
+        std.process.exit(1);
+    };
+    defer cur.deinit(alloc);
+
+    const pinned = buildPinnedFormula(alloc, base, bottle, cur) catch {
+        stderr.print("nb: out of memory resolving {s}@{s}\n", .{ base, spec }) catch {};
+        std.process.exit(1);
+    };
+    resolver.addResolved(pinned) catch |err| {
+        stderr.print("nb: failed to resolve {s}@{s}: {}\n", .{ base, spec, err }) catch {};
+        std.process.exit(1);
+    };
+
+    stdout.print("==> Pinning {s} to {s} (dependencies resolved against the latest formula)\n", .{ base, bottle.version }) catch {};
+    return base;
+}
+
 fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     const stderr = StderrWriter{};
 
@@ -537,7 +693,19 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     var resolver = nb.deps.DepResolver.init(alloc);
     defer resolver.deinit();
 
-    for (formulae.items) |name| {
+    // A `name@version` arg that is NOT itself a real versioned formula
+    // (e.g. `hexyl@0.17.0`) is resolved as a version pin via GHCR; matching args
+    // are rewritten to their base name for the rest of the pipeline and recorded
+    // so we can auto-pin them after install (the user explicitly chose a version).
+    var pinned_names: std.ArrayList([]const u8) = .empty;
+    defer pinned_names.deinit(alloc);
+
+    for (formulae.items, 0..) |name, i| {
+        if (resolveVersionPin(alloc, &resolver, name)) |base| {
+            formulae.items[i] = base;
+            pinned_names.append(alloc, base) catch {};
+            continue;
+        }
         resolver.resolve(name) catch |err| {
             stderr.print("nb: failed to resolve '{s}': {}\n", .{ name, err }) catch {};
             std.process.exit(1);
@@ -617,6 +785,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 stderr.print("nb: warning: failed to record {s} in database: {}\n", .{ f.name, err }) catch {};
             };
         }
+        for (pinned_names.items) |base| db.setPinned(base, true) catch {};
 
         const elapsed_ns: u64 = timer.read();
         const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
@@ -747,6 +916,13 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         db.recordInstall(f.name, actual_ver, f.bottle_sha256) catch |err| {
             stderr.print("nb: warning: failed to record {s} in database: {}\n", .{ f.name, err }) catch {};
         };
+    }
+
+    // Auto-pin version-pinned installs so a later `nb upgrade` won't silently
+    // replace the explicitly chosen version.
+    for (pinned_names.items) |base| {
+        db.setPinned(base, true) catch {};
+        stdout.print("==> Pinned {s} (won't be upgraded; run `nb unpin {s}` to allow upgrades)\n", .{ base, base }) catch {};
     }
 
     const elapsed_ns: u64 = timer.read();
@@ -4623,8 +4799,21 @@ fn checkForUpdate(alloc: std.mem.Allocator) void {
         f.writeStreamingAll(g_io, ts_str) catch {};
     } else |_| {}
 
-    // Fetch latest version from Cloudflare worker (native HTTP, no curl)
-    const body = nb.fetch.get(alloc, "https://nanobrew.trilok.ai/version") catch return;
+    // Fetch latest version from Cloudflare worker (native HTTP, no curl).
+    //
+    // Use a single-threaded Io here instead of the shared Threaded `safe_io`:
+    // this is a best-effort, single sequential request on the main thread
+    // after every worker thread has already joined. The Threaded Io drives
+    // std.http's connection pool through async futures, and cancelling those
+    // futures in `client.deinit()` can SIGSEGV during group teardown on Zig
+    // 0.16.0 (see #298). A single-threaded Io runs the request inline and
+    // spawns no cancellable futures, so teardown is crash-free.
+    var update_client: std.http.Client = .{
+        .allocator = alloc,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
+    defer update_client.deinit();
+    const body = nb.fetch.getWithClient(alloc, &update_client, "https://nanobrew.trilok.ai/version") catch return;
     defer alloc.free(body);
     const latest_ver = nb.version.normalizeVersion(body);
     if (latest_ver.len == 0 or std.mem.eql(u8, latest_ver, "error")) return;
