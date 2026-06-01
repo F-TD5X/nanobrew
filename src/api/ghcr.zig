@@ -20,6 +20,7 @@
 const std = @import("std");
 const paths = @import("../platform/paths.zig");
 const formula = @import("formula.zig");
+const downloader = @import("../net/downloader.zig");
 
 const BOTTLE_TAG = formula.BOTTLE_TAG;
 const BOTTLE_FALLBACKS = formula.BOTTLE_FALLBACKS;
@@ -132,19 +133,14 @@ fn refNameSuffix(ref: []const u8) []const u8 {
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────
 
-fn ghcrToken(alloc: std.mem.Allocator, client: *std.http.Client, repo: []const u8) ?[]u8 {
-    var url_buf: [512]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "https://ghcr.io/token?scope=repository:{s}:pull", .{repo}) catch return null;
-    const body = httpGet(alloc, client, url, null, null) catch return null;
-    defer alloc.free(body);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    if (parsed.value.object.get("token")) |tok| {
-        if (tok == .string) return alloc.dupe(u8, tok.string) catch null;
-    }
-    return null;
+/// Owned anonymous GHCR pull token for `homebrew/core/<name>`. Routed through
+/// the shared disk-cached helper in net/downloader.zig so a `pkg@version`
+/// install fetches the token once (and the bottle download right after reuses
+/// the same cached token) instead of once per registry request.
+fn repoToken(alloc: std.mem.Allocator, client: *std.http.Client, name: []const u8) ?[]const u8 {
+    var repo_buf: [256]u8 = undefined;
+    const repo = std.fmt.bufPrint(&repo_buf, "homebrew/core/{s}", .{name}) catch return null;
+    return downloader.cachedRepoToken(alloc, client, repo);
 }
 
 /// GET `url`, returning an owned body on HTTP 200, else `error.RegistryError`.
@@ -193,11 +189,19 @@ fn httpGet(
 /// List all available version tags for a homebrew-core formula.
 /// Caller owns the returned slice and each string.
 pub fn listTags(alloc: std.mem.Allocator, client: *std.http.Client, name: []const u8) ![][]const u8 {
-    var repo_buf: [256]u8 = undefined;
-    const repo = std.fmt.bufPrint(&repo_buf, "homebrew/core/{s}", .{name}) catch return error.RegistryError;
-    const token = ghcrToken(alloc, client, repo);
+    const token = repoToken(alloc, client, name);
     defer if (token) |t| alloc.free(t);
+    return listTagsWithToken(alloc, client, name, token);
+}
 
+/// As `listTags`, but reuses a caller-provided token to avoid a redundant
+/// token fetch when the manifest lookup needs the same token.
+fn listTagsWithToken(
+    alloc: std.mem.Allocator,
+    client: *std.http.Client,
+    name: []const u8,
+    token: ?[]const u8,
+) ![][]const u8 {
     var url_buf: [512]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}{s}/tags/list", .{ GHCR_BASE, name }) catch return error.RegistryError;
     const body = try httpGet(alloc, client, url, null, token);
@@ -229,7 +233,12 @@ pub fn resolveBottle(
     name: []const u8,
     requested_version: []const u8,
 ) ResolveError!VersionedBottle {
-    const tags = listTags(alloc, client, name) catch return error.RegistryError;
+    // One token for the whole resolve (tags/list + manifest); the bottle
+    // download immediately after reuses it from the shared disk cache too.
+    const token = repoToken(alloc, client, name);
+    defer if (token) |t| alloc.free(t);
+
+    const tags = listTagsWithToken(alloc, client, name, token) catch return error.RegistryError;
     defer {
         for (tags) |t| alloc.free(t);
         alloc.free(tags);
@@ -237,11 +246,6 @@ pub fn resolveBottle(
 
     const idx = selectVersionTag(tags, requested_version) orelse return error.BottleVersionNotFound;
     const tag = tags[idx];
-
-    var repo_buf: [256]u8 = undefined;
-    const repo = std.fmt.bufPrint(&repo_buf, "homebrew/core/{s}", .{name}) catch return error.RegistryError;
-    const token = ghcrToken(alloc, client, repo);
-    defer if (token) |t| alloc.free(t);
 
     var url_buf: [512]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}{s}/manifests/{s}", .{ GHCR_BASE, name, tag }) catch return error.RegistryError;
