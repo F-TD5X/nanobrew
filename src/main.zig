@@ -2611,6 +2611,39 @@ fn runUpdate(alloc: std.mem.Allocator) void {
 
 // ── nb install --cask ──
 
+/// Collect the app and binary names a cask install records in the DB. App
+/// artifacts contribute their app name; suite/artifact payloads that land in
+/// /Applications contribute the target basename (so `nb remove` cleans them up).
+fn collectCaskDbEntries(
+    alloc: std.mem.Allocator,
+    artifacts: []const nb.cask.Artifact,
+    apps: *std.ArrayList([]const u8),
+    binaries: *std.ArrayList([]const u8),
+) void {
+    for (artifacts) |art| {
+        switch (art) {
+            .app => |a| apps.append(alloc, a) catch {},
+            .binary => |b| binaries.append(alloc, b.target) catch {},
+            .suite => |s| if (nb.cask_installer.artifactInstallsToApplications(s.target)) {
+                apps.append(alloc, std.fs.path.basename(s.target)) catch {};
+            },
+            .artifact => |a| if (nb.cask_installer.artifactInstallsToApplications(a.target)) {
+                apps.append(alloc, std.fs.path.basename(a.target)) catch {};
+            },
+            .pkg, .font, .installer_script, .uninstall => {},
+        }
+    }
+}
+
+/// True when nanobrew's Caskroom already has a directory for this token (a prior
+/// nanobrew install placed it). Used to safely adopt an on-disk-but-untracked
+/// cask without ever claiming a foreign, manually-installed app (issue #302).
+fn caskAlreadyOnDisk(token: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const dir = std.fmt.bufPrint(&buf, "{s}/{s}", .{ paths.CASKROOM_DIR, token }) catch return false;
+    std.Io.Dir.accessAbsolute(g_io, dir, .{}) catch return false;
+    return true;
+}
 fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
@@ -2663,6 +2696,25 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
             continue;
         };
         if (cask_conflict) |conflict| {
+            // If nanobrew already owns this cask on disk (its Caskroom dir
+            // exists) but the DB lost the record — e.g. an earlier multi-cask
+            // run was interrupted before it flushed — adopt the existing payload
+            // into the DB instead of refusing, so `nb list`/`upgrade` see it
+            // again. A foreign app (no Caskroom dir) is still refused so
+            // `nb remove` never deletes something nanobrew didn't install (#302).
+            if (caskAlreadyOnDisk(token)) {
+                var apps: std.ArrayList([]const u8) = .empty;
+                defer apps.deinit(alloc);
+                var binaries: std.ArrayList([]const u8) = .empty;
+                defer binaries.deinit(alloc);
+                collectCaskDbEntries(alloc, cask_meta.artifacts, &apps, &binaries);
+                db.recordCaskInstall(token, cask_meta.version, apps.items, binaries.items) catch {
+                    stderr.print("nb: warning: could not record existing cask install\n", .{}) catch {};
+                };
+                db.flush() catch {};
+                stdout.print("==> {s} {s} already present on disk; recorded existing install\n", .{ token, cask_meta.version }) catch {};
+                continue;
+            }
             stderr.print("nb: refusing to overwrite existing {s} at {s}\n", .{ conflict.kind, conflict.path }) catch {};
             stderr.print("    Move or remove that destination first, or keep {s} managed outside nanobrew.\n", .{cask_meta.name}) catch {};
             had_error = true;
@@ -2681,24 +2733,20 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
         };
         nb.cask_installer.traceCaskPhase(cask_trace, token, "payload_install", phase_timer.read());
 
-        // Collect app/binary names from artifacts for database
+        // Collect app/binary names from artifacts for the database.
         var apps: std.ArrayList([]const u8) = .empty;
         defer apps.deinit(alloc);
         var binaries: std.ArrayList([]const u8) = .empty;
         defer binaries.deinit(alloc);
-
-        for (cask_meta.artifacts) |art| {
-            switch (art) {
-                .app => |a| apps.append(alloc, a) catch {},
-                .binary => |b| binaries.append(alloc, b.target) catch {},
-                .pkg, .font, .artifact, .suite, .installer_script, .uninstall => {},
-            }
-        }
+        collectCaskDbEntries(alloc, cask_meta.artifacts, &apps, &binaries);
 
         phase_timer = MonoTimer.start();
         db.recordCaskInstall(token, cask_meta.version, apps.items, binaries.items) catch {
             stderr.print("nb: warning: could not record cask install\n", .{}) catch {};
         };
+        // Persist after each cask so an interrupted multi-cask run keeps the
+        // records for casks that already completed (issue #302).
+        db.flush() catch {};
         nb.cask_installer.traceCaskPhase(cask_trace, token, "db_record", phase_timer.read());
         nb.cask_installer.traceCaskPhase(cask_trace, token, "command_total", token_timer.read());
 

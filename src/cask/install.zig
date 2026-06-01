@@ -323,6 +323,18 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
                     continue;
                 }
 
+                // Don't leave a dangling symlink: the source must exist by now.
+                // Casks list their app/suite payload before the $APPDIR binaries
+                // that point into it, so the bundle is already in place here; if
+                // it is not, fail loudly instead of recording a broken link (#303).
+                std.Io.Dir.accessAbsolute(lib_io, source, .{}) catch {
+                    var _b: [1024]u8 = undefined;
+                    const _m = std.fmt.bufPrint(&_b, "nb: binary source {s} not found (app payload missing?); skipping {s}\n", .{ source, bin.target }) catch "nb: binary source not found\n";
+                    std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    any_artifact_failed = true;
+                    continue;
+                };
+
                 var link_buf: [512]u8 = undefined;
                 const link_path = std.fmt.bufPrint(&link_buf, "{s}/bin/{s}", .{ PREFIX, bin.target }) catch continue;
 
@@ -419,13 +431,13 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
                 };
             },
             .artifact => |artifact_rule| {
-                copyGenericArtifact(alloc, lib_io, source_dir, artifact_rule.source, artifact_rule.target) catch {
+                installGenericArtifact(alloc, lib_io, source_dir, artifact_rule.source, artifact_rule.target) catch {
                     writeArtifactWarning(lib_io, "nb: failed to install artifact\n");
                     any_artifact_failed = true;
                 };
             },
             .suite => |suite| {
-                copyGenericArtifact(alloc, lib_io, source_dir, suite.source, suite.target) catch {
+                installGenericArtifact(alloc, lib_io, source_dir, suite.source, suite.target) catch {
                     writeArtifactWarning(lib_io, "nb: failed to install suite artifact\n");
                     any_artifact_failed = true;
                 };
@@ -930,16 +942,18 @@ fn firstInstallConflictIn(
             },
             .artifact => |artifact_rule| {
                 var dst_buf: [1024]u8 = undefined;
-                const dst = try genericArtifactDestinationPath(artifact_rule.target, &dst_buf);
-                if (try pathExistsNoFollow(io, dst)) {
-                    return try destinationConflict("artifact", dst, conflict_buf);
+                if (try genericConflictDest(applications_dir, artifact_rule.target, &dst_buf)) |dst| {
+                    if (try pathExistsNoFollow(io, dst)) {
+                        return try destinationConflict("artifact", dst, conflict_buf);
+                    }
                 }
             },
             .suite => |suite| {
                 var dst_buf: [1024]u8 = undefined;
-                const dst = try genericArtifactDestinationPath(suite.target, &dst_buf);
-                if (try pathExistsNoFollow(io, dst)) {
-                    return try destinationConflict("suite", dst, conflict_buf);
+                if (try genericConflictDest(applications_dir, suite.target, &dst_buf)) |dst| {
+                    if (try pathExistsNoFollow(io, dst)) {
+                        return try destinationConflict("suite", dst, conflict_buf);
+                    }
                 }
             },
             .pkg, .installer_script, .uninstall => {},
@@ -1363,6 +1377,92 @@ fn copyGenericArtifact(
     try copyPath(alloc, io, src, expanded_target);
 }
 
+/// Where a suite/artifact `target` maps on disk. nanobrew only ever writes a
+/// cask payload under its own prefix or into /Applications; anything else
+/// (e.g. /Library/Application Support) is skipped rather than failed (#303).
+const GenericTargetKind = enum { prefix, applications, skip };
+
+fn classifyGenericTarget(target_path: []const u8) GenericTargetKind {
+    if (std.mem.indexOf(u8, target_path, "..") != null) return .skip;
+    if (std.mem.startsWith(u8, target_path, "$HOMEBREW_PREFIX/")) return .prefix;
+    if (std.mem.startsWith(u8, target_path, PREFIX)) return .prefix;
+    if (std.mem.eql(u8, target_path, APPLICATIONS_DIR)) return .applications;
+    if (std.mem.startsWith(u8, target_path, APPLICATIONS_DIR ++ "/")) return .applications;
+    return .skip;
+}
+
+/// True when a suite/artifact `target` installs its payload into /Applications,
+/// so the DB-record side (main.zig) and the install side agree on what landed.
+pub fn artifactInstallsToApplications(target_path: []const u8) bool {
+    return classifyGenericTarget(target_path) == .applications;
+}
+
+/// Resolve where a suite/artifact would be placed (for conflict detection), or
+/// null when it targets neither the prefix nor /Applications (skipped).
+fn genericConflictDest(applications_dir: []const u8, target_path: []const u8, buf: []u8) !?[]const u8 {
+    return switch (classifyGenericTarget(target_path)) {
+        .prefix => try genericArtifactDestinationPath(target_path, buf),
+        .applications => std.fmt.bufPrint(buf, "{s}/{s}", .{ applications_dir, std.fs.path.basename(target_path) }) catch error.PathTooLong,
+        .skip => null,
+    };
+}
+
+/// Install a `suite`/`artifact` payload. /Applications targets go through the
+/// same hardened cp -R + quarantine path as `app` artifacts; prefix targets use
+/// the generic copy; everything else is skipped with a warning (not a failure).
+fn installGenericArtifact(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source_dir: []const u8,
+    source_path: []const u8,
+    target_path: []const u8,
+) !void {
+    switch (classifyGenericTarget(target_path)) {
+        .prefix => try copyGenericArtifact(alloc, io, source_dir, source_path, target_path),
+        .applications => try installApplicationsArtifact(alloc, io, source_dir, source_path, target_path),
+        .skip => {
+            var _b: [1024]u8 = undefined;
+            const _m = std.fmt.bufPrint(&_b, "nb: skipping artifact targeting {s} (outside nanobrew prefix and /Applications)\n", .{target_path}) catch "nb: skipping artifact outside managed directories\n";
+            std.Io.File.stderr().writeStreamingAll(io, _m) catch {};
+        },
+    }
+}
+
+/// Copy a suite/artifact payload to /Applications/<basename(target)>. Mirrors the
+/// `app` artifact safety model: relative source only, basename-only destination,
+/// refuse to overwrite, clear Gatekeeper quarantine.
+fn installApplicationsArtifact(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source_dir: []const u8,
+    source_path: []const u8,
+    target_path: []const u8,
+) !void {
+    if (!safeRelativePath(source_path)) return error.UnsafePath;
+    const base = std.fs.path.basename(target_path);
+    if (base.len == 0 or std.mem.indexOf(u8, base, "..") != null) return error.UnsafePath;
+
+    var dst_buf: [512]u8 = undefined;
+    const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ APPLICATIONS_DIR, base }) catch return error.PathTooLong;
+    var src_buf: [1024]u8 = undefined;
+    const src = std.fmt.bufPrint(&src_buf, "{s}/{s}", .{ source_dir, source_path }) catch return error.PathTooLong;
+
+    std.Io.Dir.accessAbsolute(io, src, .{}) catch return error.SourceNotFound;
+    if (try pathExistsNoFollow(io, dst)) return error.DestinationAlreadyExists;
+
+    const cp = try std.process.run(alloc, io, .{ .argv = &.{ "cp", "-R", src, dst } });
+    alloc.free(cp.stdout);
+    alloc.free(cp.stderr);
+    if (switch (cp.term) {
+        .exited => |c| c != 0,
+        else => true,
+    }) return error.CopyFailed;
+
+    if (comptime builtin.os.tag == .macos) {
+        clearQuarantineIfPresent(alloc, io, dst, true);
+    }
+}
+
 fn runInstallerScript(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1505,4 +1605,20 @@ fn extractTarXz(alloc: std.mem.Allocator, io: std.Io, tar_path: []const u8, dest
         .exited => |c| c != 0,
         else => true,
     }) return error.ExtractFailed;
+}
+
+test "classifyGenericTarget routes prefix, applications, and skip" {
+    try std.testing.expectEqual(GenericTargetKind.applications, classifyGenericTarget("/Applications/KiCad"));
+    try std.testing.expectEqual(GenericTargetKind.applications, classifyGenericTarget(APPLICATIONS_DIR));
+    try std.testing.expectEqual(GenericTargetKind.prefix, classifyGenericTarget("$HOMEBREW_PREFIX/etc/x"));
+    try std.testing.expectEqual(GenericTargetKind.prefix, classifyGenericTarget(PREFIX ++ "/etc/x"));
+    try std.testing.expectEqual(GenericTargetKind.skip, classifyGenericTarget("/Library/Application Support/kicad/demos"));
+    try std.testing.expectEqual(GenericTargetKind.skip, classifyGenericTarget("/Applications/../etc/evil"));
+}
+
+test "artifactInstallsToApplications only true for /Applications targets" {
+    try std.testing.expect(artifactInstallsToApplications("/Applications/KiCad"));
+    try std.testing.expect(!artifactInstallsToApplications(PREFIX ++ "/share/foo"));
+    try std.testing.expect(!artifactInstallsToApplications("/Library/Foo"));
+    try std.testing.expect(!artifactInstallsToApplications("/Applications/../etc/evil"));
 }
