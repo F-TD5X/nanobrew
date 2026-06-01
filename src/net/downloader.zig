@@ -296,17 +296,24 @@ fn fetchGhcrToken(alloc: std.mem.Allocator, client: *std.http.Client, url: []con
     const after_prefix = url[ghcr_prefix.len..];
     const blobs_idx = std.mem.indexOf(u8, after_prefix, "/blobs/") orelse return null;
     const repo = after_prefix[0..blobs_idx];
+    return cachedRepoToken(alloc, client, repo);
+}
 
-    // Check token cache (4 min TTL)
+/// Anonymous GHCR pull token for `repo` (e.g. "homebrew/core/wget"), disk-cached
+/// with a 4-minute TTL. Shared across the bottle-download and version-resolve
+/// (api/ghcr.zig) paths so a `pkg@version` install fetches the token once
+/// instead of three times. Returns an owned slice; caller frees.
+pub fn cachedRepoToken(alloc: std.mem.Allocator, client: *std.http.Client, repo: []const u8) ?[]const u8 {
     var cache_name_buf: [256]u8 = undefined;
-    const cache_name = scopeToCacheName(repo, &cache_name_buf) orelse return fetchGhcrTokenUncached(alloc, client, repo);
+    const cache_name = scopeToCacheName(repo, &cache_name_buf) orelse
+        return (fetchGhcrTokenUncached(alloc, client, repo) catch null);
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}", .{ TOKEN_CACHE_DIR, cache_name }) catch
-        return fetchGhcrTokenUncached(alloc, client, repo);
+        return (fetchGhcrTokenUncached(alloc, client, repo) catch null);
 
     if (readCachedToken(alloc, cache_path)) |cached| return cached;
 
-    const token = try fetchGhcrTokenUncached(alloc, client, repo);
+    const token = fetchGhcrTokenUncached(alloc, client, repo) catch null;
     if (token) |t| {
         const _lio = paths.safe_io;
         std.Io.Dir.createDirAbsolute(_lio, TOKEN_CACHE_DIR, .default_dir) catch {};

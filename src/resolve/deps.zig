@@ -144,6 +144,22 @@ pub const DepResolver = struct {
         }
     }
 
+    /// Inject an already-resolved Formula (e.g. a version-pinned bottle whose
+    /// metadata we built ourselves) and resolve its transitive dependencies.
+    /// Takes ownership of `f` — it will be freed by `deinit`. If a formula with
+    /// the same name is already present, `f` is freed and this is a no-op.
+    pub fn addResolved(self: *DepResolver, f: Formula) !void {
+        if (self.formulae.contains(f.name)) {
+            f.deinit(self.alloc);
+            return;
+        }
+        try self.formulae.put(f.name, f);
+        try self.edges.put(f.name, f.dependencies);
+        // Pull in the dependency tree (the injected node itself is now present,
+        // so resolve() below short-circuits for it and only fetches deps).
+        for (f.dependencies) |dep| try self.resolve(dep);
+    }
+
     pub fn hasFormula(self: *DepResolver, name: []const u8) bool {
         // Check exact name
         if (self.formulae.contains(name)) return true;

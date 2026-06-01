@@ -118,6 +118,49 @@ nb info jq                    # show package details
 nb search ripgrep             # search formulas and casks
 ```
 
+### Installing a specific version
+
+Pin any Homebrew formula to an exact version with `name@version`:
+
+```bash
+nb install hexyl@0.17.0       # install exactly hexyl 0.17.0
+nb install wget@1.21.3        # install exactly wget 1.21.3
+```
+
+nanobrew resolves the requested version from the bottles Homebrew keeps in its
+container registry. Versioned installs are **auto-pinned** so a later
+`nb upgrade` won't replace your chosen version — run `nb unpin <pkg>` to allow
+upgrades again.
+
+Notes and limitations:
+
+- Works for **Homebrew formulae** (macOS + Linux bottles). Casks (`--cask`) and
+  deb packages (`--deb`) don't support version pinning yet.
+- If the exact version isn't available as a bottle for your platform (old
+  bottles can be garbage-collected), nb lists the available versions and points
+  you at the latest instead of guessing.
+- Dependencies are resolved against the **latest** formula, not the historical
+  one — fine for typical CLI tools; see
+  [`docs/design/versioned-install.md`](docs/design/versioned-install.md) for
+  details.
+
+Homebrew's **versioned formulae** (separate packages whose name contains `@`)
+also work as before, and take precedence over version pinning:
+
+```bash
+nb install python@3.11        # the python@3.11 formula (distinct from python)
+nb install node@22            # the node@22 formula
+nb install openssl@3          # the openssl@3 formula
+```
+
+Related version controls once a package is installed:
+
+```bash
+nb pin tree                   # hold tree at its current version (skip upgrades)
+nb unpin tree                 # allow upgrades again
+nb rollback tree              # revert to the previously installed version
+```
+
 ### Shimmed Installs
 
 ```bash
