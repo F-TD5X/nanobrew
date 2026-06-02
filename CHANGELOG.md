@@ -4,7 +4,9 @@ All notable changes to nanobrew are documented here.
 
 ## Unreleased
 
-_No unreleased changes yet._
+### Fixed
+- **Casks installed via `nb bundle install` were missing from `nb list`** — the install now persists the database after each cask, and a cask whose payload is already on disk (e.g. from an interrupted run) is re-adopted into the database instead of silently skipped, so `nb list`, `nb bundle dump`, and `nb upgrade` stay in sync with the Caskroom. (#302)
+- **Casks delivered via a `suite`/`artifact` stanza (e.g. KiCad) now install correctly** — the cask parser handles `suite` and `artifact` artifacts (previously dropped), `/Applications` payloads are copied and de-quarantined like `app` artifacts, and a `binary` symlink is no longer created when its source is absent — so a failed cask reports an error instead of falsely succeeding with broken symlinks. (#303)
 
 ## [0.1.195] - 2026-06-02
 

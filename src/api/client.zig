@@ -540,6 +540,38 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                             }
                         }
                     }
+                } else if (obj.get("suite")) |suite_val| {
+                    // Homebrew shape: {"suite": ["Dir"], "target": "/Applications/Dir"}
+                    if (suite_val == .array) {
+                        const suite_target = getStr(obj, "target") orelse "";
+                        if (suite_target.len > 0) {
+                            for (suite_val.array.items) |s| {
+                                if (s == .string) {
+                                    try artifacts.append(alloc, .{ .suite = .{
+                                        .source = try allocDupe(alloc, s.string),
+                                        .target = try allocDupe(alloc, suite_target),
+                                    } });
+                                }
+                            }
+                        }
+                    }
+                } else if (obj.get("artifact")) |art_val| {
+                    // Homebrew shape: {"artifact": ["src", {"target": "/path"}]}
+                    // (target may also be a sibling key of the artifact object).
+                    if (art_val == .array and art_val.array.items.len > 0 and art_val.array.items[0] == .string) {
+                        const art_items = art_val.array.items;
+                        var art_target: []const u8 = "";
+                        if (art_items.len > 1 and art_items[art_items.len - 1] == .object) {
+                            art_target = getStr(art_items[art_items.len - 1].object, "target") orelse "";
+                        }
+                        if (art_target.len == 0) art_target = getStr(obj, "target") orelse "";
+                        if (art_target.len > 0) {
+                            try artifacts.append(alloc, .{ .artifact = .{
+                                .source = try allocDupe(alloc, art_items[0].string),
+                                .target = try allocDupe(alloc, art_target),
+                            } });
+                        }
+                    }
                 }
             }
         }
@@ -1053,4 +1085,43 @@ test "parseCaskJson - missing url returns error" {
         \\"sha256":"abc","desc":"","artifacts":[]}
     ;
     try testing.expectError(error.MissingField, parseCaskJson(testing.allocator, json));
+}
+
+test "parseCaskJson - parses suite and artifact stanzas (KiCad shape)" {
+    const json =
+        \\{"token":"kicad","version":"10.0.3","url":"https://example.com/kicad.dmg","artifacts":[
+        \\{"suite":["KiCad"],"target":"/Applications/KiCad"},
+        \\{"artifact":["demos",{"target":"/Library/Application Support/kicad/demos"}]},
+        \\{"binary":["$APPDIR/KiCad/KiCad.app/Contents/MacOS/kicad-cli"]},
+        \\{"uninstall":[{"quit":"org.kicad.kicad"}]}
+        \\]}
+    ;
+    const cask = try parseCaskJson(testing.allocator, json);
+    defer cask.deinit(testing.allocator);
+
+    var saw_suite = false;
+    var saw_artifact = false;
+    var saw_binary = false;
+    for (cask.artifacts) |art| {
+        switch (art) {
+            .suite => |s| {
+                saw_suite = true;
+                try testing.expectEqualStrings("KiCad", s.source);
+                try testing.expectEqualStrings("/Applications/KiCad", s.target);
+            },
+            .artifact => |a| {
+                saw_artifact = true;
+                try testing.expectEqualStrings("demos", a.source);
+                try testing.expectEqualStrings("/Library/Application Support/kicad/demos", a.target);
+            },
+            .binary => |b| {
+                saw_binary = true;
+                try testing.expectEqualStrings("kicad-cli", b.target);
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_suite);
+    try testing.expect(saw_artifact);
+    try testing.expect(saw_binary);
 }
