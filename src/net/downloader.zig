@@ -376,9 +376,44 @@ fn scopeToCacheName(repo: []const u8, buf: *[256]u8) ?[]const u8 {
     return buf[0..repo.len];
 }
 
-/// Internal: download using an existing HTTP client and optional pre-fetched token.
-/// `preauth_token` is a read-only slice owned by the caller — not freed here.
+/// Returns true for errors that are worth retrying (transient network/server
+/// conditions, rate limits, or a truncated body that failed verification).
+/// Permanent failures (404, auth) are not retried.
+fn isRetryable(err: anyerror) bool {
+    return switch (err) {
+        error.BottleNotFound, error.AuthFailed, error.PathTooLong => false,
+        else => true,
+    };
+}
+
+/// Download with bounded retries. Transient failures (network blips, 5xx, 429,
+/// truncated bodies) are retried with a short linear backoff so a single flaky
+/// connection no longer aborts an otherwise-healthy parallel batch (#311).
 fn downloadOneWithClient(
+    alloc: std.mem.Allocator,
+    client: *std.http.Client,
+    req: DownloadRequest,
+    preauth_token: ?[]const u8,
+) !void {
+    const max_attempts: usize = 3;
+    var attempt: usize = 0;
+    while (true) {
+        attempt += 1;
+        downloadAttempt(alloc, client, req, preauth_token) catch |err| {
+            if (attempt >= max_attempts or !isRetryable(err)) return err;
+            // Linear backoff: 250ms, 500ms. Keeps a flaky download from
+            // hammering the server while still recovering quickly.
+            std.Io.sleep(paths.safe_io, .fromMilliseconds(@as(i64, @intCast(attempt)) * 250), .awake) catch {};
+            continue;
+        };
+        return;
+    }
+}
+
+/// Internal: single download attempt using an existing HTTP client and optional
+/// pre-fetched token. `preauth_token` is a read-only slice owned by the caller —
+/// not freed here.
+fn downloadAttempt(
     alloc: std.mem.Allocator,
     client: *std.http.Client,
     req: DownloadRequest,
@@ -446,7 +481,16 @@ fn downloadOneWithClient(
 
     var redirect_buf: [32768]u8 = undefined;
     var response = http_req.receiveHead(&redirect_buf) catch return error.DownloadFailed;
-    if (response.head.status != .ok) return error.DownloadFailed;
+    if (response.head.status != .ok) {
+        // Map status to a specific error so callers (and retry logic) can tell a
+        // permanent failure (404/auth) from a transient one (5xx/429). (#311)
+        return switch (response.head.status) {
+            .not_found, .gone => error.BottleNotFound,
+            .unauthorized, .forbidden => error.AuthFailed,
+            .too_many_requests => error.RateLimited,
+            else => error.DownloadFailed,
+        };
+    }
 
     // Stream body to tmp file with SHA256 hashing in single pass
     var tmp_path_buf: [512]u8 = undefined;

@@ -906,7 +906,11 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     defer db.close();
     for (all_formulae) |f| {
         var ver_buf6: [256]u8 = undefined;
-        const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf6) orelse f.version;
+        // Only record packages that actually landed in the Cellar. If there is no
+        // keg directory the install failed (download/extract/materialize), so
+        // skipping here avoids writing phantom DB entries that later trip up
+        // `nb doctor` / `nb cleanup --prune-kegs` (#311).
+        const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf6) orelse continue;
 
         const existing = db.findKeg(f.name);
         if (existing) |keg| {
@@ -1198,7 +1202,14 @@ fn fullInstallOne(
                 .target_kind = .formula,
                 .target_name = f.name,
             }) catch |err| {
-                stderr.print("nb: {s}: download failed: {}\n", .{ f.name, err }) catch {};
+                const hint: []const u8 = switch (err) {
+                    error.BottleNotFound => " (bottle not found upstream — the version metadata may be stale)",
+                    error.AuthFailed => " (registry auth failed)",
+                    error.RateLimited => " (rate limited by registry — retry shortly)",
+                    error.ChecksumMismatch => " (checksum mismatch — download corrupted or metadata stale)",
+                    else => " (network error after retries)",
+                };
+                stderr.print("nb: {s}: download failed: {s}{s}\n", .{ f.name, @errorName(err), hint }) catch {};
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
