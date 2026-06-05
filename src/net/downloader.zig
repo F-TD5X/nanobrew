@@ -377,24 +377,31 @@ fn scopeToCacheName(repo: []const u8, buf: *[256]u8) ?[]const u8 {
 }
 
 /// Returns true for errors that are worth retrying (transient network/server
-/// conditions, rate limits, or a truncated body that failed verification).
-/// Permanent failures (404, auth) are not retried.
+/// conditions or rate limits). Permanent failures (404, auth) and a full-body
+/// checksum mismatch are not retried — a mismatch means the bytes received were
+/// wrong/stale (a genuinely truncated transfer surfaces as a stream error, i.e.
+/// DownloadFailed), so retrying just wastes time.
 fn isRetryable(err: anyerror) bool {
     return switch (err) {
-        error.BottleNotFound, error.AuthFailed, error.PathTooLong => false,
+        error.BottleNotFound, error.AuthFailed, error.PathTooLong, error.ChecksumMismatch => false,
         else => true,
     };
 }
 
-/// Download with bounded retries. Transient failures (network blips, 5xx, 429,
-/// truncated bodies) are retried with a short linear backoff so a single flaky
-/// connection no longer aborts an otherwise-healthy parallel batch (#311).
+/// Download with bounded retries. Transient failures (network blips, 5xx, 429)
+/// are retried with a short linear backoff so a single flaky connection no
+/// longer aborts an otherwise-healthy parallel batch (#311). Telemetry is
+/// recorded once per logical download here (not per attempt) so retries don't
+/// inflate the failure count.
 fn downloadOneWithClient(
     alloc: std.mem.Allocator,
     client: *std.http.Client,
     req: DownloadRequest,
     preauth_token: ?[]const u8,
 ) !void {
+    var telemetry_event = telemetry.DownloadEvent.start(req.target_kind, req.target_name);
+    errdefer telemetry_event.fail();
+
     const max_attempts: usize = 3;
     var attempt: usize = 0;
     while (true) {
@@ -406,8 +413,12 @@ fn downloadOneWithClient(
             std.Io.sleep(paths.safe_io, .fromMilliseconds(@as(i64, @intCast(attempt)) * 250), .awake) catch {};
             continue;
         };
-        return;
+        break;
     }
+
+    var dest_path_buf: [512]u8 = undefined;
+    const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch return;
+    telemetry_event.succeed(telemetry.fileSize(dest_path));
 }
 
 /// Internal: single download attempt using an existing HTTP client and optional
@@ -423,8 +434,6 @@ fn downloadAttempt(
     const t_dl = if (bench) milliTimestamp() else @as(i64, 0);
     var dest_path_buf: [512]u8 = undefined;
     const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch return error.PathTooLong;
-    var telemetry_event = telemetry.DownloadEvent.start(req.target_kind, req.target_name);
-    errdefer telemetry_event.fail();
 
     // Rewrite bottle URL if NANOBREW_BOTTLE_DOMAIN or HOMEBREW_BOTTLE_DOMAIN is set (#74)
     const bottle_domain: ?[]const u8 = blk: {
@@ -540,7 +549,6 @@ fn downloadAttempt(
                 const sha = req.expected_sha256;
                 std.debug.print("[nb-bench] dl {s}…: {d}ms (cached blob)\n", .{ sha[0..@min(8, sha.len)], milliTimestamp() - t_dl });
             }
-            telemetry_event.succeed(telemetry.fileSize(dest_path));
             return;
         }
         return err;
@@ -549,7 +557,6 @@ fn downloadAttempt(
         const sha = req.expected_sha256;
         std.debug.print("[nb-bench] dl {s}…: {d}ms\n", .{ sha[0..@min(8, sha.len)], milliTimestamp() - t_dl });
     }
-    telemetry_event.succeed(telemetry.fileSize(dest_path));
 }
 
 /// Public single-download entry point for callers without a persistent client.
