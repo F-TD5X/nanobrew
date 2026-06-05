@@ -139,29 +139,58 @@ fn decompressGzip(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
     return result.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-/// Fetch a URL and write the response body directly to a file.
-pub fn download(alloc: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
-    var client: std.http.Client = .{ .allocator = alloc, .io = paths.safe_io };
-    defer client.deinit();
-    return downloadWithClient(&client, url, dest_path);
-}
+/// Optional HTTP POST form body. When present, the request is sent as a POST
+/// with `Content-Type: application/x-www-form-urlencoded` and `body` as the
+/// payload. Used for casks whose download declares `using: :post, data: {...}`
+/// (e.g. segger-jlink's license acceptance) — see #305. `body` must be mutable
+/// because std.http's `sendBodyComplete` requires `[]u8`.
+pub const PostBody = ?[]u8;
 
-/// Download using an existing client.
-pub fn downloadWithClient(client: *std.http.Client, url: []const u8, dest_path: []const u8) !void {
-    return downloadWithClientHeaders(client, url, dest_path, &.{});
-}
+/// Shared implementation behind all download* helpers. Streams the response to
+/// `dest_path`, optionally verifying SHA256, optionally issuing a POST with a
+/// form body instead of a bodiless GET.
+fn downloadCore(
+    client: *std.http.Client,
+    url: []const u8,
+    dest_path: []const u8,
+    expected_sha256: ?[]const u8,
+    extra_headers: []const std.http.Header,
+    body: PostBody,
+) !void {
+    if (expected_sha256) |sha| {
+        if (sha.len < 64) return error.ChecksumMismatch;
+    }
 
-/// Download using an existing client plus additional headers.
-pub fn downloadWithClientHeaders(client: *std.http.Client, url: []const u8, dest_path: []const u8, extra_headers: []const std.http.Header) !void {
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
     const split = splitUserAgent(client.allocator, extra_headers);
     defer if (split.rest.ptr != extra_headers.ptr and split.rest.len > 0) client.allocator.free(split.rest);
-    var req = client.request(.GET, uri, requestOptions(split.ua, split.rest)) catch return error.FetchFailed;
 
-    req.sendBodiless() catch {
-        req.deinit();
-        return error.FetchFailed;
-    };
+    // For POST we must advertise the form content type. Build a combined header
+    // slice so we don't mutate the caller's headers.
+    var post_headers: ?[]std.http.Header = null;
+    defer if (post_headers) |ph| client.allocator.free(ph);
+    const effective_rest: []const std.http.Header = if (body != null) blk: {
+        const combined = client.allocator.alloc(std.http.Header, split.rest.len + 1) catch break :blk split.rest;
+        @memcpy(combined[0..split.rest.len], split.rest);
+        combined[split.rest.len] = .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" };
+        post_headers = combined;
+        break :blk combined;
+    } else split.rest;
+
+    const method: std.http.Method = if (body != null) .POST else .GET;
+    var req = client.request(method, uri, requestOptions(split.ua, effective_rest)) catch return error.FetchFailed;
+
+    if (body) |b| {
+        req.sendBodyComplete(b) catch {
+            req.deinit();
+            return error.FetchFailed;
+        };
+    } else {
+        req.sendBodiless() catch {
+            req.deinit();
+            return error.FetchFailed;
+        };
+    }
 
     var head_buf: [32768]u8 = undefined;
     var response = req.receiveHead(&head_buf) catch {
@@ -182,7 +211,13 @@ pub fn downloadWithClientHeaders(client: *std.http.Client, url: []const u8, dest
     var file_writer = file.writer(_dl_io, &file_writer_buf);
     var reader = response.reader(&.{});
 
-    _ = reader.streamRemaining(&file_writer.interface) catch {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash_buf: [DOWNLOAD_STREAM_BUFFER_SIZE]u8 = undefined;
+    var hashed = reader.hashed(&hasher, &hash_buf);
+    // Stream through the hashing reader only when verification is requested.
+    const stream_src: *std.Io.Reader = if (expected_sha256 != null) &hashed.reader else reader;
+
+    _ = stream_src.streamRemaining(&file_writer.interface) catch {
         file.close(_dl_io);
         req.deinit();
         std.Io.Dir.deleteFileAbsolute(_dl_io, dest_path) catch {};
@@ -196,6 +231,42 @@ pub fn downloadWithClientHeaders(client: *std.http.Client, url: []const u8, dest
     };
     file.close(_dl_io);
     req.deinit();
+
+    if (expected_sha256) |sha| {
+        const digest = hasher.finalResult();
+        const charset = "0123456789abcdef";
+        var hex: [64]u8 = undefined;
+        for (digest, 0..) |byte, idx| {
+            hex[idx * 2] = charset[byte >> 4];
+            hex[idx * 2 + 1] = charset[byte & 0x0f];
+        }
+        if (!std.mem.eql(u8, &hex, sha[0..64])) {
+            std.Io.Dir.deleteFileAbsolute(_dl_io, dest_path) catch {};
+            return error.ChecksumMismatch;
+        }
+    }
+}
+
+/// Fetch a URL and write the response body directly to a file.
+pub fn download(alloc: std.mem.Allocator, url: []const u8, dest_path: []const u8) !void {
+    var client: std.http.Client = .{ .allocator = alloc, .io = paths.safe_io };
+    defer client.deinit();
+    return downloadWithClient(&client, url, dest_path);
+}
+
+/// Download using an existing client.
+pub fn downloadWithClient(client: *std.http.Client, url: []const u8, dest_path: []const u8) !void {
+    return downloadWithClientHeaders(client, url, dest_path, &.{});
+}
+
+/// Download using an existing client plus additional headers.
+pub fn downloadWithClientHeaders(client: *std.http.Client, url: []const u8, dest_path: []const u8, extra_headers: []const std.http.Header) !void {
+    return downloadCore(client, url, dest_path, null, extra_headers, null);
+}
+
+/// Download (no SHA) with optional POST form body.
+pub fn downloadWithClientHeadersBody(client: *std.http.Client, url: []const u8, dest_path: []const u8, extra_headers: []const std.http.Header, body: PostBody) !void {
+    return downloadCore(client, url, dest_path, null, extra_headers, body);
 }
 
 /// Download using an existing client while computing SHA256 in the same pass.
@@ -216,66 +287,19 @@ pub fn downloadWithClientSha256Headers(
     expected_sha256: []const u8,
     extra_headers: []const std.http.Header,
 ) !void {
-    if (expected_sha256.len < 64) return error.ChecksumMismatch;
+    return downloadCore(client, url, dest_path, expected_sha256, extra_headers, null);
+}
 
-    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    const split = splitUserAgent(client.allocator, extra_headers);
-    defer if (split.rest.ptr != extra_headers.ptr and split.rest.len > 0) client.allocator.free(split.rest);
-    var req = client.request(.GET, uri, requestOptions(split.ua, split.rest)) catch return error.FetchFailed;
-
-    req.sendBodiless() catch {
-        req.deinit();
-        return error.FetchFailed;
-    };
-
-    var head_buf: [32768]u8 = undefined;
-    var response = req.receiveHead(&head_buf) catch {
-        req.deinit();
-        return error.FetchFailed;
-    };
-    if (response.head.status != .ok) {
-        req.deinit();
-        return error.FetchFailed;
-    }
-
-    const _dl_io = paths.safe_io;
-    var file = std.Io.Dir.createFileAbsolute(_dl_io, dest_path, .{}) catch {
-        req.deinit();
-        return error.FetchFailed;
-    };
-    var file_writer_buf: [DOWNLOAD_STREAM_BUFFER_SIZE]u8 = undefined;
-    var file_writer = file.writer(_dl_io, &file_writer_buf);
-    var reader = response.reader(&.{});
-    var hash_buf: [DOWNLOAD_STREAM_BUFFER_SIZE]u8 = undefined;
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var hashed = reader.hashed(&hasher, &hash_buf);
-
-    _ = hashed.reader.streamRemaining(&file_writer.interface) catch {
-        file.close(_dl_io);
-        req.deinit();
-        std.Io.Dir.deleteFileAbsolute(_dl_io, dest_path) catch {};
-        return error.FetchFailed;
-    };
-    file_writer.interface.flush() catch {
-        file.close(_dl_io);
-        req.deinit();
-        std.Io.Dir.deleteFileAbsolute(_dl_io, dest_path) catch {};
-        return error.FetchFailed;
-    };
-    file.close(_dl_io);
-    req.deinit();
-
-    const digest = hasher.finalResult();
-    const charset = "0123456789abcdef";
-    var hex: [64]u8 = undefined;
-    for (digest, 0..) |byte, idx| {
-        hex[idx * 2] = charset[byte >> 4];
-        hex[idx * 2 + 1] = charset[byte & 0x0f];
-    }
-    if (!std.mem.eql(u8, &hex, expected_sha256[0..64])) {
-        std.Io.Dir.deleteFileAbsolute(_dl_io, dest_path) catch {};
-        return error.ChecksumMismatch;
-    }
+/// Verifying download with optional POST form body.
+pub fn downloadWithClientSha256HeadersBody(
+    client: *std.http.Client,
+    url: []const u8,
+    dest_path: []const u8,
+    expected_sha256: []const u8,
+    extra_headers: []const std.http.Header,
+    body: PostBody,
+) !void {
+    return downloadCore(client, url, dest_path, expected_sha256, extra_headers, body);
 }
 
 // ============================================================

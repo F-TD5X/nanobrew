@@ -6,6 +6,7 @@
 const std = @import("std");
 const Cask = @import("../api/cask.zig").Cask;
 const Artifact = @import("../api/cask.zig").Artifact;
+const PostField = @import("../api/cask.zig").PostField;
 const DownloadFormat = @import("../api/cask.zig").DownloadFormat;
 const paths = @import("../platform/paths.zig");
 const fetch = @import("../net/fetch.zig");
@@ -519,11 +520,20 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
 
+    // Some casks (e.g. segger-jlink) require an HTTP POST with a form body to
+    // accept a license before the real payload is served (#305). Build the
+    // x-www-form-urlencoded body once; null means a plain GET.
+    const post_body: fetch.PostBody = if (cask.isPostDownload())
+        try buildFormBody(alloc, cask.post_data)
+    else
+        null;
+    defer if (post_body) |b| alloc.free(b);
+
     // Verify SHA256 if available
     if (cask.sha256.len == 0 or std.mem.eql(u8, cask.sha256, "no_check")) {
         var attempt: usize = 0;
         while (attempt < CASK_DOWNLOAD_ATTEMPTS) : (attempt += 1) {
-            fetch.downloadWithClientHeaders(&client, url, dest, &CASK_DOWNLOAD_HEADERS) catch |err| {
+            fetch.downloadWithClientHeadersBody(&client, url, dest, &CASK_DOWNLOAD_HEADERS, post_body) catch |err| {
                 std.Io.Dir.deleteFileAbsolute(lib_io, dest) catch {};
                 if (shouldRetryDownload(err, attempt)) {
                     writeDownloadRetryWarning(lib_io, cask, attempt);
@@ -543,7 +553,7 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
 
     var attempt: usize = 0;
     while (attempt < CASK_DOWNLOAD_ATTEMPTS) : (attempt += 1) {
-        fetch.downloadWithClientSha256Headers(&client, url, dest, cask.sha256, &CASK_DOWNLOAD_HEADERS) catch |err| {
+        fetch.downloadWithClientSha256HeadersBody(&client, url, dest, cask.sha256, &CASK_DOWNLOAD_HEADERS, post_body) catch |err| {
             std.Io.Dir.deleteFileAbsolute(lib_io, dest) catch {};
             if (shouldRetryDownload(err, attempt)) {
                 writeDownloadRetryWarning(lib_io, cask, attempt);
@@ -563,6 +573,37 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
         std.Io.Dir.copyFileAbsolute(dest, cached_path, lib_io, .{}) catch {};
     }
     return true;
+}
+
+/// Build an `application/x-www-form-urlencoded` body from a cask's POST data
+/// fields (#305). Caller owns the returned slice.
+fn buildFormBody(alloc: std.mem.Allocator, fields: []const PostField) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    for (fields, 0..) |field, i| {
+        if (i > 0) try buf.append(alloc, '&');
+        try appendFormEncoded(alloc, &buf, field.key);
+        try buf.append(alloc, '=');
+        try appendFormEncoded(alloc, &buf, field.value);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Percent-encode `s` per application/x-www-form-urlencoded rules (spaces as
+/// '+', unreserved chars verbatim, everything else %HH).
+fn appendFormEncoded(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            try buf.append(alloc, c);
+        } else if (c == ' ') {
+            try buf.append(alloc, '+');
+        } else {
+            try buf.append(alloc, '%');
+            try buf.append(alloc, hex[c >> 4]);
+            try buf.append(alloc, hex[c & 0x0f]);
+        }
+    }
 }
 
 fn shouldRetryDownload(err: anyerror, attempt: usize) bool {
@@ -1217,6 +1258,19 @@ fn safeRelativePath(path: []const u8) bool {
 fn safeArchiveMemberPath(path: []const u8) bool {
     return safeRelativePath(path) and
         std.mem.indexOfAny(u8, path, "*?[\\") == null;
+}
+
+test "buildFormBody encodes fields as x-www-form-urlencoded (#305)" {
+    const fields = [_]PostField{
+        .{ .key = "accept_license_agreement", .value = "accepted" },
+        .{ .key = "submit", .value = "Download software" },
+    };
+    const body = try buildFormBody(std.testing.allocator, &fields);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "accept_license_agreement=accepted&submit=Download+software",
+        body,
+    );
 }
 
 test "firstAppInstallConflictIn detects existing app destination" {
