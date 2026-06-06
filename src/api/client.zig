@@ -642,6 +642,23 @@ fn parseCaskJsonArch(alloc: std.mem.Allocator, json_data: []const u8, prefer_int
             alloc.free(field.value);
         }
     }
+    // Extra request modifiers some casks need to reach the real download
+    // (license/CDN gating): referer, user_agent, cookies, header (#305 follow-up).
+    var referer: ?[]const u8 = null;
+    errdefer if (referer) |r| alloc.free(r);
+    var user_agent: ?[]const u8 = null;
+    errdefer if (user_agent) |u| alloc.free(u);
+    var cookies: std.ArrayList(PostField) = .empty;
+    defer cookies.deinit(alloc);
+    errdefer {
+        for (cookies.items) |c| {
+            alloc.free(c.key);
+            alloc.free(c.value);
+        }
+    }
+    var headers_list: std.ArrayList([]const u8) = .empty;
+    defer headers_list.deinit(alloc);
+    errdefer for (headers_list.items) |h| alloc.free(h);
     {
         const specs: ?std.json.ObjectMap = blk: {
             if (selected_var) |sv| {
@@ -669,10 +686,41 @@ fn parseCaskJsonArch(alloc: std.mem.Allocator, json_data: []const u8, prefer_int
                     }
                 }
             }
+            if (getStr(s, "referer")) |r| referer = try allocDupe(alloc, r);
+            if (getStr(s, "user_agent")) |ua| {
+                if (resolveUserAgent(ua)) |resolved| user_agent = try allocDupe(alloc, resolved);
+            }
+            if (s.get("cookies")) |ck_val| {
+                if (ck_val == .object) {
+                    var it = ck_val.object.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* == .string) {
+                            try cookies.append(alloc, .{
+                                .key = try allocDupe(alloc, entry.key_ptr.*),
+                                .value = try allocDupe(alloc, entry.value_ptr.*.string),
+                            });
+                        }
+                    }
+                }
+            }
+            // `header` may be a single "Name: Value" string or an array of them.
+            if (s.get("header")) |hv| {
+                switch (hv) {
+                    .string => try headers_list.append(alloc, try allocDupe(alloc, hv.string)),
+                    .array => for (hv.array.items) |h| {
+                        if (h == .string) try headers_list.append(alloc, try allocDupe(alloc, h.string));
+                    },
+                    else => {},
+                }
+            }
         }
     }
     const owned_post_data = try post_data.toOwnedSlice(alloc);
     errdefer alloc.free(owned_post_data);
+    const owned_cookies = try cookies.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_cookies);
+    const owned_headers = try headers_list.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_headers);
 
     return Cask{
         .token = token,
@@ -687,7 +735,24 @@ fn parseCaskJsonArch(alloc: std.mem.Allocator, json_data: []const u8, prefer_int
         .min_macos = min_macos,
         .download_using = download_using,
         .post_data = owned_post_data,
+        .referer = referer,
+        .user_agent = user_agent,
+        .cookies = owned_cookies,
+        .headers = owned_headers,
     };
+}
+
+/// Resolve a cask `url_specs.user_agent` value. Homebrew uses Ruby symbols for
+/// presets: `:fake` is a browser UA, `:default`/`:curl` mean "use the tool's
+/// own UA" (we return null to keep our built-in one). A literal string is used
+/// verbatim.
+fn resolveUserAgent(ua: []const u8) ?[]const u8 {
+    if (ua.len == 0) return null;
+    if (std.mem.eql(u8, ua, ":default") or std.mem.eql(u8, ua, ":curl")) return null;
+    if (std.mem.eql(u8, ua, ":fake") or std.mem.eql(u8, ua, ":browser")) {
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15";
+    }
+    return ua;
 }
 
 fn fetchAndCache(alloc: std.mem.Allocator, shared_client: ?*std.http.Client, name: []const u8, cache_path: []const u8) !Formula {
@@ -1218,6 +1283,30 @@ test "parseCaskJson - parses url_specs POST data (#305)" {
         }
     }
     try testing.expect(saw_accept and saw_submit);
+}
+
+test "parseCaskJson - parses referer/user_agent/cookies/header url_specs (#305)" {
+    const json =
+        \\{"token":"x","name":["X"],"version":"1.0","url":"https://e.com/x.dmg",
+        \\"sha256":"abc","desc":"","artifacts":[],
+        \\"url_specs":{"referer":"https://e.com/dl","user_agent":":fake",
+        \\"cookies":{"sid":"123"},"header":["X-A: 1","X-B: 2"]}}
+    ;
+    const c = try parseCaskJson(testing.allocator, json);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqualStrings("https://e.com/dl", c.referer.?);
+    try testing.expect(c.user_agent != null);
+    try testing.expect(std.mem.indexOf(u8, c.user_agent.?, "Safari") != null); // :fake resolved
+    try testing.expectEqual(@as(usize, 1), c.cookies.len);
+    try testing.expectEqualStrings("sid", c.cookies[0].key);
+    try testing.expectEqual(@as(usize, 2), c.headers.len);
+}
+
+test "resolveUserAgent - maps Homebrew symbols" {
+    try testing.expect(resolveUserAgent(":default") == null);
+    try testing.expect(resolveUserAgent(":curl") == null);
+    try testing.expect(resolveUserAgent(":fake") != null);
+    try testing.expectEqualStrings("MyApp/1.0", resolveUserAgent("MyApp/1.0").?);
 }
 
 test "parseCaskJson - no url_specs means GET (no post data)" {

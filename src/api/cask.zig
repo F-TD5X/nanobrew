@@ -75,6 +75,16 @@ pub const Cask = struct {
     download_using: ?[]const u8 = null,
     /// Form fields from `url_specs.data`, sent as the POST body (#305).
     post_data: []const PostField = &.{},
+    /// `url_specs.referer` — sent as the Referer header when present.
+    referer: ?[]const u8 = null,
+    /// `url_specs.user_agent` — resolved UA string (Homebrew's `:fake` symbol is
+    /// mapped to a browser UA; `:default`/`:curl` leave this null to use the
+    /// built-in UA). When set, overrides the default download User-Agent.
+    user_agent: ?[]const u8 = null,
+    /// `url_specs.cookies` — sent joined into a single Cookie header.
+    cookies: []const PostField = &.{},
+    /// `url_specs.header` — extra request headers, each "Name: Value".
+    headers: []const []const u8 = &.{},
 
     /// True when this cask must be downloaded with an HTTP POST carrying
     /// `post_data` (e.g. segger-jlink's license acceptance form).
@@ -163,6 +173,15 @@ pub const Cask = struct {
             alloc.free(field.value);
         }
         if (self.post_data.len > 0) alloc.free(self.post_data);
+        if (self.referer) |r| alloc.free(r);
+        if (self.user_agent) |u| alloc.free(u);
+        for (self.cookies) |c| {
+            alloc.free(c.key);
+            alloc.free(c.value);
+        }
+        if (self.cookies.len > 0) alloc.free(self.cookies);
+        for (self.headers) |h| alloc.free(h);
+        if (self.headers.len > 0) alloc.free(self.headers);
     }
 };
 
