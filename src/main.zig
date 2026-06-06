@@ -27,6 +27,7 @@ const Command = enum {
     where,
     upgrade,
     update,
+    update_registry,
     help,
     doctor,
     cleanup,
@@ -150,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
         .where => runWhere(alloc, args[2..]),
         .upgrade => runUpgrade(alloc, args[2..]),
         .update => runUpdate(alloc),
+        .update_registry => runUpdateRegistry(alloc),
         .help => printUsage(),
         .doctor => runDoctor(alloc),
         .cleanup => runCleanup(alloc, args[2..]),
@@ -198,6 +200,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "upgrade", Command.upgrade },
         .{ "update", Command.update },
         .{ "self-update", Command.update },
+        .{ "update-registry", Command.update_registry },
         .{ "help", Command.help },
         .{ "--help", Command.help },
         .{ "-h", Command.help },
@@ -2258,11 +2261,35 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb update ──
 
+/// Refresh the verified-upstream registry cache from the remote so pinned
+/// versions stop going stale between binary releases (#308/#310). Best-effort:
+/// prints a status line but never aborts the caller.
+fn refreshUpstreamRegistry(alloc: std.mem.Allocator) void {
+    const stdout = StdoutWriter{};
+    if (nb.upstream_registry.refreshCache(alloc)) |count| {
+        stdout.print("==> Refreshed upstream registry ({d} records)\n", .{count}) catch {};
+    } else |err| switch (err) {
+        error.RemoteRegistryDisabled => {},
+        else => stdout.print("==> Could not refresh upstream registry ({s}); using cached/embedded data\n", .{@errorName(err)}) catch {},
+    }
+}
+
+/// `nb update-registry` — refresh only the verified-upstream registry cache.
+fn runUpdateRegistry(alloc: std.mem.Allocator) void {
+    const stdout = StdoutWriter{};
+    stdout.print("==> Refreshing upstream registry...\n", .{}) catch {};
+    refreshUpstreamRegistry(alloc);
+}
+
 fn runUpdate(alloc: std.mem.Allocator) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
 
     stdout.print("==> Updating nanobrew...\n", .{}) catch {};
+
+    // Refresh pinned upstream metadata too — otherwise a current binary keeps
+    // stale pins until the next rebuild (#308/#310).
+    refreshUpstreamRegistry(alloc);
 
     // Detect OS and arch at comptime
     const os_name = comptime switch (@import("builtin").os.tag) {
@@ -2878,7 +2905,8 @@ fn printUsage() void {
         \\  upgrade [formula]        Upgrade packages (or all if none specified)
         \\  upgrade --cask [app]     Upgrade casks (or all if none specified)
         \\  upgrade --deb            Upgrade all installed .deb packages
-        \\  update                   Self-update nanobrew to the latest version
+        \\  update                   Self-update nanobrew (also refreshes the upstream registry)
+        \\  update-registry          Refresh only the verified-upstream version registry
         \\  doctor                   Check installation health
         \\  cleanup [--dry-run]      Remove stale caches and orphaned files
         \\  outdated                 List packages with newer versions available
@@ -3938,6 +3966,7 @@ fn runCompletions(args: []const []const u8) void {
             \\    'where:Find packages by pattern (installed, files, index)'
             \\    'upgrade:Upgrade packages'
             \\    'update:Self-update nanobrew'
+            \\    'update-registry:Refresh the verified-upstream registry'
             \\    'doctor:Check installation health'
             \\    'cleanup:Remove stale caches'
             \\    'outdated:List outdated packages'
@@ -4038,6 +4067,7 @@ fn runCompletions(args: []const []const u8) void {
             \\complete -c nb -n '__fish_use_subcommand' -a 'where' -d 'Find packages by pattern'
             \\complete -c nb -n '__fish_use_subcommand' -a 'upgrade' -d 'Upgrade packages'
             \\complete -c nb -n '__fish_use_subcommand' -a 'update' -d 'Self-update nanobrew'
+            \\complete -c nb -n '__fish_use_subcommand' -a 'update-registry' -d 'Refresh the verified-upstream registry'
             \\complete -c nb -n '__fish_use_subcommand' -a 'doctor' -d 'Check installation health'
             \\complete -c nb -n '__fish_use_subcommand' -a 'cleanup' -d 'Remove stale caches'
             \\complete -c nb -n '__fish_use_subcommand' -a 'outdated' -d 'List outdated packages'
