@@ -421,12 +421,17 @@ fn runLocalRbInstall(alloc: std.mem.Allocator, path: []const u8) void {
 
     var had_error = std.atomic.Value(bool).init(false);
     var phase = std.atomic.Value(u8).init(@intFromEnum(Phase.waiting));
+    var fail_reason: ?[]const u8 = null;
     const local_formulae = [_]nb.formula.Formula{f};
     const local_requested = [_][]const u8{f.name};
-    fullInstallOne(alloc, f, &had_error, &phase, false, &local_requested, &local_formulae);
+    fullInstallOne(alloc, f, &had_error, &phase, &fail_reason, false, &local_requested, &local_formulae);
 
     if (had_error.load(.acquire)) {
-        stderr.print("nb: failed to install '{s}'\n", .{f.name}) catch {};
+        if (fail_reason) |why| {
+            stderr.print("nb: failed to install '{s}' ({s})\n", .{ f.name, why }) catch {};
+        } else {
+            stderr.print("nb: failed to install '{s}'\n", .{f.name}) catch {};
+        }
         std.process.exit(1);
     }
 
@@ -829,6 +834,15 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         defer alloc.free(names);
         for (install_order, 0..) |f, idx| names[idx] = f.name;
 
+        // Per-package failure reason (static strings set by the worker), so the
+        // final summary explains *why* each package failed instead of a bare ✗.
+        const reasons = alloc.alloc(?[]const u8, pkg_count) catch {
+            stderr.print("nb: out of memory\n", .{}) catch {};
+            std.process.exit(1);
+        };
+        defer alloc.free(reasons);
+        for (reasons) |*r| r.* = null;
+
         var had_error = std.atomic.Value(bool).init(false);
         var threads: std.ArrayList(std.Thread) = .empty;
         defer threads.deinit(alloc);
@@ -843,7 +857,8 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 threads.items[0].join();
                 _ = threads.orderedRemove(0);
             }
-            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], use_shims, formulae.items, all_formulae }) catch {
+            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], &reasons[pi], use_shims, formulae.items, all_formulae }) catch {
+                reasons[pi] = "could not spawn worker thread";
                 had_error.store(true, .release);
                 phases[pi].store(@intFromEnum(Phase.failed), .release);
                 continue;
@@ -875,7 +890,11 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 if (phase == .done) {
                     stdout.print("    ✓ {s}\n", .{name}) catch {};
                 } else if (phase == .failed) {
-                    stdout.print("    ✗ {s}\n", .{name}) catch {};
+                    if (reasons[i]) |why| {
+                        stdout.print("    ✗ {s} ({s})\n", .{ name, why }) catch {};
+                    } else {
+                        stdout.print("    ✗ {s}\n", .{name}) catch {};
+                    }
                 }
             }
         }
@@ -887,7 +906,11 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 const raw: u8 = phases[i].load(.acquire);
                 const phase: Phase = @enumFromInt(raw);
                 if (phase == .failed) {
-                    stderr.print("    failed: {s}\n", .{name}) catch {};
+                    if (reasons[i]) |why| {
+                        stderr.print("    failed: {s} ({s})\n", .{ name, why }) catch {};
+                    } else {
+                        stderr.print("    failed: {s}\n", .{name}) catch {};
+                    }
                 }
             }
             stderr.print("nb: hint: check permissions with `nb doctor`\n", .{}) catch {};
@@ -1136,6 +1159,18 @@ fn formulaLinkNeedsRepair(
     return nb.linker.needsLinkRepair(name, version, .{ .mode = .private_dependency });
 }
 
+/// Short, human-readable reason for a bottle download failure, surfaced in the
+/// install summary so a `✗` is actionable (#311).
+fn downloadFailureReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.BottleNotFound => "bottle not found upstream — version metadata may be stale",
+        error.AuthFailed => "registry auth failed",
+        error.RateLimited => "rate limited by registry — retry shortly",
+        error.ChecksumMismatch => "checksum mismatch — download corrupted or metadata stale",
+        else => "network error after retries",
+    };
+}
+
 /// Full per-package pipeline: download → extract → materialize → relocate → link
 /// Runs in its own thread — no barriers between phases.
 fn fullInstallOne(
@@ -1143,6 +1178,9 @@ fn fullInstallOne(
     f: nb.formula.Formula,
     had_error: *std.atomic.Value(bool),
     phase: *std.atomic.Value(u8),
+    // Set to a short, static reason string on failure so the final summary can
+    // explain *why* a package failed instead of printing a bare ✗ (#311).
+    fail_reason: *?[]const u8,
     use_shims: bool,
     requested: []const []const u8,
     all_formulae: []const nb.formula.Formula,
@@ -1163,6 +1201,7 @@ fn fullInstallOne(
             phase.store(@intFromEnum(Phase.linking), .release);
             linkFormulaKeg(alloc, f.name, fv, use_shims, requested, all_formulae) catch |err| {
                 stderr.print("nb: {s}: link failed: {}\n", .{ f.name, err }) catch {};
+                fail_reason.* = "link failed";
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1178,6 +1217,7 @@ fn fullInstallOne(
         phase.store(@intFromEnum(Phase.downloading), .release);
         nb.source_builder.buildFromSource(alloc, g_io, f) catch |err| {
             stderr.print("nb: {s}: source build failed: {}\n", .{ f.name, err }) catch {};
+            fail_reason.* = "source build failed";
             had_error.store(true, .release);
             phase.store(@intFromEnum(Phase.failed), .release);
             return;
@@ -1190,6 +1230,7 @@ fn fullInstallOne(
         var blob_buf: [512]u8 = undefined;
         const blob_path = std.fmt.bufPrint(&blob_buf, "{s}/{s}", .{ blob_dir, f.bottle_sha256 }) catch {
             stderr.print("nb: {s}: path too long for blob\n", .{f.name}) catch {};
+            fail_reason.* = "blob path too long";
             had_error.store(true, .release);
             phase.store(@intFromEnum(Phase.failed), .release);
             return;
@@ -1202,14 +1243,8 @@ fn fullInstallOne(
                 .target_kind = .formula,
                 .target_name = f.name,
             }) catch |err| {
-                const hint: []const u8 = switch (err) {
-                    error.BottleNotFound => " (bottle not found upstream — the version metadata may be stale)",
-                    error.AuthFailed => " (registry auth failed)",
-                    error.RateLimited => " (rate limited by registry — retry shortly)",
-                    error.ChecksumMismatch => " (checksum mismatch — download corrupted or metadata stale)",
-                    else => " (network error after retries)",
-                };
-                stderr.print("nb: {s}: download failed: {s}{s}\n", .{ f.name, @errorName(err), hint }) catch {};
+                fail_reason.* = downloadFailureReason(err);
+                stderr.print("nb: {s}: download failed: {s} ({s})\n", .{ f.name, @errorName(err), fail_reason.*.? }) catch {};
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1221,6 +1256,7 @@ fn fullInstallOne(
         if (!nb.store.hasEntry(g_io, f.bottle_sha256)) {
             nb.store.ensureEntry(alloc, g_io, blob_path, f.bottle_sha256) catch |err| {
                 stderr.print("nb: {s}: extract failed: {}\n", .{ f.name, err }) catch {};
+                fail_reason.* = "extract failed";
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1240,6 +1276,7 @@ fn fullInstallOne(
             phase.store(@intFromEnum(Phase.linking), .release);
             linkFormulaKeg(alloc, f.name, fv, use_shims, requested, all_formulae) catch |err| {
                 stderr.print("nb: {s}: link failed: {}\n", .{ f.name, err }) catch {};
+                fail_reason.* = "link failed";
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1252,6 +1289,7 @@ fn fullInstallOne(
         }
         nb.cellar.materialize(g_io, f.bottle_sha256, f.name, f.version) catch |err| {
             stderr.print("nb: {s}: materialize failed: {}\n", .{ f.name, err }) catch {};
+            fail_reason.* = "materialize failed";
             had_error.store(true, .release);
             phase.store(@intFromEnum(Phase.failed), .release);
             return;
@@ -1264,6 +1302,7 @@ fn fullInstallOne(
     const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf) orelse f.version;
     platform.relocate.relocateKeg(alloc, g_io, f.name, actual_ver) catch |err| {
         stderr.print("nb: {s}: relocate failed: {}\n", .{ f.name, err }) catch {};
+        fail_reason.* = "relocate failed";
         had_error.store(true, .release);
         phase.store(@intFromEnum(Phase.failed), .release);
         return;
@@ -1284,6 +1323,7 @@ fn fullInstallOne(
     phase.store(@intFromEnum(Phase.linking), .release);
     linkFormulaKeg(alloc, f.name, actual_ver, use_shims, requested, all_formulae) catch |err| {
         stderr.print("nb: {s}: link failed: {}\n", .{ f.name, err }) catch {};
+        fail_reason.* = "link failed";
         had_error.store(true, .release);
         phase.store(@intFromEnum(Phase.failed), .release);
         return;

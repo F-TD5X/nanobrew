@@ -382,7 +382,18 @@ fn fetchAndCacheCask(alloc: std.mem.Allocator, token: []const u8, cache_path: []
     return parseCaskJson(alloc, body);
 }
 
+/// Whether this build should select Intel (x86_64) cask `variations` blocks.
+const target_is_intel = @import("builtin").cpu.arch == .x86_64;
+
 fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
+    return parseCaskJsonArch(alloc, json_data, target_is_intel);
+}
+
+/// Arch-parameterized cask parser. `prefer_intel` selects Intel `variations`
+/// blocks and uses the x86_64 #{arch} substitution. Split out from parseCaskJson
+/// (which passes the build arch) so the Intel path has unit-test coverage even
+/// when tests run on Apple Silicon (#307).
+fn parseCaskJsonArch(alloc: std.mem.Allocator, json_data: []const u8, prefer_intel: bool) !Cask {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_data, .{});
     defer parsed.deinit();
 
@@ -392,11 +403,7 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
     errdefer alloc.free(token);
     // Resolve #{arch} in URL — Homebrew's cask DSL uses this for arch-specific downloads.
     // The API returns the arm64-resolved URL by default; on x86_64 we need to substitute.
-    const cask_arch = comptime switch (@import("builtin").cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "x86_64",
-        else => "arm64",
-    };
+    const cask_arch: []const u8 = if (prefer_intel) "x86_64" else "arm64";
     const raw_url = getStr(root, "url") orelse return error.MissingField;
 
     // On x86_64, select a SINGLE matching `variations` block (newest macOS key
@@ -405,7 +412,7 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
     // gcc-arm-embedded) downloaded the Intel URL but kept the arm64 root version,
     // producing broken Caskroom paths and symlinks (#307, builds on #174).
     const selected_var: ?std.json.ObjectMap = blk: {
-        if (comptime @import("builtin").cpu.arch == .x86_64) {
+        if (prefer_intel) {
             if (root.get("variations")) |vars| {
                 if (vars == .object) {
                     const intel_keys = [_][]const u8{
@@ -1222,6 +1229,46 @@ test "parseCaskJson - no url_specs means GET (no post data)" {
     defer c.deinit(testing.allocator);
     try testing.expect(!c.isPostDownload());
     try testing.expectEqual(@as(usize, 0), c.post_data.len);
+}
+
+test "parseCaskJsonArch - Intel variation drives version, url, sha AND artifact paths (#307)" {
+    // Shape mirrors gcc-arm-embedded: root is arm64 15.2.rel1, the Intel
+    // variation is 14.2.rel1, and artifact paths bake in the root version.
+    const json =
+        \\{"token":"gcc-arm-embedded","name":["GCC ARM Embedded"],
+        \\"version":"15.2.rel1","sha256":"armsha",
+        \\"url":"https://ex.com/arm-gnu-toolchain-15.2.rel1-darwin-arm64.pkg",
+        \\"artifacts":[
+        \\  {"binary":["/Applications/ArmGNUToolchain/15.2.rel1/bin/arm-none-eabi-gcc"]},
+        \\  {"pkg":["arm-gnu-toolchain-15.2.rel1-darwin-arm64.pkg"]}
+        \\],
+        \\"variations":{"ventura":{
+        \\  "version":"14.2.rel1","sha256":"intelsha",
+        \\  "url":"https://ex.com/arm-gnu-toolchain-14.2.rel1-darwin-x86_64.pkg"}}}
+    ;
+
+    // Intel build: everything must come from the variation.
+    const intel = try parseCaskJsonArch(testing.allocator, json, true);
+    defer intel.deinit(testing.allocator);
+    try testing.expectEqualStrings("14.2.rel1", intel.version);
+    try testing.expectEqualStrings("intelsha", intel.sha256);
+    try testing.expectEqualStrings("https://ex.com/arm-gnu-toolchain-14.2.rel1-darwin-x86_64.pkg", intel.url);
+    var saw_binary = false;
+    for (intel.artifacts) |art| {
+        if (art == .binary) {
+            saw_binary = true;
+            // Path version rewritten from the root 15.2.rel1 to 14.2.rel1.
+            try testing.expectEqualStrings("/Applications/ArmGNUToolchain/14.2.rel1/bin/arm-none-eabi-gcc", art.binary.source);
+        }
+    }
+    try testing.expect(saw_binary);
+
+    // arm64 build: the root values are used unchanged (no variation, no rewrite).
+    const arm = try parseCaskJsonArch(testing.allocator, json, false);
+    defer arm.deinit(testing.allocator);
+    try testing.expectEqualStrings("15.2.rel1", arm.version);
+    try testing.expectEqualStrings("armsha", arm.sha256);
+    try testing.expect(std.mem.indexOf(u8, arm.url, "arm64") != null);
 }
 
 test "rewriteVersion - substitutes arch version in artifact paths (#307)" {
