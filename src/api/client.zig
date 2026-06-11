@@ -985,16 +985,39 @@ fn allocDupe(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return alloc.dupe(u8, s);
 }
 
-/// Dupe `s`, substituting every occurrence of `from` with `to`. Used to rewrite
+/// Dupe `s`, substituting occurrences of `from` with `to`. Used to rewrite
 /// the arm64 (root) cask version baked into the API's artifact paths with the
 /// architecture-specific version when an Intel `variations` block was selected,
 /// so binary/uninstall paths point at the directory the Intel pkg actually
 /// creates (#307). No-op when `from`/`to` are equal or `from` is absent.
+/// Only token-bounded occurrences are replaced: a `from` of "1.2" must not
+/// match inside "11.2" or "1.25" (neighbors may not be alphanumeric or '.').
 fn rewriteVersion(alloc: std.mem.Allocator, s: []const u8, from: []const u8, to: []const u8) ![]const u8 {
     if (from.len == 0 or std.mem.eql(u8, from, to) or std.mem.indexOf(u8, s, from) == null) {
         return allocDupe(alloc, s);
     }
-    return std.mem.replaceOwned(u8, alloc, s, from, to);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (std.mem.startsWith(u8, s[i..], from)) {
+            const before_ok = i == 0 or !isVersionTokenChar(s[i - 1]);
+            const after_idx = i + from.len;
+            const after_ok = after_idx >= s.len or !isVersionTokenChar(s[after_idx]);
+            if (before_ok and after_ok) {
+                try out.appendSlice(alloc, to);
+                i += from.len;
+                continue;
+            }
+        }
+        try out.append(alloc, s[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn isVersionTokenChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '.';
 }
 
 const testing = std.testing;
