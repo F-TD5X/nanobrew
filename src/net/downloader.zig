@@ -289,7 +289,11 @@ fn downloadAndExtractOne(
 
 const TOKEN_CACHE_DIR = paths.TOKEN_CACHE_DIR;
 
-fn fetchGhcrToken(alloc: std.mem.Allocator, client: *std.http.Client, url: []const u8) !?[]const u8 {
+/// Public so the install pipeline can pre-fetch one GHCR bearer token at the
+/// start of a batch and share it read-only with every worker. Without this,
+/// each worker pays at least a disk-cache hit (and at most an HTTP RTT)
+/// before its bottle download starts.
+pub fn fetchGhcrToken(alloc: std.mem.Allocator, client: *std.http.Client, url: []const u8) !?[]const u8 {
     const ghcr_prefix = "https://ghcr.io/v2/";
     if (!std.mem.startsWith(u8, url, ghcr_prefix)) return null;
 
@@ -378,7 +382,13 @@ fn scopeToCacheName(repo: []const u8, buf: *[256]u8) ?[]const u8 {
 
 /// Internal: download using an existing HTTP client and optional pre-fetched token.
 /// `preauth_token` is a read-only slice owned by the caller — not freed here.
-fn downloadOneWithClient(
+/// Public so the install pipeline can route every bottle download through a
+/// single batch-scoped `std.http.Client`. The client's connection pool then
+/// hangs onto open TLS sessions to ghcr.io (or a mirror) and successive
+/// downloads avoid a fresh TLS+TCP handshake.
+/// `preauth_token`, when present, is shared read-only across workers and
+/// replaces N per-download token lookups with one batch-wide lookup.
+pub fn downloadOneWithClient(
     alloc: std.mem.Allocator,
     client: *std.http.Client,
     req: DownloadRequest,
@@ -415,16 +425,15 @@ fn downloadOneWithClient(
 
     // Determine auth token:
     //   1. preauth_token if URL is ghcr.io (caller pre-fetched for the batch)
-    //   2. null if custom bottle domain that is not ghcr.io (no auth required)
-    //   3. fresh fetch (disk-cached with 4-min TTL) otherwise
-    const is_ghcr = std.mem.startsWith(u8, effective_url, "https://ghcr.io");
-    const skip_auth = bottle_domain != null and !is_ghcr;
-    const fresh_token: ?[]const u8 = if (!skip_auth and preauth_token == null)
+    //   2. fresh fetch (disk-cached with 4-min TTL) for ghcr.io without preauth
+    //   3. null for custom bottle domains or other third-party bottle hosts
+    const is_ghcr = isGhcrUrl(effective_url);
+    const fresh_token: ?[]const u8 = if (is_ghcr and preauth_token == null)
         try fetchGhcrToken(alloc, client, effective_url)
     else
         null;
     defer if (fresh_token) |t| alloc.free(t);
-    const token: ?[]const u8 = if (skip_auth) null else (preauth_token orelse fresh_token);
+    const token: ?[]const u8 = if (is_ghcr) (preauth_token orelse fresh_token) else null;
 
     // Build auth header
     var auth_buf: [4096]u8 = undefined;
@@ -523,12 +532,23 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn isGhcrUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "https://ghcr.io/");
+}
+
 const testing = std.testing;
 
 test "scopeToCacheName - replaces slashes with underscores" {
     var buf: [256]u8 = undefined;
     const name = scopeToCacheName("homebrew/core/ffmpeg", &buf).?;
     try testing.expectEqualStrings("homebrew_core_ffmpeg", name);
+}
+
+test "isGhcrUrl only matches the ghcr.io HTTPS host" {
+    try testing.expect(isGhcrUrl("https://ghcr.io/v2/homebrew/core/hello/blobs/sha256:abc"));
+    try testing.expect(!isGhcrUrl("https://github.com/owner/repo/releases/download/v1/pkg.tar.gz"));
+    try testing.expect(!isGhcrUrl("https://ghcr.io.evil.example/v2/homebrew/core/hello"));
+    try testing.expect(!isGhcrUrl("http://ghcr.io/v2/homebrew/core/hello"));
 }
 
 test "scopeToCacheName - single segment unchanged" {
