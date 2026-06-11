@@ -4,6 +4,9 @@ All notable changes to nanobrew are documented here.
 
 ## Unreleased
 
+### Added
+- **`nb switch <pkg>@<version>`** — reactivate a previously-installed version. Instant when the keg is still in the Cellar (switch keeps the outgoing version on disk, unlike `rollback`); otherwise re-materializes from the content-addressed store, and suggests `nb install pkg@version` when the payload is gone. `nb list --versions` shows each package's install history with the switchable versions marked.
+
 ### Fixed
 - **Failed installs no longer leave phantom DB entries, and downloads retry transient failures** — a package whose download/extract failed used to be recorded in the database at its declared version, tripping `nb doctor` and blocking reinstalls. Installs now only record kegs that actually landed in the Cellar, bottle downloads retry network blips/5xx/429 with linear backoff (checksum mismatches and 404/auth are not retried), and the install summary prints *why* each package failed instead of a bare ✗. (#311)
 - **Intel casks read `version` from the same arch `variations` block as `url`/`sha256`** — previously the root (arm64) version leaked into artifact paths on Intel, breaking Caskroom paths and symlinks for casks like `gcc-arm-embedded`; the root version baked into artifact paths is rewritten (token-bounded) to the arch version. (#307)

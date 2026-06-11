@@ -35,6 +35,7 @@ const Command = enum {
     pin,
     unpin,
     rollback,
+    switch_version,
     bundle,
     deps,
     services,
@@ -144,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
             runRemove(alloc, args[2..]);
             runInstall(alloc, args[2..]);
         },
-        .list => runList(alloc),
+        .list => runList(alloc, args[2..]),
         .leaves => runLeaves(alloc, args[2..]),
         .info => runInfo(alloc, args[2..]),
         .search => runSearch(alloc, args[2..]),
@@ -159,6 +160,7 @@ pub fn main(init: std.process.Init) !void {
         .pin => runPin(alloc, args[2..], true),
         .unpin => runPin(alloc, args[2..], false),
         .rollback => runRollback(alloc, args[2..]),
+        .switch_version => runSwitch(alloc, args[2..]),
         .bundle => runBundle(alloc, args[2..]),
         .deps => runDeps(alloc, args[2..]),
         .services => runServices(alloc, args[2..]),
@@ -213,6 +215,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "unpin", Command.unpin },
         .{ "rollback", Command.rollback },
         .{ "rb", Command.rollback },
+        .{ "switch", Command.switch_version },
         .{ "bundle", Command.bundle },
         .{ "deps", Command.deps },
         .{ "services", Command.services },
@@ -1455,9 +1458,14 @@ fn runRemove(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb list ──
 
-fn runList(alloc: std.mem.Allocator) void {
+fn runList(alloc: std.mem.Allocator, args: []const []const u8) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
+
+    var show_versions = false;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--versions")) show_versions = true;
+    }
 
     var db = nb.database.Database.open(alloc) catch {
         stderr.print("nb: could not open database\n", .{}) catch {};
@@ -1487,6 +1495,21 @@ fn runList(alloc: std.mem.Allocator) void {
     for (kegs) |keg| {
         const pin_tag = if (keg.pinned) " [pinned]" else "";
         stdout.print("{s} {s}{s}\n", .{ keg.name, keg.version, pin_tag }) catch {};
+        if (show_versions) {
+            // Newest history first. A version is switchable when its blob is
+            // still in the content-addressed store (cleanup may prune it).
+            const hist = db.getHistory(keg.name);
+            var idx = hist.len;
+            while (idx > 0) {
+                idx -= 1;
+                const h = hist[idx];
+                var kv_buf: [256]u8 = undefined;
+                const switchable = (h.sha256.len > 0 and nb.store.hasEntry(g_io, h.sha256)) or
+                    nb.cellar.detectKegVersion(keg.name, h.version, &kv_buf) != null;
+                const avail = if (switchable) " (switchable)" else "";
+                stdout.print("    {s}{s}\n", .{ h.version, avail }) catch {};
+            }
+        }
     }
     for (casks) |c| {
         stdout.print("{s} {s} (cask)\n", .{ c.token, c.version }) catch {};
@@ -2958,7 +2981,7 @@ fn printUsage() void {
         \\  remove <formula>         Uninstall packages
         \\  remove --cask <app>      Uninstall macOS applications
         \\  remove --deb <pkg>       Uninstall .deb packages (Linux)
-        \\  list                     List installed packages, casks, and debs
+        \\  list [--versions]        List installed packages, casks, and debs
         \\  leaves [--tree]          List packages with no dependents
         \\  info <formula>           Show formula info from Homebrew API
         \\  info --cask <app>        Show cask info from Homebrew API
@@ -2975,6 +2998,7 @@ fn printUsage() void {
         \\  pin <package>            Pin a package (skip during upgrade)
         \\  unpin <package>          Unpin a package
         \\  rollback <package>       Rollback to previous version
+        \\  switch <pkg>@<version>   Reactivate a previously-installed version
         \\  bundle [dump|install]    Export/import package lists (Brewfile-compatible)
         \\  deps [--tree] <formula>  Show dependency tree
         \\  services [list|start|stop|restart] [name]
@@ -3527,6 +3551,107 @@ fn runRollback(alloc: std.mem.Allocator, args: []const []const u8) void {
         stdout.print("==> Rolled back {s} to {s}\n", .{ name, prev.version }) catch {};
     }
 }
+
+// ── nb switch ──
+
+/// `nb switch <pkg>@<version>` — reactivate a previously-installed version.
+/// `rollback` is the special case "switch to the previous version"; switch
+/// targets any version in the install history whose blob is still in the
+/// content-addressed store. The currently-active keg is pushed onto history
+/// by recordInstall, so switching back and forth works.
+fn runSwitch(alloc: std.mem.Allocator, args: []const []const u8) void {
+    const stdout = StdoutWriter{};
+    const stderr = StderrWriter{};
+
+    if (args.len == 0) {
+        stderr.print("nb: no package specified\nUsage: nb switch <package>@<version>\n", .{}) catch {};
+        std.process.exit(1);
+    }
+
+    var db = nb.database.Database.open(alloc) catch {
+        stderr.print("nb: could not open database\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer db.close();
+
+    var had_error = false;
+    for (args) |spec| {
+        const at = std.mem.lastIndexOfScalar(u8, spec, '@') orelse {
+            stderr.print("nb: '{s}': expected <package>@<version> (see `nb list --versions`)\n", .{spec}) catch {};
+            had_error = true;
+            continue;
+        };
+        const name = spec[0..at];
+        const want = spec[at + 1 ..];
+        if (name.len == 0 or want.len == 0) {
+            stderr.print("nb: '{s}': expected <package>@<version>\n", .{spec}) catch {};
+            had_error = true;
+            continue;
+        }
+
+        const keg = db.findKeg(name) orelse {
+            stderr.print("nb: '{s}' is not installed\n", .{name}) catch {};
+            had_error = true;
+            continue;
+        };
+        if (std.mem.eql(u8, keg.version, want)) {
+            stdout.print("==> {s} {s} is already active\n", .{ name, want }) catch {};
+            continue;
+        }
+
+        // Latest matching history entry wins — versions repeat after A→B→A.
+        const hist = db.getHistory(name);
+        const prev: nb.database.HistoryEntry = blk: {
+            var idx = hist.len;
+            while (idx > 0) {
+                idx -= 1;
+                if (std.mem.eql(u8, hist[idx].version, want)) break :blk hist[idx];
+            }
+            stderr.print("nb: {s} {s} is not in the install history; try `nb install {s}@{s}`\n", .{ name, want, name, want }) catch {};
+            had_error = true;
+            continue;
+        };
+
+        // Fast path: the target keg is still in the Cellar (switch keeps the
+        // outgoing version on disk, unlike rollback) — just relink.
+        var ver_buf: [256]u8 = undefined;
+        const on_disk = nb.cellar.detectKegVersion(name, want, &ver_buf);
+
+        if (on_disk == null) {
+            // Not in the Cellar — re-materialize from the content-addressed
+            // store. An empty/pruned store entry means a re-download is needed.
+            if (prev.sha256.len == 0 or !nb.store.hasEntry(g_io, prev.sha256)) {
+                stderr.print("nb: the payload for {s} {s} is no longer on disk; try `nb install {s}@{s}`\n", .{ name, want, name, want }) catch {};
+                had_error = true;
+                continue;
+            }
+        }
+
+        stdout.print("==> Switching {s} ({s} -> {s})\n", .{ name, keg.version, want }) catch {};
+        nb.linker.unlinkKeg(name, keg.version) catch {};
+
+        const actual_ver = on_disk orelse blk: {
+            nb.cellar.materialize(g_io, prev.sha256, name, prev.version) catch |err| {
+                stderr.print("nb: {s}: materialize failed: {}\n", .{ name, err }) catch {};
+                // Re-link the version we just unlinked so the package isn't
+                // left with no active links.
+                nb.linker.linkKeg(name, keg.version) catch {};
+                had_error = true;
+                continue;
+            };
+            const v = nb.cellar.detectKegVersion(name, prev.version, &ver_buf) orelse prev.version;
+            platform.relocate.relocateKeg(alloc, g_io, name, v) catch {};
+            platform.relocate.replaceKegPlaceholders(g_io, name, v);
+            platform.relocate.sealKegBundles(alloc, g_io, name, v);
+            break :blk v;
+        };
+
+        nb.linker.linkKeg(name, actual_ver) catch {};
+        db.recordInstall(name, prev.version, prev.sha256) catch {};
+        stdout.print("==> Switched {s} to {s} (previous version kept in the Cellar; `nb cleanup` prunes it)\n", .{ name, prev.version }) catch {};
+    }
+    if (had_error) std.process.exit(1);
+}
 // ── nb bundle ──
 
 fn runBundle(alloc: std.mem.Allocator, args: []const []const u8) void {
@@ -4037,6 +4162,7 @@ fn runCompletions(args: []const []const u8) void {
             \\    'pin:Pin a package'
             \\    'unpin:Unpin a package'
             \\    'rollback:Rollback to previous version'
+            \\    'switch:Reactivate a previously-installed version'
             \\    'bundle:Export/import package lists'
             \\    'deps:Show dependency tree'
             \\    'services:Manage services'
@@ -4092,7 +4218,7 @@ fn runCompletions(args: []const []const u8) void {
     } else if (std.mem.eql(u8, shell, "bash")) {
         stdout.print(
             \\_nb_completions() {{
-            \\  local commands="init install remove list leaves info search where upgrade update doctor cleanup outdated pin unpin rollback bundle deps services completions telemetry nuke migrate help"
+            \\  local commands="init install remove list leaves info search where upgrade update doctor cleanup outdated pin unpin rollback switch bundle deps services completions telemetry nuke migrate help"
             \\  if [[ $COMP_CWORD -eq 1 ]]; then
             \\    COMPREPLY=($(compgen -W "$commands" -- "${{COMP_WORDS[COMP_CWORD]}}"))
             \\  else
