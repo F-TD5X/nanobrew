@@ -116,6 +116,61 @@ fn cachedIndexTsv(alloc: std.mem.Allocator, url: []const u8, json_path: []const 
     return buildAndWriteIndexTsv(alloc, json, idx_path, kind);
 }
 
+/// Byte range of one entry inside the bulk JSON, from the TSV sidecar.
+pub const EntryRange = struct { start: usize, end: usize };
+
+/// Find a formula's byte range in the cached bulk formula list. Returns null
+/// unless the bulk JSON cache is fresh and the sidecar matches it — callers
+/// fall back to a network fetch.
+pub fn bulkFormulaEntryJson(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
+    const lib_io = paths.safe_io;
+    const json_mtime = fileMtimeNs(FORMULA_CACHE) orelse return null;
+    const now_ts = std.Io.Timestamp.now(lib_io, .real);
+    if (now_ts.nanoseconds - json_mtime > CACHE_TTL_NS) return null;
+    const idx_mtime = fileMtimeNs(FORMULA_IDX) orelse return null;
+    if (idx_mtime < json_mtime) return null;
+
+    const tsv = readFileAlloc(alloc, FORMULA_IDX) orelse return null;
+    defer alloc.free(tsv);
+    const range = findEntryRange(tsv, name) orelse return null;
+
+    // pread exactly the entry's bytes out of the 30 MB bulk JSON.
+    const file = std.Io.Dir.openFileAbsolute(lib_io, FORMULA_CACHE, .{}) catch return null;
+    defer file.close(lib_io);
+    const st = file.stat(lib_io) catch return null;
+    if (range.end > st.size or range.start >= range.end) return null;
+    const buf = alloc.alloc(u8, range.end - range.start) catch return null;
+    const n = file.readPositionalAll(lib_io, buf, range.start) catch {
+        alloc.free(buf);
+        return null;
+    };
+    if (n != buf.len or buf.len == 0 or buf[0] != '{' or buf[buf.len - 1] != '}') {
+        alloc.free(buf);
+        return null;
+    }
+    return buf;
+}
+
+/// Exact-name lookup in the TSV sidecar; offsets come from columns 4/5.
+fn findEntryRange(tsv: []const u8, name: []const u8) ?EntryRange {
+    var line_iter = std.mem.splitScalar(u8, tsv, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len <= name.len or line[name.len] != '\t') continue;
+        if (!std.mem.eql(u8, line[0..name.len], name)) continue;
+        // name\tversion\tdesc\tstart\tend
+        var cols = std.mem.splitScalar(u8, line, '\t');
+        _ = cols.next(); // name
+        _ = cols.next(); // version
+        _ = cols.next(); // desc
+        const start_s = cols.next() orelse return null;
+        const end_s = cols.next() orelse return null;
+        const start = std.fmt.parseInt(usize, start_s, 10) catch return null;
+        const end = std.fmt.parseInt(usize, end_s, 10) catch return null;
+        return .{ .start = start, .end = end };
+    }
+    return null;
+}
+
 fn fileMtimeNs(path: []const u8) ?i96 {
     const lib_io = paths.safe_io;
     const file = std.Io.Dir.openFileAbsolute(lib_io, path, .{}) catch return null;
@@ -177,6 +232,9 @@ fn buildIndexTsv(alloc: std.mem.Allocator, json: []const u8, kind: ListKind) ![]
             .object_begin => {},
             else => return error.UnexpectedJson,
         }
+        // Byte range of this entry within the source JSON — the cursor sits
+        // just past the consumed structural token on both ends.
+        const entry_start = scanner.cursor - 1;
 
         var name: []const u8 = "";
         var desc: []const u8 = "";
@@ -238,13 +296,15 @@ fn buildIndexTsv(alloc: std.mem.Allocator, json: []const u8, kind: ListKind) ![]
             }
         }
 
+        const entry_end = scanner.cursor;
+
         if (name.len == 0) continue;
         try out.appendSlice(alloc, name);
         try out.append(alloc, '\t');
         try appendSanitized(&out, alloc, version);
         try out.append(alloc, '\t');
         try appendSanitized(&out, alloc, desc);
-        try out.append(alloc, '\n');
+        try out.print(alloc, "\t{d}\t{d}\n", .{ entry_start, entry_end });
     }
 
     return out.toOwnedSlice(alloc);
@@ -265,7 +325,10 @@ fn searchIndexTsv(alloc: std.mem.Allocator, tsv: []const u8, lower_query: []cons
         const tab2 = std.mem.indexOfScalarPos(u8, line, tab1 + 1, '\t') orelse continue;
         const name = line[0..tab1];
         const version = line[tab1 + 1 .. tab2];
-        const desc = line[tab2 + 1 ..];
+        // Column 3 is desc; trailing columns (entry byte offsets) are for the
+        // bulk-slice formula fetch, not for search.
+        const desc_end = std.mem.indexOfScalarPos(u8, line, tab2 + 1, '\t') orelse line.len;
+        const desc = line[tab2 + 1 .. desc_end];
         if (!containsIgnoreCase(name, lower_query) and !containsIgnoreCase(desc, lower_query)) continue;
         try results.append(alloc, .{
             .name = try alloc.dupe(u8, name),
@@ -343,14 +406,38 @@ fn toLower(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 
 const testing = std.testing;
 
-test "buildIndexTsv - formula entries become name/version/desc rows" {
+test "buildIndexTsv - formula entries become rows with valid entry offsets" {
     const json =
         \\[{"name":"ripgrep","desc":"Search tool","versions":{"stable":"14.1.1","head":"HEAD"},"revision":0},
         \\ {"name":"weird","desc":"tab\there","versions":{"stable":"1.0"}}]
     ;
     const tsv = try buildIndexTsv(testing.allocator, json, .formula);
     defer testing.allocator.free(tsv);
-    try testing.expectEqualStrings("ripgrep\t14.1.1\tSearch tool\nweird\t1.0\ttab here\n", tsv);
+
+    // Rows are name\tversion\tdesc\tstart\tend; desc sanitized.
+    var lines = std.mem.splitScalar(u8, tsv, '\n');
+    const row1 = lines.next().?;
+    try testing.expect(std.mem.startsWith(u8, row1, "ripgrep\t14.1.1\tSearch tool\t"));
+    const row2 = lines.next().?;
+    try testing.expect(std.mem.startsWith(u8, row2, "weird\t1.0\ttab here\t"));
+
+    // The offsets must slice back to exactly the entry's JSON object.
+    const r1 = findEntryRange(tsv, "ripgrep").?;
+    const slice1 = json[r1.start..r1.end];
+    try testing.expect(slice1[0] == '{' and slice1[slice1.len - 1] == '}');
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, slice1, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ripgrep", parsed.value.object.get("name").?.string);
+
+    const r2 = findEntryRange(tsv, "weird").?;
+    const slice2 = json[r2.start..r2.end];
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, slice2, .{});
+    defer parsed2.deinit();
+    try testing.expectEqualStrings("weird", parsed2.value.object.get("name").?.string);
+
+    // Prefix names must not match other entries' rows.
+    try testing.expect(findEntryRange(tsv, "rip") == null);
+    try testing.expect(findEntryRange(tsv, "nope") == null);
 }
 
 test "buildIndexTsv - cask entries use token and version" {
@@ -359,7 +446,9 @@ test "buildIndexTsv - cask entries use token and version" {
     ;
     const tsv = try buildIndexTsv(testing.allocator, json, .cask);
     defer testing.allocator.free(tsv);
-    try testing.expectEqualStrings("raycast\t1.101.1\tLauncher\n", tsv);
+    try testing.expect(std.mem.startsWith(u8, tsv, "raycast\t1.101.1\tLauncher\t"));
+    const r = findEntryRange(tsv, "raycast").?;
+    try testing.expect(json[r.start] == '{' and json[r.end - 1] == '}');
 }
 
 test "searchIndexTsv - matches name and desc case-insensitively" {
