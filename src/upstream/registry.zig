@@ -330,6 +330,34 @@ pub fn loadRegistryWithOptions(alloc: std.mem.Allocator, options: LoadOptions) !
     return parseRegistry(alloc, DEFAULT_REGISTRY_JSON);
 }
 
+/// Force-fetch the remote registry and overwrite the local cache, ignoring the
+/// TTL. Validates that the payload parses before writing so a bad response
+/// can't poison the cache. Returns the number of records cached. Lets `nb
+/// update` / `nb update-registry` refresh pinned versions without rebuilding
+/// the binary (#308/#310 follow-up).
+pub fn refreshCache(alloc: std.mem.Allocator) !usize {
+    var options: LoadOptions = .{};
+    if (envSlice("NANOBREW_UPSTREAM_REGISTRY_CACHE")) |cache_path| {
+        if (cache_path.len > 0) options.cache_path = cache_path;
+    }
+    if (envSlice("NANOBREW_UPSTREAM_REGISTRY_URL")) |remote_url| {
+        options.remote_url = remote_url;
+    }
+    if (options.remote_url.len == 0) return error.RemoteRegistryDisabled;
+    if (std.c.getenv("NANOBREW_DISABLE_UPSTREAM_REGISTRY_REMOTE") != null) {
+        return error.RemoteRegistryDisabled;
+    }
+
+    const remote_json = try fetchRemoteRegistryJson(alloc, options.remote_url);
+    defer alloc.free(remote_json);
+
+    var registry = try parseRegistry(alloc, remote_json);
+    defer registry.deinit(alloc);
+
+    writeRegistryCache(options.cache_path, remote_json);
+    return registry.records.len;
+}
+
 pub fn parseRecordJson(alloc: std.mem.Allocator, json_data: []const u8) !Record {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_data, .{});
     defer parsed.deinit();

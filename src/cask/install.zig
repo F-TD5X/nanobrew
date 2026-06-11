@@ -6,6 +6,7 @@
 const std = @import("std");
 const Cask = @import("../api/cask.zig").Cask;
 const Artifact = @import("../api/cask.zig").Artifact;
+const PostField = @import("../api/cask.zig").PostField;
 const DownloadFormat = @import("../api/cask.zig").DownloadFormat;
 const paths = @import("../platform/paths.zig");
 const fetch = @import("../net/fetch.zig");
@@ -19,9 +20,6 @@ const APPLICATIONS_DIR = "/Applications";
 const ZIP_LIST_STDOUT_LIMIT = 8 * 1024 * 1024;
 const CASK_DOWNLOAD_ATTEMPTS = 3;
 const CASK_DOWNLOAD_RETRY_BASE_MS = 250;
-const CASK_DOWNLOAD_HEADERS = [_]std.http.Header{
-    .{ .name = "User-Agent", .value = "Homebrew/4 (nanobrew)" },
-};
 
 // Darwin extended-attribute syscall used in place of spawning `/usr/bin/xattr`
 // for the common non-recursive quarantine-removal path.
@@ -523,11 +521,27 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
 
+    // Some casks (e.g. segger-jlink) require an HTTP POST with a form body to
+    // accept a license before the real payload is served (#305). Build the
+    // x-www-form-urlencoded body once; null means a plain GET.
+    const post_body: fetch.PostBody = if (cask.isPostDownload())
+        try buildFormBody(alloc, cask.post_data)
+    else
+        null;
+    defer if (post_body) |b| alloc.free(b);
+
+    // Build request headers from the cask's url_specs (user_agent/referer/
+    // cookies/header), falling back to the default UA. Some downloads gate on
+    // these (#305 follow-up).
+    var header_storage = try buildCaskHeaders(alloc, cask);
+    defer header_storage.deinit(alloc);
+    const req_headers = header_storage.headers;
+
     // Verify SHA256 if available
     if (cask.sha256.len == 0 or std.mem.eql(u8, cask.sha256, "no_check")) {
         var attempt: usize = 0;
         while (attempt < CASK_DOWNLOAD_ATTEMPTS) : (attempt += 1) {
-            fetch.downloadWithClientHeaders(&client, url, dest, &CASK_DOWNLOAD_HEADERS) catch |err| {
+            fetch.downloadWithClientHeadersBody(&client, url, dest, req_headers, post_body) catch |err| {
                 std.Io.Dir.deleteFileAbsolute(lib_io, dest) catch {};
                 if (shouldRetryDownload(err, attempt)) {
                     writeDownloadRetryWarning(lib_io, cask, attempt);
@@ -547,7 +561,7 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
 
     var attempt: usize = 0;
     while (attempt < CASK_DOWNLOAD_ATTEMPTS) : (attempt += 1) {
-        fetch.downloadWithClientSha256Headers(&client, url, dest, cask.sha256, &CASK_DOWNLOAD_HEADERS) catch |err| {
+        fetch.downloadWithClientSha256HeadersBody(&client, url, dest, cask.sha256, req_headers, post_body) catch |err| {
             std.Io.Dir.deleteFileAbsolute(lib_io, dest) catch {};
             if (shouldRetryDownload(err, attempt)) {
                 writeDownloadRetryWarning(lib_io, cask, attempt);
@@ -567,6 +581,91 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
         std.Io.Dir.copyFileAbsolute(dest, cached_path, lib_io, .{}) catch {};
     }
     return true;
+}
+
+/// Owns the request-header slice (and the joined Cookie string it may point
+/// into) built from a cask's url_specs for one download.
+const CaskHeaders = struct {
+    headers: []std.http.Header,
+    cookie_value: ?[]u8 = null,
+
+    fn deinit(self: *CaskHeaders, alloc: std.mem.Allocator) void {
+        alloc.free(self.headers);
+        if (self.cookie_value) |c| alloc.free(c);
+    }
+};
+
+/// Assemble the HTTP headers for a cask download: the User-Agent (cask override
+/// or our default), plus any Referer / Cookie / custom header entries declared
+/// in the cask's url_specs (#305 follow-up). Header name/value slices borrow the
+/// cask's own strings; only the joined Cookie value is allocated here.
+fn buildCaskHeaders(alloc: std.mem.Allocator, cask: Cask) !CaskHeaders {
+    var list: std.ArrayList(std.http.Header) = .empty;
+    errdefer list.deinit(alloc);
+
+    try list.append(alloc, .{
+        .name = "User-Agent",
+        .value = cask.user_agent orelse "Homebrew/4 (nanobrew)",
+    });
+    if (cask.referer) |r| try list.append(alloc, .{ .name = "Referer", .value = r });
+
+    var cookie_value: ?[]u8 = null;
+    errdefer if (cookie_value) |c| alloc.free(c);
+    if (cask.cookies.len > 0) {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        for (cask.cookies, 0..) |c, i| {
+            if (i > 0) try buf.appendSlice(alloc, "; ");
+            try buf.appendSlice(alloc, c.key);
+            try buf.append(alloc, '=');
+            try buf.appendSlice(alloc, c.value);
+        }
+        cookie_value = try buf.toOwnedSlice(alloc);
+        try list.append(alloc, .{ .name = "Cookie", .value = cookie_value.? });
+    }
+
+    // Each header entry is "Name: Value"; split on the first ':' (value's
+    // leading space trimmed). Slices borrow the cask's string.
+    for (cask.headers) |h| {
+        const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
+        const name = std.mem.trim(u8, h[0..colon], " ");
+        const value = std.mem.trim(u8, h[colon + 1 ..], " ");
+        if (name.len == 0) continue;
+        try list.append(alloc, .{ .name = name, .value = value });
+    }
+
+    return .{ .headers = try list.toOwnedSlice(alloc), .cookie_value = cookie_value };
+}
+
+/// Build an `application/x-www-form-urlencoded` body from a cask's POST data
+/// fields (#305). Caller owns the returned slice.
+fn buildFormBody(alloc: std.mem.Allocator, fields: []const PostField) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    for (fields, 0..) |field, i| {
+        if (i > 0) try buf.append(alloc, '&');
+        try appendFormEncoded(alloc, &buf, field.key);
+        try buf.append(alloc, '=');
+        try appendFormEncoded(alloc, &buf, field.value);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Percent-encode `s` per application/x-www-form-urlencoded rules (spaces as
+/// '+', unreserved chars verbatim, everything else %HH).
+fn appendFormEncoded(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            try buf.append(alloc, c);
+        } else if (c == ' ') {
+            try buf.append(alloc, '+');
+        } else {
+            try buf.append(alloc, '%');
+            try buf.append(alloc, hex[c >> 4]);
+            try buf.append(alloc, hex[c & 0x0f]);
+        }
+    }
 }
 
 fn shouldRetryDownload(err: anyerror, attempt: usize) bool {
@@ -1226,6 +1325,59 @@ fn safeRelativePath(path: []const u8) bool {
 fn safeArchiveMemberPath(path: []const u8) bool {
     return safeRelativePath(path) and
         std.mem.indexOfAny(u8, path, "*?[\\") == null;
+}
+
+test "buildCaskHeaders includes UA override, referer, joined cookies, and split headers (#305)" {
+    const cookies = [_]PostField{
+        .{ .key = "a", .value = "1" },
+        .{ .key = "b", .value = "2" },
+    };
+    const hdrs = [_][]const u8{ "X-One: foo", "X-Two: bar" };
+    var cask = std.mem.zeroInit(Cask, .{});
+    cask.user_agent = "Custom/9";
+    cask.referer = "https://ref.example";
+    cask.cookies = &cookies;
+    cask.headers = &hdrs;
+
+    var built = try buildCaskHeaders(std.testing.allocator, cask);
+    defer built.deinit(std.testing.allocator);
+
+    var ua: ?[]const u8 = null;
+    var referer: ?[]const u8 = null;
+    var cookie: ?[]const u8 = null;
+    var x_one: ?[]const u8 = null;
+    for (built.headers) |h| {
+        if (std.mem.eql(u8, h.name, "User-Agent")) ua = h.value;
+        if (std.mem.eql(u8, h.name, "Referer")) referer = h.value;
+        if (std.mem.eql(u8, h.name, "Cookie")) cookie = h.value;
+        if (std.mem.eql(u8, h.name, "X-One")) x_one = h.value;
+    }
+    try std.testing.expectEqualStrings("Custom/9", ua.?);
+    try std.testing.expectEqualStrings("https://ref.example", referer.?);
+    try std.testing.expectEqualStrings("a=1; b=2", cookie.?);
+    try std.testing.expectEqualStrings("foo", x_one.?);
+}
+
+test "buildCaskHeaders defaults the User-Agent when the cask sets none" {
+    const cask = std.mem.zeroInit(Cask, .{});
+    var built = try buildCaskHeaders(std.testing.allocator, cask);
+    defer built.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), built.headers.len);
+    try std.testing.expectEqualStrings("User-Agent", built.headers[0].name);
+    try std.testing.expectEqualStrings("Homebrew/4 (nanobrew)", built.headers[0].value);
+}
+
+test "buildFormBody encodes fields as x-www-form-urlencoded (#305)" {
+    const fields = [_]PostField{
+        .{ .key = "accept_license_agreement", .value = "accepted" },
+        .{ .key = "submit", .value = "Download software" },
+    };
+    const body = try buildFormBody(std.testing.allocator, &fields);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "accept_license_agreement=accepted&submit=Download+software",
+        body,
+    );
 }
 
 test "firstAppInstallConflictIn detects existing app destination" {

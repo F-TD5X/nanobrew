@@ -10,10 +10,12 @@ const BOTTLE_TAG = @import("formula.zig").BOTTLE_TAG;
 const BOTTLE_FALLBACKS = @import("formula.zig").BOTTLE_FALLBACKS;
 const Cask = @import("cask.zig").Cask;
 const Artifact = @import("cask.zig").Artifact;
+const PostField = @import("cask.zig").PostField;
 const tap = @import("tap.zig");
 const fetch = @import("../net/fetch.zig");
 const upstream_github = @import("../upstream/github.zig");
 const upstream_registry = @import("../upstream/registry.zig");
+const version_cmp = @import("../version.zig");
 
 const API_BASE = "https://formulae.brew.sh/api/formula/";
 const CASK_API_BASE = "https://formulae.brew.sh/api/cask/";
@@ -226,6 +228,19 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
         else
             upstream_github.fetchFormula(alloc, name);
         if (upstream_result) |upstream_formula| {
+            // The verified-upstream registry pins a version that can lag behind
+            // Homebrew's live API. Prefer the live bottle when it's strictly
+            // newer so installs aren't stuck on a stale pin (#308). Best-effort:
+            // tap refs have no core API and any live-fetch failure keeps the pin.
+            if (!tap_ref and upstreamFreshnessEnabled()) {
+                if (fetchFormulaLive(alloc, client, name) catch null) |live| {
+                    if (version_cmp.isNewer(live.version, upstream_formula.version)) {
+                        upstream_formula.deinit(alloc);
+                        return live;
+                    }
+                    live.deinit(alloc);
+                }
+            }
             return upstream_formula;
         } else |err| switch (err) {
             error.UpstreamRecordNotFound,
@@ -244,7 +259,24 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
         return tap.fetchTapFormula(alloc, client, name);
     }
 
-    // Check cache first (5 minute TTL)
+    return fetchFormulaLive(alloc, client, name) catch |err| {
+        if (err == error.FormulaNotFound) {
+            // Try to resolve as an alias (e.g., "python" -> "python@3.14")
+            if (resolveFormulaAlias(alloc, name)) |resolved_name| {
+                defer alloc.free(resolved_name);
+                if (!std.mem.eql(u8, resolved_name, name)) {
+                    return fetchFormulaWithClientAndUpstreamRegistry(alloc, client, resolved_name, registry) catch err;
+                }
+            }
+        }
+        return err;
+    };
+}
+
+/// Fetch a formula directly from the live Homebrew API (cache → network),
+/// bypassing the verified-upstream registry. Used both as the no-upstream path
+/// and for the freshness comparison above.
+fn fetchFormulaLive(alloc: std.mem.Allocator, client: ?*std.http.Client, name: []const u8) !Formula {
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}.json", .{ API_CACHE_DIR, name }) catch return error.NameTooLong;
 
@@ -257,20 +289,14 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
         return formula;
     }
 
-    const result = fetchAndCache(alloc, client, name, cache_path);
-    if (result == error.FormulaNotFound) {
-        // Try to resolve as an alias (e.g., "python" -> "python@3.14")
-        if (resolveFormulaAlias(alloc, name)) |resolved_name| {
-            defer alloc.free(resolved_name);
-            if (!std.mem.eql(u8, resolved_name, name)) {
-                // Found an alias, fetch with the resolved name
-                const r = fetchFormulaWithClientAndUpstreamRegistry(alloc, client, resolved_name, registry) catch return result;
-                // Return the formula with its resolved name
-                return r;
-            }
-        }
-    }
-    return result;
+    return fetchAndCache(alloc, client, name, cache_path);
+}
+
+/// Whether to cross-check verified-upstream pins against the live Homebrew API.
+/// On by default; set NANOBREW_DISABLE_UPSTREAM_FRESHNESS=1 to keep pins as-is
+/// (e.g. fully offline use of the embedded registry).
+fn upstreamFreshnessEnabled() bool {
+    return std.c.getenv("NANOBREW_DISABLE_UPSTREAM_FRESHNESS") == null;
 }
 
 fn isTapRef(name: []const u8) bool {
@@ -286,6 +312,18 @@ pub fn fetchCask(alloc: std.mem.Allocator, token: []const u8) !Cask {
 
     if (std.c.getenv("NANOBREW_DISABLE_UPSTREAM") == null) {
         if (upstream_github.fetchCask(alloc, token)) |upstream_cask| {
+            // Prefer the live Homebrew cask when it's strictly newer than the
+            // pinned verified-upstream version (#310). Best-effort — tap refs and
+            // any live-fetch failure keep the verified pin.
+            if (!tap_ref and upstreamFreshnessEnabled()) {
+                if (fetchCaskLive(alloc, token) catch null) |live| {
+                    if (version_cmp.isNewer(live.version, upstream_cask.version)) {
+                        upstream_cask.deinit(alloc);
+                        return live;
+                    }
+                    live.deinit(alloc);
+                }
+            }
             return upstream_cask;
         } else |err| switch (err) {
             error.UpstreamRecordNotFound,
@@ -305,6 +343,12 @@ pub fn fetchCask(alloc: std.mem.Allocator, token: []const u8) !Cask {
         return tap.fetchTapCask(alloc, token);
     }
 
+    return fetchCaskLive(alloc, token);
+}
+
+/// Fetch a cask directly from the live Homebrew API (cache → network),
+/// bypassing the verified-upstream registry.
+fn fetchCaskLive(alloc: std.mem.Allocator, token: []const u8) !Cask {
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/cask-{s}.json", .{ API_CACHE_DIR, token }) catch return error.NameTooLong;
 
@@ -338,7 +382,18 @@ fn fetchAndCacheCask(alloc: std.mem.Allocator, token: []const u8, cache_path: []
     return parseCaskJson(alloc, body);
 }
 
+/// Whether this build should select Intel (x86_64) cask `variations` blocks.
+const target_is_intel = @import("builtin").cpu.arch == .x86_64;
+
 fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
+    return parseCaskJsonArch(alloc, json_data, target_is_intel);
+}
+
+/// Arch-parameterized cask parser. `prefer_intel` selects Intel `variations`
+/// blocks and uses the x86_64 #{arch} substitution. Split out from parseCaskJson
+/// (which passes the build arch) so the Intel path has unit-test coverage even
+/// when tests run on Apple Silicon (#307).
+fn parseCaskJsonArch(alloc: std.mem.Allocator, json_data: []const u8, prefer_intel: bool) !Cask {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_data, .{});
     defer parsed.deinit();
 
@@ -346,25 +401,18 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
 
     const token = try allocDupe(alloc, getStr(root, "token") orelse return error.MissingField);
     errdefer alloc.free(token);
-    const version = try allocDupe(alloc, getStr(root, "version") orelse return error.MissingField);
-    errdefer alloc.free(version);
     // Resolve #{arch} in URL — Homebrew's cask DSL uses this for arch-specific downloads.
     // The API returns the arm64-resolved URL by default; on x86_64 we need to substitute.
-    const cask_arch = comptime switch (@import("builtin").cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "x86_64",
-        else => "arm64",
-    };
+    const cask_arch: []const u8 = if (prefer_intel) "x86_64" else "arm64";
     const raw_url = getStr(root, "url") orelse return error.MissingField;
-    const url = blk: {
-        if (std.mem.indexOf(u8, raw_url, "#{arch}") != null) {
-            break :blk try std.mem.replaceOwned(u8, alloc, raw_url, "#{arch}", cask_arch);
-        }
-        // On x86_64, also check the variations object for an Intel-specific URL override.
-        // Try macOS version keys newest-first so modern Intel Macs (Tahoe, Sequoia,
-        // Sonoma, Ventura, Monterey) match before falling through to the default arm64 URL.
-        // Fixes #174: casks with no #{arch} in their URL served the arm64 variant on Intel.
-        if (comptime @import("builtin").cpu.arch == .x86_64) {
+
+    // On x86_64, select a SINGLE matching `variations` block (newest macOS key
+    // first) and read url/sha256/version consistently from it. Reading each field
+    // independently meant arch-specific casks (e.g. `on_arm`/`on_intel` blocks like
+    // gcc-arm-embedded) downloaded the Intel URL but kept the arm64 root version,
+    // producing broken Caskroom paths and symlinks (#307, builds on #174).
+    const selected_var: ?std.json.ObjectMap = blk: {
+        if (prefer_intel) {
             if (root.get("variations")) |vars| {
                 if (vars == .object) {
                     const intel_keys = [_][]const u8{
@@ -373,42 +421,42 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                     };
                     for (intel_keys) |key| {
                         if (vars.object.get(key)) |v| {
-                            if (v == .object) {
-                                if (getStr(v.object, "url")) |vurl| {
-                                    break :blk try allocDupe(alloc, vurl);
-                                }
-                            }
+                            if (v == .object) break :blk v.object;
                         }
                     }
                 }
             }
         }
-        break :blk try allocDupe(alloc, raw_url);
+        break :blk null;
+    };
+
+    // The arm64/default version baked into the API's pre-rendered artifact paths.
+    const root_version = getStr(root, "version") orelse return error.MissingField;
+    const version = try allocDupe(alloc, blk: {
+        if (selected_var) |sv| {
+            if (getStr(sv, "version")) |vver| break :blk vver;
+        }
+        break :blk root_version;
+    });
+    errdefer alloc.free(version);
+
+    const url = blk: {
+        // Prefer the variation URL when one was selected; otherwise the root URL.
+        const base_url = if (selected_var) |sv| (getStr(sv, "url") orelse raw_url) else raw_url;
+        if (std.mem.indexOf(u8, base_url, "#{arch}") != null) {
+            break :blk try std.mem.replaceOwned(u8, alloc, base_url, "#{arch}", cask_arch);
+        }
+        break :blk try allocDupe(alloc, base_url);
     };
     errdefer alloc.free(url);
-    // Pick sha256 matching the resolved URL source (variations may override it too)
-    const sha256 = blk: {
-        if (comptime @import("builtin").cpu.arch == .x86_64) {
-            if (root.get("variations")) |vars| {
-                if (vars == .object) {
-                    const intel_keys = [_][]const u8{
-                        "tahoe",   "sequoia",  "sonoma", "ventura",     "monterey",
-                        "big_sur", "catalina", "mojave", "high_sierra", "x86_64",
-                    };
-                    for (intel_keys) |key| {
-                        if (vars.object.get(key)) |v| {
-                            if (v == .object) {
-                                if (getStr(v.object, "sha256")) |vsha| {
-                                    break :blk try allocDupe(alloc, vsha);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+
+    // sha256 must come from the same source as the URL/version above.
+    const sha256 = try allocDupe(alloc, blk: {
+        if (selected_var) |sv| {
+            if (getStr(sv, "sha256")) |vsha| break :blk vsha;
         }
-        break :blk try allocDupe(alloc, getStr(root, "sha256") orelse "no_check");
-    };
+        break :blk getStr(root, "sha256") orelse "no_check";
+    });
     errdefer alloc.free(sha256);
     const homepage = try allocDupe(alloc, getStr(root, "homepage") orelse "");
     errdefer alloc.free(homepage);
@@ -492,7 +540,7 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                     if (app_val == .array) {
                         for (app_val.array.items) |a| {
                             if (a == .string) {
-                                try artifacts.append(alloc, .{ .app = try allocDupe(alloc, a.string) });
+                                try artifacts.append(alloc, .{ .app = try rewriteVersion(alloc, a.string, root_version, version) });
                             }
                         }
                     }
@@ -504,7 +552,7 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                         var bi: usize = 0;
                         while (bi < items.len) : (bi += 1) {
                             if (items[bi] == .string) {
-                                const source = try allocDupe(alloc, items[bi].string);
+                                const source = try rewriteVersion(alloc, items[bi].string, root_version, version);
                                 // Check if next element is an object with target
                                 var target: []const u8 = undefined;
                                 if (bi + 1 < items.len and items[bi + 1] == .object) {
@@ -516,7 +564,7 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                                 try artifacts.append(alloc, .{ .binary = .{ .source = source, .target = target } });
                             } else if (items[bi] == .object) {
                                 const source_str = getStr(items[bi].object, "source") orelse continue;
-                                const source = try allocDupe(alloc, source_str);
+                                const source = try rewriteVersion(alloc, source_str, root_version, version);
                                 const target = try allocDupe(alloc, getStr(items[bi].object, "target") orelse std.fs.path.basename(source_str));
                                 try artifacts.append(alloc, .{ .binary = .{ .source = source, .target = target } });
                             }
@@ -526,7 +574,7 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                     if (pkg_val == .array) {
                         for (pkg_val.array.items) |p| {
                             if (p == .string) {
-                                try artifacts.append(alloc, .{ .pkg = try allocDupe(alloc, p.string) });
+                                try artifacts.append(alloc, .{ .pkg = try rewriteVersion(alloc, p.string, root_version, version) });
                             }
                         }
                     }
@@ -535,7 +583,7 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                         for (uninst_val.array.items) |u| {
                             if (u == .object) {
                                 const quit = try allocDupe(alloc, getStr(u.object, "quit") orelse "");
-                                const pkgutil = try allocDupe(alloc, getStr(u.object, "pkgutil") orelse "");
+                                const pkgutil = try rewriteVersion(alloc, getStr(u.object, "pkgutil") orelse "", root_version, version);
                                 try artifacts.append(alloc, .{ .uninstall = .{ .quit = quit, .pkgutil = pkgutil } });
                             }
                         }
@@ -548,8 +596,8 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                             for (suite_val.array.items) |s| {
                                 if (s == .string) {
                                     try artifacts.append(alloc, .{ .suite = .{
-                                        .source = try allocDupe(alloc, s.string),
-                                        .target = try allocDupe(alloc, suite_target),
+                                        .source = try rewriteVersion(alloc, s.string, root_version, version),
+                                        .target = try rewriteVersion(alloc, suite_target, root_version, version),
                                     } });
                                 }
                             }
@@ -567,8 +615,8 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
                         if (art_target.len == 0) art_target = getStr(obj, "target") orelse "";
                         if (art_target.len > 0) {
                             try artifacts.append(alloc, .{ .artifact = .{
-                                .source = try allocDupe(alloc, art_items[0].string),
-                                .target = try allocDupe(alloc, art_target),
+                                .source = try rewriteVersion(alloc, art_items[0].string, root_version, version),
+                                .target = try rewriteVersion(alloc, art_target, root_version, version),
                             } });
                         }
                     }
@@ -579,6 +627,100 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
 
     const owned_artifacts = try artifacts.toOwnedSlice(alloc);
     errdefer alloc.free(owned_artifacts);
+
+    // Parse `url_specs` (Homebrew's `using:`/`data:` download spec). When a POST
+    // method + form data is present we must replay it on download, otherwise the
+    // server returns a license/landing page instead of the payload (#305). Prefer
+    // the selected variation's url_specs so arch-specific POST bodies are honored.
+    var download_using: ?[]const u8 = null;
+    errdefer if (download_using) |u| alloc.free(u);
+    var post_data: std.ArrayList(PostField) = .empty;
+    defer post_data.deinit(alloc);
+    errdefer {
+        for (post_data.items) |field| {
+            alloc.free(field.key);
+            alloc.free(field.value);
+        }
+    }
+    // Extra request modifiers some casks need to reach the real download
+    // (license/CDN gating): referer, user_agent, cookies, header (#305 follow-up).
+    var referer: ?[]const u8 = null;
+    errdefer if (referer) |r| alloc.free(r);
+    var user_agent: ?[]const u8 = null;
+    errdefer if (user_agent) |u| alloc.free(u);
+    var cookies: std.ArrayList(PostField) = .empty;
+    defer cookies.deinit(alloc);
+    errdefer {
+        for (cookies.items) |c| {
+            alloc.free(c.key);
+            alloc.free(c.value);
+        }
+    }
+    var headers_list: std.ArrayList([]const u8) = .empty;
+    defer headers_list.deinit(alloc);
+    errdefer for (headers_list.items) |h| alloc.free(h);
+    {
+        const specs: ?std.json.ObjectMap = blk: {
+            if (selected_var) |sv| {
+                if (sv.get("url_specs")) |us| {
+                    if (us == .object) break :blk us.object;
+                }
+            }
+            if (root.get("url_specs")) |us| {
+                if (us == .object) break :blk us.object;
+            }
+            break :blk null;
+        };
+        if (specs) |s| {
+            if (getStr(s, "using")) |u| download_using = try allocDupe(alloc, u);
+            if (s.get("data")) |data_val| {
+                if (data_val == .object) {
+                    var it = data_val.object.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* == .string) {
+                            try post_data.append(alloc, .{
+                                .key = try allocDupe(alloc, entry.key_ptr.*),
+                                .value = try allocDupe(alloc, entry.value_ptr.*.string),
+                            });
+                        }
+                    }
+                }
+            }
+            if (getStr(s, "referer")) |r| referer = try allocDupe(alloc, r);
+            if (getStr(s, "user_agent")) |ua| {
+                if (resolveUserAgent(ua)) |resolved| user_agent = try allocDupe(alloc, resolved);
+            }
+            if (s.get("cookies")) |ck_val| {
+                if (ck_val == .object) {
+                    var it = ck_val.object.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* == .string) {
+                            try cookies.append(alloc, .{
+                                .key = try allocDupe(alloc, entry.key_ptr.*),
+                                .value = try allocDupe(alloc, entry.value_ptr.*.string),
+                            });
+                        }
+                    }
+                }
+            }
+            // `header` may be a single "Name: Value" string or an array of them.
+            if (s.get("header")) |hv| {
+                switch (hv) {
+                    .string => try headers_list.append(alloc, try allocDupe(alloc, hv.string)),
+                    .array => for (hv.array.items) |h| {
+                        if (h == .string) try headers_list.append(alloc, try allocDupe(alloc, h.string));
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    const owned_post_data = try post_data.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_post_data);
+    const owned_cookies = try cookies.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_cookies);
+    const owned_headers = try headers_list.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_headers);
 
     return Cask{
         .token = token,
@@ -591,7 +733,26 @@ fn parseCaskJson(alloc: std.mem.Allocator, json_data: []const u8) !Cask {
         .auto_updates = auto_updates,
         .artifacts = owned_artifacts,
         .min_macos = min_macos,
+        .download_using = download_using,
+        .post_data = owned_post_data,
+        .referer = referer,
+        .user_agent = user_agent,
+        .cookies = owned_cookies,
+        .headers = owned_headers,
     };
+}
+
+/// Resolve a cask `url_specs.user_agent` value. Homebrew uses Ruby symbols for
+/// presets: `:fake` is a browser UA, `:default`/`:curl` mean "use the tool's
+/// own UA" (we return null to keep our built-in one). A literal string is used
+/// verbatim.
+fn resolveUserAgent(ua: []const u8) ?[]const u8 {
+    if (ua.len == 0) return null;
+    if (std.mem.eql(u8, ua, ":default") or std.mem.eql(u8, ua, ":curl")) return null;
+    if (std.mem.eql(u8, ua, ":fake") or std.mem.eql(u8, ua, ":browser")) {
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15";
+    }
+    return ua;
 }
 
 fn fetchAndCache(alloc: std.mem.Allocator, shared_client: ?*std.http.Client, name: []const u8, cache_path: []const u8) !Formula {
@@ -822,6 +983,41 @@ fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 fn allocDupe(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return alloc.dupe(u8, s);
+}
+
+/// Dupe `s`, substituting occurrences of `from` with `to`. Used to rewrite
+/// the arm64 (root) cask version baked into the API's artifact paths with the
+/// architecture-specific version when an Intel `variations` block was selected,
+/// so binary/uninstall paths point at the directory the Intel pkg actually
+/// creates (#307). No-op when `from`/`to` are equal or `from` is absent.
+/// Only token-bounded occurrences are replaced: a `from` of "1.2" must not
+/// match inside "11.2" or "1.25" (neighbors may not be alphanumeric or '.').
+fn rewriteVersion(alloc: std.mem.Allocator, s: []const u8, from: []const u8, to: []const u8) ![]const u8 {
+    if (from.len == 0 or std.mem.eql(u8, from, to) or std.mem.indexOf(u8, s, from) == null) {
+        return allocDupe(alloc, s);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (std.mem.startsWith(u8, s[i..], from)) {
+            const before_ok = i == 0 or !isVersionTokenChar(s[i - 1]);
+            const after_idx = i + from.len;
+            const after_ok = after_idx >= s.len or !isVersionTokenChar(s[after_idx]);
+            if (before_ok and after_ok) {
+                try out.appendSlice(alloc, to);
+                i += from.len;
+                continue;
+            }
+        }
+        try out.append(alloc, s[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn isVersionTokenChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '.';
 }
 
 const testing = std.testing;
@@ -1087,6 +1283,117 @@ test "parseCaskJson - missing url returns error" {
         \\"sha256":"abc","desc":"","artifacts":[]}
     ;
     try testing.expectError(error.MissingField, parseCaskJson(testing.allocator, json));
+}
+
+test "parseCaskJson - parses url_specs POST data (#305)" {
+    const json =
+        \\{"token":"segger-jlink","name":["SEGGER JLink"],"version":"9.48",
+        \\"url":"https://example.com/JLink.pkg","sha256":"abc","desc":"","artifacts":[],
+        \\"url_specs":{"using":"post","data":{"accept_license_agreement":"accepted","submit":"Download software"}}}
+    ;
+    const c = try parseCaskJson(testing.allocator, json);
+    defer c.deinit(testing.allocator);
+    try testing.expect(c.isPostDownload());
+    try testing.expectEqual(@as(usize, 2), c.post_data.len);
+    // Order follows JSON object iteration; assert by lookup instead of index.
+    var saw_accept = false;
+    var saw_submit = false;
+    for (c.post_data) |f| {
+        if (std.mem.eql(u8, f.key, "accept_license_agreement")) {
+            saw_accept = true;
+            try testing.expectEqualStrings("accepted", f.value);
+        } else if (std.mem.eql(u8, f.key, "submit")) {
+            saw_submit = true;
+            try testing.expectEqualStrings("Download software", f.value);
+        }
+    }
+    try testing.expect(saw_accept and saw_submit);
+}
+
+test "parseCaskJson - parses referer/user_agent/cookies/header url_specs (#305)" {
+    const json =
+        \\{"token":"x","name":["X"],"version":"1.0","url":"https://e.com/x.dmg",
+        \\"sha256":"abc","desc":"","artifacts":[],
+        \\"url_specs":{"referer":"https://e.com/dl","user_agent":":fake",
+        \\"cookies":{"sid":"123"},"header":["X-A: 1","X-B: 2"]}}
+    ;
+    const c = try parseCaskJson(testing.allocator, json);
+    defer c.deinit(testing.allocator);
+    try testing.expectEqualStrings("https://e.com/dl", c.referer.?);
+    try testing.expect(c.user_agent != null);
+    try testing.expect(std.mem.indexOf(u8, c.user_agent.?, "Safari") != null); // :fake resolved
+    try testing.expectEqual(@as(usize, 1), c.cookies.len);
+    try testing.expectEqualStrings("sid", c.cookies[0].key);
+    try testing.expectEqual(@as(usize, 2), c.headers.len);
+}
+
+test "resolveUserAgent - maps Homebrew symbols" {
+    try testing.expect(resolveUserAgent(":default") == null);
+    try testing.expect(resolveUserAgent(":curl") == null);
+    try testing.expect(resolveUserAgent(":fake") != null);
+    try testing.expectEqualStrings("MyApp/1.0", resolveUserAgent("MyApp/1.0").?);
+}
+
+test "parseCaskJson - no url_specs means GET (no post data)" {
+    const json =
+        \\{"token":"firefox","name":["Firefox"],"version":"1.0",
+        \\"url":"https://example.com/f.dmg","sha256":"abc","desc":"","artifacts":[]}
+    ;
+    const c = try parseCaskJson(testing.allocator, json);
+    defer c.deinit(testing.allocator);
+    try testing.expect(!c.isPostDownload());
+    try testing.expectEqual(@as(usize, 0), c.post_data.len);
+}
+
+test "parseCaskJsonArch - Intel variation drives version, url, sha AND artifact paths (#307)" {
+    // Shape mirrors gcc-arm-embedded: root is arm64 15.2.rel1, the Intel
+    // variation is 14.2.rel1, and artifact paths bake in the root version.
+    const json =
+        \\{"token":"gcc-arm-embedded","name":["GCC ARM Embedded"],
+        \\"version":"15.2.rel1","sha256":"armsha",
+        \\"url":"https://ex.com/arm-gnu-toolchain-15.2.rel1-darwin-arm64.pkg",
+        \\"artifacts":[
+        \\  {"binary":["/Applications/ArmGNUToolchain/15.2.rel1/bin/arm-none-eabi-gcc"]},
+        \\  {"pkg":["arm-gnu-toolchain-15.2.rel1-darwin-arm64.pkg"]}
+        \\],
+        \\"variations":{"ventura":{
+        \\  "version":"14.2.rel1","sha256":"intelsha",
+        \\  "url":"https://ex.com/arm-gnu-toolchain-14.2.rel1-darwin-x86_64.pkg"}}}
+    ;
+
+    // Intel build: everything must come from the variation.
+    const intel = try parseCaskJsonArch(testing.allocator, json, true);
+    defer intel.deinit(testing.allocator);
+    try testing.expectEqualStrings("14.2.rel1", intel.version);
+    try testing.expectEqualStrings("intelsha", intel.sha256);
+    try testing.expectEqualStrings("https://ex.com/arm-gnu-toolchain-14.2.rel1-darwin-x86_64.pkg", intel.url);
+    var saw_binary = false;
+    for (intel.artifacts) |art| {
+        if (art == .binary) {
+            saw_binary = true;
+            // Path version rewritten from the root 15.2.rel1 to 14.2.rel1.
+            try testing.expectEqualStrings("/Applications/ArmGNUToolchain/14.2.rel1/bin/arm-none-eabi-gcc", art.binary.source);
+        }
+    }
+    try testing.expect(saw_binary);
+
+    // arm64 build: the root values are used unchanged (no variation, no rewrite).
+    const arm = try parseCaskJsonArch(testing.allocator, json, false);
+    defer arm.deinit(testing.allocator);
+    try testing.expectEqualStrings("15.2.rel1", arm.version);
+    try testing.expectEqualStrings("armsha", arm.sha256);
+    try testing.expect(std.mem.indexOf(u8, arm.url, "arm64") != null);
+}
+
+test "rewriteVersion - substitutes arch version in artifact paths (#307)" {
+    const out = try rewriteVersion(testing.allocator, "/Applications/Tool/15.2.rel1/bin/x", "15.2.rel1", "14.2.rel1");
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("/Applications/Tool/14.2.rel1/bin/x", out);
+
+    // No-op when versions match.
+    const same = try rewriteVersion(testing.allocator, "/a/15.2.rel1", "15.2.rel1", "15.2.rel1");
+    defer testing.allocator.free(same);
+    try testing.expectEqualStrings("/a/15.2.rel1", same);
 }
 
 test "parseCaskJson - parses suite and artifact stanzas (KiCad shape)" {

@@ -355,7 +355,10 @@ fn relocateMachO64(alloc: std.mem.Allocator, io: std.Io, path: []const u8, data:
         const r = std.process.run(alloc, io, .{ .argv = argv.items, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return false;
         defer alloc.free(r.stdout);
         defer alloc.free(r.stderr);
-        return switch (r.term) { .exited => |c| c == 0, else => false };
+        return switch (r.term) {
+            .exited => |c| c == 0,
+            else => false,
+        };
     }
     return false;
 }
@@ -397,9 +400,18 @@ fn relocateWithOtool(alloc: std.mem.Allocator, io: std.Io, path: []const u8, oto
             current_cmd = .load_dylib;
             continue;
         }
-        if (std.mem.startsWith(u8, trimmed, "cmd LC_ID_DYLIB")) { current_cmd = .id_dylib; continue; }
-        if (std.mem.startsWith(u8, trimmed, "cmd LC_RPATH")) { current_cmd = .rpath; continue; }
-        if (std.mem.startsWith(u8, trimmed, "cmd ")) { current_cmd = .none; continue; }
+        if (std.mem.startsWith(u8, trimmed, "cmd LC_ID_DYLIB")) {
+            current_cmd = .id_dylib;
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "cmd LC_RPATH")) {
+            current_cmd = .rpath;
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "cmd ")) {
+            current_cmd = .none;
+            continue;
+        }
 
         if ((current_cmd == .load_dylib or current_cmd == .id_dylib) and std.mem.startsWith(u8, trimmed, "name ")) {
             const after = trimmed[5..];
@@ -407,7 +419,10 @@ fn relocateWithOtool(alloc: std.mem.Allocator, io: std.Io, path: []const u8, oto
             const dylib_path = after[0..paren];
             if (hasPlaceholder(dylib_path)) {
                 const new_path = replacePlaceholders(alloc, dylib_path) catch continue;
-                to_free.append(alloc, new_path) catch { alloc.free(new_path); continue; };
+                to_free.append(alloc, new_path) catch {
+                    alloc.free(new_path);
+                    continue;
+                };
                 if (current_cmd == .load_dylib) {
                     argv.append(alloc, "-change") catch continue;
                     argv.append(alloc, dylib_path) catch continue;
@@ -424,7 +439,10 @@ fn relocateWithOtool(alloc: std.mem.Allocator, io: std.Io, path: []const u8, oto
             const rpath = after[0..paren];
             if (hasPlaceholder(rpath)) {
                 const new_rpath = replacePlaceholders(alloc, rpath) catch continue;
-                to_free.append(alloc, new_rpath) catch { alloc.free(new_rpath); continue; };
+                to_free.append(alloc, new_rpath) catch {
+                    alloc.free(new_rpath);
+                    continue;
+                };
                 argv.append(alloc, "-rpath") catch continue;
                 argv.append(alloc, rpath) catch continue;
                 argv.append(alloc, new_rpath) catch continue;
@@ -438,7 +456,10 @@ fn relocateWithOtool(alloc: std.mem.Allocator, io: std.Io, path: []const u8, oto
         const r = std.process.run(alloc, io, .{ .argv = argv.items, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return false;
         defer alloc.free(r.stdout);
         defer alloc.free(r.stderr);
-        return switch (r.term) { .exited => |c| c == 0, else => false };
+        return switch (r.term) {
+            .exited => |c| c == 0,
+            else => false,
+        };
     }
     return false;
 }
@@ -501,6 +522,7 @@ fn fileContainsPlaceholder(path: []const u8) bool {
     if (ph.fileContainsPlaceholder(path)) return true;
     return fileContainsLiteral(path, "/opt/homebrew/") or
         fileContainsLiteral(path, "/usr/local/Cellar/") or
+        fileContainsLiteral(path, "/usr/local/opt/") or
         fileContainsLiteral(path, "/home/linuxbrew/.linuxbrew/");
 }
 
@@ -512,15 +534,16 @@ fn fileContainsLiteral(path: []const u8, needle: []const u8) bool {
     var file_offset: u64 = 0;
     const result: bool = blk: {
         while (true) {
-            if (overlap > 0) {
-                const src = buf[buf.len - overlap ..];
-                std.mem.copyForwards(u8, buf[0..overlap], src);
-            }
             const n = file.readPositional(lib_io, &.{buf[overlap..]}, file_offset) catch break :blk false;
             if (n == 0) break;
             const total = overlap + n;
             if (std.mem.indexOf(u8, buf[0..total], needle) != null) break :blk true;
-            overlap = @min(needle.len - 1, total);
+            // Carry the tail of the *valid data* (buf[total-carry..total], not
+            // buf[buf.len-carry..]) so a needle spanning the chunk boundary is
+            // found even after a short read leaves the buffer tail stale.
+            const carry = @min(needle.len - 1, total);
+            std.mem.copyForwards(u8, buf[0..carry], buf[total - carry .. total]);
+            overlap = carry;
             file_offset += @intCast(n);
         }
         break :blk false;
@@ -536,7 +559,10 @@ fn runProcess(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![
         .stderr_limit = .limited(4096),
     }) catch return error.ReadFailed;
     defer alloc.free(result.stderr);
-    if (switch (result.term) { .exited => |c| c != 0, else => true }) {
+    if (switch (result.term) {
+        .exited => |c| c != 0,
+        else => true,
+    }) {
         alloc.free(result.stdout);
         return error.ProcessFailed;
     }

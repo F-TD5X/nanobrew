@@ -52,6 +52,12 @@ pub const SecurityWarning = struct {
     }
 };
 
+/// A single key/value pair from a cask's `url ... data: { ... }` block.
+pub const PostField = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const Cask = struct {
     token: []const u8, // "firefox"
     name: []const u8, // "Mozilla Firefox"
@@ -65,6 +71,26 @@ pub const Cask = struct {
     min_macos: ?[]const u8,
     metadata_source: MetadataSource = .homebrew,
     security_warnings: []const SecurityWarning = &.{},
+    /// Download method from the cask's `url_specs.using` (e.g. "post"). null = GET.
+    download_using: ?[]const u8 = null,
+    /// Form fields from `url_specs.data`, sent as the POST body (#305).
+    post_data: []const PostField = &.{},
+    /// `url_specs.referer` — sent as the Referer header when present.
+    referer: ?[]const u8 = null,
+    /// `url_specs.user_agent` — resolved UA string (Homebrew's `:fake` symbol is
+    /// mapped to a browser UA; `:default`/`:curl` leave this null to use the
+    /// built-in UA). When set, overrides the default download User-Agent.
+    user_agent: ?[]const u8 = null,
+    /// `url_specs.cookies` — sent joined into a single Cookie header.
+    cookies: []const PostField = &.{},
+    /// `url_specs.header` — extra request headers, each "Name: Value".
+    headers: []const []const u8 = &.{},
+
+    /// True when this cask must be downloaded with an HTTP POST carrying
+    /// `post_data` (e.g. segger-jlink's license acceptance form).
+    pub fn isPostDownload(self: *const Cask) bool {
+        return self.download_using != null and std.ascii.eqlIgnoreCase(self.download_using.?, "post");
+    }
 
     pub fn downloadFormat(self: *const Cask) DownloadFormat {
         if (std.mem.endsWith(u8, self.url, ".dmg")) return .dmg;
@@ -141,6 +167,21 @@ pub const Cask = struct {
         if (self.min_macos) |m| alloc.free(m);
         for (self.security_warnings) |warning| warning.deinit(alloc);
         if (self.security_warnings.len > 0) alloc.free(self.security_warnings);
+        if (self.download_using) |u| alloc.free(u);
+        for (self.post_data) |field| {
+            alloc.free(field.key);
+            alloc.free(field.value);
+        }
+        if (self.post_data.len > 0) alloc.free(self.post_data);
+        if (self.referer) |r| alloc.free(r);
+        if (self.user_agent) |u| alloc.free(u);
+        for (self.cookies) |c| {
+            alloc.free(c.key);
+            alloc.free(c.value);
+        }
+        if (self.cookies.len > 0) alloc.free(self.cookies);
+        for (self.headers) |h| alloc.free(h);
+        if (self.headers.len > 0) alloc.free(self.headers);
     }
 };
 

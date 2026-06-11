@@ -380,15 +380,61 @@ fn scopeToCacheName(repo: []const u8, buf: *[256]u8) ?[]const u8 {
     return buf[0..repo.len];
 }
 
-/// Internal: download using an existing HTTP client and optional pre-fetched token.
-/// `preauth_token` is a read-only slice owned by the caller — not freed here.
+/// Returns true for errors that are worth retrying (transient network/server
+/// conditions or rate limits). Permanent failures (404, auth) and a full-body
+/// checksum mismatch are not retried — a mismatch means the bytes received were
+/// wrong/stale (a genuinely truncated transfer surfaces as a stream error, i.e.
+/// DownloadFailed), so retrying just wastes time.
+fn isRetryable(err: anyerror) bool {
+    return switch (err) {
+        error.BottleNotFound, error.AuthFailed, error.PathTooLong, error.ChecksumMismatch => false,
+        else => true,
+    };
+}
+
+/// Download with bounded retries. Transient failures (network blips, 5xx, 429)
+/// are retried with a short linear backoff so a single flaky connection no
+/// longer aborts an otherwise-healthy parallel batch (#311). Telemetry is
+/// recorded once per logical download here (not per attempt) so retries don't
+/// inflate the failure count.
+///
 /// Public so the install pipeline can route every bottle download through a
-/// single batch-scoped `std.http.Client`. The client's connection pool then
-/// hangs onto open TLS sessions to ghcr.io (or a mirror) and successive
-/// downloads avoid a fresh TLS+TCP handshake.
-/// `preauth_token`, when present, is shared read-only across workers and
-/// replaces N per-download token lookups with one batch-wide lookup.
+/// single batch-scoped `std.http.Client` — the connection pool then hangs onto
+/// open TLS sessions and successive downloads avoid a fresh handshake.
+/// `preauth_token` is a read-only slice owned by the caller (shared across
+/// workers, replaces N per-download token lookups with one) — not freed here.
 pub fn downloadOneWithClient(
+    alloc: std.mem.Allocator,
+    client: *std.http.Client,
+    req: DownloadRequest,
+    preauth_token: ?[]const u8,
+) !void {
+    var telemetry_event = telemetry.DownloadEvent.start(req.target_kind, req.target_name);
+    errdefer telemetry_event.fail();
+
+    const max_attempts: usize = 3;
+    var attempt: usize = 0;
+    while (true) {
+        attempt += 1;
+        downloadAttempt(alloc, client, req, preauth_token) catch |err| {
+            if (attempt >= max_attempts or !isRetryable(err)) return err;
+            // Linear backoff: 250ms, 500ms. Keeps a flaky download from
+            // hammering the server while still recovering quickly.
+            std.Io.sleep(paths.safe_io, .fromMilliseconds(@as(i64, @intCast(attempt)) * 250), .awake) catch {};
+            continue;
+        };
+        break;
+    }
+
+    var dest_path_buf: [512]u8 = undefined;
+    const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch return;
+    telemetry_event.succeed(telemetry.fileSize(dest_path));
+}
+
+/// Internal: single download attempt using an existing HTTP client and optional
+/// pre-fetched token. `preauth_token` is a read-only slice owned by the caller —
+/// not freed here.
+fn downloadAttempt(
     alloc: std.mem.Allocator,
     client: *std.http.Client,
     req: DownloadRequest,
@@ -398,8 +444,6 @@ pub fn downloadOneWithClient(
     const t_dl = if (bench) milliTimestamp() else @as(i64, 0);
     var dest_path_buf: [512]u8 = undefined;
     const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch return error.PathTooLong;
-    var telemetry_event = telemetry.DownloadEvent.start(req.target_kind, req.target_name);
-    errdefer telemetry_event.fail();
 
     // Rewrite bottle URL if NANOBREW_BOTTLE_DOMAIN or HOMEBREW_BOTTLE_DOMAIN is set (#74)
     const bottle_domain: ?[]const u8 = blk: {
@@ -455,7 +499,16 @@ pub fn downloadOneWithClient(
 
     var redirect_buf: [32768]u8 = undefined;
     var response = http_req.receiveHead(&redirect_buf) catch return error.DownloadFailed;
-    if (response.head.status != .ok) return error.DownloadFailed;
+    if (response.head.status != .ok) {
+        // Map status to a specific error so callers (and retry logic) can tell a
+        // permanent failure (404/auth) from a transient one (5xx/429). (#311)
+        return switch (response.head.status) {
+            .not_found, .gone => error.BottleNotFound,
+            .unauthorized, .forbidden => error.AuthFailed,
+            .too_many_requests => error.RateLimited,
+            else => error.DownloadFailed,
+        };
+    }
 
     // Stream body to tmp file with SHA256 hashing in single pass
     var tmp_path_buf: [512]u8 = undefined;
@@ -505,7 +558,6 @@ pub fn downloadOneWithClient(
                 const sha = req.expected_sha256;
                 std.debug.print("[nb-bench] dl {s}…: {d}ms (cached blob)\n", .{ sha[0..@min(8, sha.len)], milliTimestamp() - t_dl });
             }
-            telemetry_event.succeed(telemetry.fileSize(dest_path));
             return;
         }
         return err;
@@ -514,7 +566,6 @@ pub fn downloadOneWithClient(
         const sha = req.expected_sha256;
         std.debug.print("[nb-bench] dl {s}…: {d}ms\n", .{ sha[0..@min(8, sha.len)], milliTimestamp() - t_dl });
     }
-    telemetry_event.succeed(telemetry.fileSize(dest_path));
 }
 
 /// Public single-download entry point for callers without a persistent client.

@@ -4,7 +4,13 @@ All notable changes to nanobrew are documented here.
 
 ## Unreleased
 
-_No unreleased changes yet._
+### Fixed
+- **Failed installs no longer leave phantom DB entries, and downloads retry transient failures** — a package whose download/extract failed used to be recorded in the database at its declared version, tripping `nb doctor` and blocking reinstalls. Installs now only record kegs that actually landed in the Cellar, bottle downloads retry network blips/5xx/429 with linear backoff (checksum mismatches and 404/auth are not retried), and the install summary prints *why* each package failed instead of a bare ✗. (#311)
+- **Intel casks read `version` from the same arch `variations` block as `url`/`sha256`** — previously the root (arm64) version leaked into artifact paths on Intel, breaking Caskroom paths and symlinks for casks like `gcc-arm-embedded`; the root version baked into artifact paths is rewritten (token-bounded) to the arch version. (#307)
+- **Casks with `using: :post` download correctly** — `url_specs` (`data:`, `referer:`, `user_agent:`, `cookies:`, `header:`) are parsed and replayed, so license-gated casks like `segger-jlink` get the real payload instead of an HTML page that fails the checksum. (#305)
+- **Stale verified-upstream pins no longer downgrade installs** — the registry pin is cross-checked against the live Homebrew API and the newer version wins (falling back to the pin offline); `python3` resolves 3.14.5 instead of the embedded 3.14.4, `claude-code` resolves latest instead of 2.1.109. Opt out with `NANOBREW_DISABLE_UPSTREAM_FRESHNESS=1`. The registry itself is refreshable via `nb update` / `nb update-registry`. (#308, #310)
+- **`bin.install` parsing is strict** — `bin.install_symlink` is no longer mistaken for `bin.install`, and non-literal arguments (`#{version}` interpolation, `Dir[...]` globs, keg-rooted paths) drop the declared-binaries list so the source build keeps its generic whole-payload copy instead of failing.
+- **Interrupted cask installs are only re-adopted at the exact on-disk version** — adoption no longer records the API's current version for a payload installed at an older one, which froze `nb upgrade` on a stale app. (#302 follow-up)
 
 ## [0.1.196] - 2026-06-02
 

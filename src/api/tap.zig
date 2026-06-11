@@ -301,6 +301,10 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
     // root and is never symlinked into `prefix/bin`. See #286.
     var install_bins: std.ArrayList([]const u8) = .empty;
     defer install_bins.deinit(alloc);
+    // Set when any bin.install/sbin.install argument is not a plain string
+    // literal. Partial capture is worse than none: source.zig only runs the
+    // generic whole-payload copy when install_binaries is empty.
+    var bin_install_unparseable: bool = false;
 
     // Track block nesting for on_macos/on_linux/bottle/test
     var in_bottle: bool = false;
@@ -336,12 +340,14 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
                 }
                 continue;
             }
-            if (startsWith(line, "bin.install") or startsWith(line, "sbin.install")) {
-                if (extractBinInstallNames(line)) |names| {
-                    for (names) |maybe_name| {
+            if (isBinInstallLine(line)) {
+                switch (extractBinInstallNames(line)) {
+                    .names => |names| for (names) |maybe_name| {
                         const bin_name = maybe_name orelse break;
                         try install_bins.append(alloc, try alloc.dupe(u8, bin_name));
-                    }
+                    },
+                    .unparseable => bin_install_unparseable = true,
+                    .none => {},
                 }
             }
             continue;
@@ -490,12 +496,14 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
         }
 
         // bin.install / sbin.install
-        if (startsWith(line, "bin.install") or startsWith(line, "sbin.install")) {
-            if (extractBinInstallNames(line)) |names| {
-                for (names) |maybe_name| {
+        if (isBinInstallLine(line)) {
+            switch (extractBinInstallNames(line)) {
+                .names => |names| for (names) |maybe_name| {
                     const bin_name = maybe_name orelse break;
                     try install_bins.append(alloc, try alloc.dupe(u8, bin_name));
-                }
+                },
+                .unparseable => bin_install_unparseable = true,
+                .none => {},
             }
         }
     }
@@ -530,6 +538,11 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
         try alloc.dupe(u8, s)
     else
         try alloc.dupe(u8, "");
+
+    if (bin_install_unparseable) {
+        for (install_bins.items) |b| alloc.free(b);
+        install_bins.clearRetainingCapacity();
+    }
 
     return .{
         .name = try alloc.dupe(u8, name),
@@ -599,49 +612,87 @@ fn extractQuotedAfter(line: []const u8, keyword: []const u8) ?[]const u8 {
     return rest[0..q2];
 }
 
+/// True for a `bin.install` / `sbin.install` directive. The boundary check
+/// matters: a bare prefix match also catches `bin.install_symlink`, whose
+/// argument is keg-rooted (e.g. `libexec/"tool"`), not a payload-rooted file —
+/// capturing it would make source.zig skip the generic whole-payload copy and
+/// then fail (or install a launcher without its payload).
+fn isBinInstallLine(line: []const u8) bool {
+    for ([_][]const u8{ "bin.install", "sbin.install" }) |kw| {
+        if (startsWith(line, kw)) {
+            if (line.len == kw.len) return false; // no arguments
+            const c = line[kw.len];
+            return c == ' ' or c == '\t' or c == '(';
+        }
+    }
+    return false;
+}
+
+const BinInstallParse = union(enum) {
+    /// No binary names on the line.
+    none,
+    /// Plain string-literal names, in order; trailing entries are null.
+    names: [8]?[]const u8,
+    /// The directive has arguments we cannot resolve statically
+    /// (`#{version}` interpolation, `Dir[...]` globs, keg-path prefixes like
+    /// `libexec/"x"`). The caller must NOT trust any partial capture — the
+    /// safe behavior is to drop all declared binaries for the formula so the
+    /// source-build path keeps its generic whole-payload copy.
+    unparseable,
+};
+
 /// Extract binary names from `bin.install` / `sbin.install` Ruby directives.
-/// Handles: `bin.install "a"`, `bin.install "a", "b"`, `bin.install "src" => "dst"`.
-/// For rename syntax, only the source (left-hand) name is returned.
-fn extractBinInstallNames(line: []const u8) ?[8]?[]const u8 {
-    const install_idx = std.mem.indexOf(u8, line, ".install") orelse return null;
-    var rest = line[install_idx + ".install".len ..];
-    // Skip leading whitespace and optional open-paren
-    while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t' or rest[0] == '(')) rest = rest[1..];
+/// Handles: `bin.install "a"`, `bin.install "a", "b"`, `bin.install "src" => "dst"`,
+/// `bin.install("tool")`. For rename syntax, only the source name is returned.
+/// Strict: every argument must be a plain string literal — anything else
+/// (Ruby expressions, interpolation, globs) yields `.unparseable`.
+fn extractBinInstallNames(line: []const u8) BinInstallParse {
+    const install_idx = std.mem.indexOf(u8, line, ".install") orelse return .none;
+    var rest = std.mem.trimStart(u8, line[install_idx + ".install".len ..], " \t");
+    if (rest.len > 0 and rest[0] == '(') rest = std.mem.trimStart(u8, rest[1..], " \t");
 
     var result: [8]?[]const u8 = .{null} ** 8;
     var count: usize = 0;
 
-    while (rest.len > 0 and count < 8) {
-        const q1 = std.mem.indexOfScalar(u8, rest, '"') orelse
-            (std.mem.indexOfScalar(u8, rest, '\'') orelse break);
-        const quote_char = rest[q1];
-        const after_q1 = rest[q1 + 1 ..];
-        const q2 = std.mem.indexOfScalar(u8, after_q1, quote_char) orelse break;
-        const name = after_q1[0..q2];
+    while (rest.len > 0) {
+        if (rest[0] == '#') break; // trailing Ruby comment
+        const quote_char = rest[0];
+        if (quote_char != '"' and quote_char != '\'') return .unparseable;
+        const close = std.mem.indexOfScalar(u8, rest[1..], quote_char) orelse return .unparseable;
+        const name = rest[1 .. 1 + close];
+        if (name.len == 0) return .unparseable;
+        if (std.mem.indexOf(u8, name, "#{") != null) return .unparseable; // interpolation
+        if (std.mem.indexOfScalar(u8, name, '*') != null) return .unparseable; // glob
+        if (count >= result.len) return .unparseable; // don't truncate silently
+        result[count] = name;
+        count += 1;
+        rest = std.mem.trimStart(u8, rest[1 + close + 1 ..], " \t");
 
-        rest = after_q1[q2 + 1 ..];
-
-        // Check for rename syntax (=>)
-        var trimmed = rest;
-        while (trimmed.len > 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) trimmed = trimmed[1..];
-        if (std.mem.startsWith(u8, trimmed, "=>")) {
-            const after_arrow = trimmed[2..];
-            const tq1 = std.mem.indexOfScalar(u8, after_arrow, '"') orelse
-                (std.mem.indexOfScalar(u8, after_arrow, '\'') orelse break);
-            const tq_char = after_arrow[tq1];
-            const after_tq1 = after_arrow[tq1 + 1 ..];
-            const tq2 = std.mem.indexOfScalar(u8, after_tq1, tq_char) orelse break;
-            rest = after_tq1[tq2 + 1 ..];
+        // Rename syntax: `"src" => "dst"` — keep src, require dst be a literal.
+        if (std.mem.startsWith(u8, rest, "=>")) {
+            rest = std.mem.trimStart(u8, rest[2..], " \t");
+            if (rest.len == 0 or (rest[0] != '"' and rest[0] != '\'')) return .unparseable;
+            const tq = rest[0];
+            const tclose = std.mem.indexOfScalar(u8, rest[1..], tq) orelse return .unparseable;
+            rest = std.mem.trimStart(u8, rest[1 + tclose + 1 ..], " \t");
         }
 
-        if (name.len > 0) {
-            result[count] = name;
-            count += 1;
+        if (rest.len == 0) break;
+        if (rest[0] == ')') {
+            rest = std.mem.trimStart(u8, rest[1..], " \t");
+            continue;
         }
+        if (rest[0] == ',') {
+            rest = std.mem.trimStart(u8, rest[1..], " \t");
+            if (rest.len == 0) return .unparseable; // dangling comma
+            continue;
+        }
+        if (rest[0] == '#') break;
+        return .unparseable;
     }
 
-    if (count == 0) return null;
-    return result;
+    if (count == 0) return .none;
+    return .{ .names = result };
 }
 
 /// Find bottle sha256 matching our platform tag.
@@ -1140,13 +1191,13 @@ test "findBottleSha256 - matching tag" {
 }
 
 test "extractBinInstallNames - single binary" {
-    const result = extractBinInstallNames("bin.install \"crush\"") orelse unreachable;
+    const result = extractBinInstallNames("bin.install \"crush\"").names;
     try testing.expectEqualStrings("crush", result[0].?);
     try testing.expect(result[1] == null);
 }
 
 test "extractBinInstallNames - multiple binaries" {
-    const result = extractBinInstallNames("bin.install \"a\", \"b\", \"c\"") orelse unreachable;
+    const result = extractBinInstallNames("bin.install \"a\", \"b\", \"c\"").names;
     try testing.expectEqualStrings("a", result[0].?);
     try testing.expectEqualStrings("b", result[1].?);
     try testing.expectEqualStrings("c", result[2].?);
@@ -1154,19 +1205,57 @@ test "extractBinInstallNames - multiple binaries" {
 }
 
 test "extractBinInstallNames - rename syntax" {
-    const result = extractBinInstallNames("bin.install \"crush\" => \"crush-cli\"") orelse unreachable;
+    const result = extractBinInstallNames("bin.install \"crush\" => \"crush-cli\"").names;
     try testing.expectEqualStrings("crush", result[0].?);
     try testing.expect(result[1] == null);
 }
 
 test "extractBinInstallNames - sbin" {
-    const result = extractBinInstallNames("sbin.install \"daemon\"") orelse unreachable;
+    const result = extractBinInstallNames("sbin.install \"daemon\"").names;
     try testing.expectEqualStrings("daemon", result[0].?);
 }
 
 test "extractBinInstallNames - parenthesized call" {
-    const result = extractBinInstallNames("bin.install(\"tool\")") orelse unreachable;
+    const result = extractBinInstallNames("bin.install(\"tool\")").names;
     try testing.expectEqualStrings("tool", result[0].?);
+}
+
+test "isBinInstallLine - rejects bin.install_symlink (review follow-up)" {
+    try testing.expect(isBinInstallLine("bin.install \"x\""));
+    try testing.expect(isBinInstallLine("sbin.install(\"d\")"));
+    try testing.expect(!isBinInstallLine("bin.install_symlink libexec/\"tool/bin/tool\""));
+    try testing.expect(!isBinInstallLine("sbin.install_symlink \"x\""));
+    try testing.expect(!isBinInstallLine("generate_completions_from_executable(bin/\"zmx\")"));
+}
+
+test "extractBinInstallNames - non-literal args are unparseable, not partially captured" {
+    // Ruby interpolation
+    try testing.expect(extractBinInstallNames("bin.install \"tool-#{version}\"") == .unparseable);
+    // glob
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"scripts/*\"]") == .unparseable);
+    // keg-path-rooted argument
+    try testing.expect(extractBinInstallNames("bin.install libexec/\"x\"") == .unparseable);
+    // bare expression
+    try testing.expect(extractBinInstallNames("bin.install some_var") == .unparseable);
+}
+
+test "parseRubyFormula - unparseable bin.install clears install_binaries so generic copy runs" {
+    const src =
+        \\class Mixed < Formula
+        \\  version "1.0"
+        \\  url "https://example.com/mixed.tar.gz"
+        \\  sha256 "abc"
+        \\  def install
+        \\    bin.install "good"
+        \\    bin.install "tool-#{version}"
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "mixed", src);
+    defer f.deinit(testing.allocator);
+    // Partial capture ("good" without the interpolated one) would break the
+    // install — the whole list must be dropped.
+    try testing.expectEqual(@as(usize, 0), f.install_binaries.len);
 }
 
 test "parseRubyFormula - extracts install_binaries" {

@@ -27,6 +27,7 @@ const Command = enum {
     where,
     upgrade,
     update,
+    update_registry,
     help,
     doctor,
     cleanup,
@@ -150,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
         .where => runWhere(alloc, args[2..]),
         .upgrade => runUpgrade(alloc, args[2..]),
         .update => runUpdate(alloc),
+        .update_registry => runUpdateRegistry(alloc),
         .help => printUsage(),
         .doctor => runDoctor(alloc),
         .cleanup => runCleanup(alloc, args[2..]),
@@ -198,6 +200,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "upgrade", Command.upgrade },
         .{ "update", Command.update },
         .{ "self-update", Command.update },
+        .{ "update-registry", Command.update_registry },
         .{ "help", Command.help },
         .{ "--help", Command.help },
         .{ "-h", Command.help },
@@ -421,14 +424,19 @@ fn runLocalRbInstall(alloc: std.mem.Allocator, path: []const u8) void {
 
     var had_error = std.atomic.Value(bool).init(false);
     var phase = std.atomic.Value(u8).init(@intFromEnum(Phase.waiting));
+    var fail_reason: ?[]const u8 = null;
     const local_formulae = [_]nb.formula.Formula{f};
     const local_requested = [_][]const u8{f.name};
     // Single-formula path: no batch sharing benefit — pass nulls so the
     // worker creates its own one-shot client (existing behavior).
-    fullInstallOne(alloc, f, &had_error, &phase, false, &local_requested, &local_formulae, null, null);
+    fullInstallOne(alloc, f, &had_error, &phase, &fail_reason, false, &local_requested, &local_formulae, null, null);
 
     if (had_error.load(.acquire)) {
-        stderr.print("nb: failed to install '{s}'\n", .{f.name}) catch {};
+        if (fail_reason) |why| {
+            stderr.print("nb: failed to install '{s}' ({s})\n", .{ f.name, why }) catch {};
+        } else {
+            stderr.print("nb: failed to install '{s}'\n", .{f.name}) catch {};
+        }
         std.process.exit(1);
     }
 
@@ -647,8 +655,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         if (std.mem.endsWith(u8, arg, ".rb")) {
             const exists = if (arg.len > 0 and arg[0] == '/')
                 if (std.Io.Dir.accessAbsolute(g_io, arg, .{})) |_| true else |_| false
-            else
-                if (std.Io.Dir.cwd().access(g_io, arg, .{})) |_| true else |_| false;
+            else if (std.Io.Dir.cwd().access(g_io, arg, .{})) |_| true else |_| false;
             if (exists) {
                 runLocalRbInstall(alloc, arg);
                 return;
@@ -831,6 +838,15 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         defer alloc.free(names);
         for (install_order, 0..) |f, idx| names[idx] = f.name;
 
+        // Per-package failure reason (static strings set by the worker), so the
+        // final summary explains *why* each package failed instead of a bare ✗.
+        const reasons = alloc.alloc(?[]const u8, pkg_count) catch {
+            stderr.print("nb: out of memory\n", .{}) catch {};
+            std.process.exit(1);
+        };
+        defer alloc.free(reasons);
+        for (reasons) |*r| r.* = null;
+
         var had_error = std.atomic.Value(bool).init(false);
 
         // Batch-scoped HTTP client + GHCR token: one TLS connection pool
@@ -883,7 +899,8 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 slots.items[idx].handle.join();
                 _ = slots.orderedRemove(idx);
             }
-            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], use_shims, formulae.items, all_formulae, &shared_client, shared_ghcr_token }) catch {
+            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], &reasons[pi], use_shims, formulae.items, all_formulae, &shared_client, shared_ghcr_token }) catch {
+                reasons[pi] = "could not spawn worker thread";
                 had_error.store(true, .release);
                 phases[pi].store(@intFromEnum(Phase.failed), .release);
                 continue;
@@ -915,7 +932,11 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 if (phase == .done) {
                     stdout.print("    ✓ {s}\n", .{name}) catch {};
                 } else if (phase == .failed) {
-                    stdout.print("    ✗ {s}\n", .{name}) catch {};
+                    if (reasons[i]) |why| {
+                        stdout.print("    ✗ {s} ({s})\n", .{ name, why }) catch {};
+                    } else {
+                        stdout.print("    ✗ {s}\n", .{name}) catch {};
+                    }
                 }
             }
         }
@@ -927,7 +948,11 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 const raw: u8 = phases[i].load(.acquire);
                 const phase: Phase = @enumFromInt(raw);
                 if (phase == .failed) {
-                    stderr.print("    failed: {s}\n", .{name}) catch {};
+                    if (reasons[i]) |why| {
+                        stderr.print("    failed: {s} ({s})\n", .{ name, why }) catch {};
+                    } else {
+                        stderr.print("    failed: {s}\n", .{name}) catch {};
+                    }
                 }
             }
             stderr.print("nb: hint: check permissions with `nb doctor`\n", .{}) catch {};
@@ -946,7 +971,11 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     defer db.close();
     for (all_formulae) |f| {
         var ver_buf6: [256]u8 = undefined;
-        const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf6) orelse f.version;
+        // Only record packages that actually landed in the Cellar. If there is no
+        // keg directory the install failed (download/extract/materialize), so
+        // skipping here avoids writing phantom DB entries that later trip up
+        // `nb doctor` / `nb cleanup --prune-kegs` (#311).
+        const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf6) orelse continue;
 
         const existing = db.findKeg(f.name);
         if (existing) |keg| {
@@ -959,18 +988,18 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     }
 
     // Auto-pin version-pinned installs so a later `nb upgrade` won't silently
-    // replace the explicitly chosen version.
+    // replace the explicitly chosen version. setPinned fails with NotFound when
+    // the install never produced a keg record — don't claim "Pinned" then.
     for (pinned_names.items) |base| {
-        db.setPinned(base, true) catch {};
-        stdout.print("==> Pinned {s} (won't be upgraded; run `nb unpin {s}` to allow upgrades)\n", .{ base, base }) catch {};
+        if (db.setPinned(base, true)) {
+            stdout.print("==> Pinned {s} (won't be upgraded; run `nb unpin {s}` to allow upgrades)\n", .{ base, base }) catch {};
+        } else |_| {}
     }
 
     const elapsed_ns: u64 = timer.read();
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
     stdout.print("==> Done in {d:.1}ms\n", .{elapsed_ms}) catch {};
 }
-
-
 
 /// Render live progress UI with spinners and checkmarks.
 /// Blocks until all packages reach .done or .failed.
@@ -1172,6 +1201,18 @@ fn formulaLinkNeedsRepair(
     return nb.linker.needsLinkRepair(name, version, .{ .mode = .private_dependency });
 }
 
+/// Short, human-readable reason for a bottle download failure, surfaced in the
+/// install summary so a `✗` is actionable (#311).
+fn downloadFailureReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.BottleNotFound => "bottle not found upstream — version metadata may be stale",
+        error.AuthFailed => "registry auth failed",
+        error.RateLimited => "rate limited by registry — retry shortly",
+        error.ChecksumMismatch => "checksum mismatch — download corrupted or metadata stale",
+        else => "network error after retries",
+    };
+}
+
 /// Full per-package pipeline: download → extract → materialize → relocate → link
 /// Runs in its own thread — no barriers between phases.
 ///
@@ -1184,6 +1225,9 @@ fn fullInstallOne(
     f: nb.formula.Formula,
     had_error: *std.atomic.Value(bool),
     phase: *std.atomic.Value(u8),
+    // Set to a short, static reason string on failure so the final summary can
+    // explain *why* a package failed instead of printing a bare ✗ (#311).
+    fail_reason: *?[]const u8,
     use_shims: bool,
     requested: []const []const u8,
     all_formulae: []const nb.formula.Formula,
@@ -1206,6 +1250,7 @@ fn fullInstallOne(
             phase.store(@intFromEnum(Phase.linking), .release);
             linkFormulaKeg(alloc, f.name, fv, use_shims, requested, all_formulae) catch |err| {
                 stderr.print("nb: {s}: link failed: {}\n", .{ f.name, err }) catch {};
+                fail_reason.* = "link failed";
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1221,6 +1266,7 @@ fn fullInstallOne(
         phase.store(@intFromEnum(Phase.downloading), .release);
         nb.source_builder.buildFromSource(alloc, g_io, f) catch |err| {
             stderr.print("nb: {s}: source build failed: {}\n", .{ f.name, err }) catch {};
+            fail_reason.* = "source build failed";
             had_error.store(true, .release);
             phase.store(@intFromEnum(Phase.failed), .release);
             return;
@@ -1233,6 +1279,7 @@ fn fullInstallOne(
         var blob_buf: [512]u8 = undefined;
         const blob_path = std.fmt.bufPrint(&blob_buf, "{s}/{s}", .{ blob_dir, f.bottle_sha256 }) catch {
             stderr.print("nb: {s}: path too long for blob\n", .{f.name}) catch {};
+            fail_reason.* = "blob path too long";
             had_error.store(true, .release);
             phase.store(@intFromEnum(Phase.failed), .release);
             return;
@@ -1253,7 +1300,8 @@ fn fullInstallOne(
             else
                 nb.downloader.downloadOne(alloc, dl_req);
             dl_result catch |err| {
-                stderr.print("nb: {s}: download failed: {}\n", .{ f.name, err }) catch {};
+                fail_reason.* = downloadFailureReason(err);
+                stderr.print("nb: {s}: download failed: {s} ({s})\n", .{ f.name, @errorName(err), fail_reason.*.? }) catch {};
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1265,6 +1313,7 @@ fn fullInstallOne(
         if (!nb.store.hasEntry(g_io, f.bottle_sha256)) {
             nb.store.ensureEntry(alloc, g_io, blob_path, f.bottle_sha256) catch |err| {
                 stderr.print("nb: {s}: extract failed: {}\n", .{ f.name, err }) catch {};
+                fail_reason.* = "extract failed";
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1284,6 +1333,7 @@ fn fullInstallOne(
             phase.store(@intFromEnum(Phase.linking), .release);
             linkFormulaKeg(alloc, f.name, fv, use_shims, requested, all_formulae) catch |err| {
                 stderr.print("nb: {s}: link failed: {}\n", .{ f.name, err }) catch {};
+                fail_reason.* = "link failed";
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
@@ -1296,6 +1346,7 @@ fn fullInstallOne(
         }
         nb.cellar.materialize(g_io, f.bottle_sha256, f.name, f.version) catch |err| {
             stderr.print("nb: {s}: materialize failed: {}\n", .{ f.name, err }) catch {};
+            fail_reason.* = "materialize failed";
             had_error.store(true, .release);
             phase.store(@intFromEnum(Phase.failed), .release);
             return;
@@ -1308,6 +1359,7 @@ fn fullInstallOne(
     const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf) orelse f.version;
     platform.relocate.relocateKeg(alloc, g_io, f.name, actual_ver) catch |err| {
         stderr.print("nb: {s}: relocate failed: {}\n", .{ f.name, err }) catch {};
+        fail_reason.* = "relocate failed";
         had_error.store(true, .release);
         phase.store(@intFromEnum(Phase.failed), .release);
         return;
@@ -1328,6 +1380,7 @@ fn fullInstallOne(
     phase.store(@intFromEnum(Phase.linking), .release);
     linkFormulaKeg(alloc, f.name, actual_ver, use_shims, requested, all_formulae) catch |err| {
         stderr.print("nb: {s}: link failed: {}\n", .{ f.name, err }) catch {};
+        fail_reason.* = "link failed";
         had_error.store(true, .release);
         phase.store(@intFromEnum(Phase.failed), .release);
         return;
@@ -1985,7 +2038,10 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
             if (filter_names.len > 0) {
                 var found = false;
                 for (filter_names) |n| {
-                    if (std.mem.eql(u8, n, c.token)) { found = true; break; }
+                    if (std.mem.eql(u8, n, c.token)) {
+                        found = true;
+                        break;
+                    }
                 }
                 if (!found) continue;
             }
@@ -2005,7 +2061,10 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
             if (filter_names.len > 0) {
                 var found = false;
                 for (filter_names) |n| {
-                    if (std.mem.eql(u8, n, k.name)) { found = true; break; }
+                    if (std.mem.eql(u8, n, k.name)) {
+                        found = true;
+                        break;
+                    }
                 }
                 if (!found) continue;
             }
@@ -2262,11 +2321,35 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb update ──
 
+/// Refresh the verified-upstream registry cache from the remote so pinned
+/// versions stop going stale between binary releases (#308/#310). Best-effort:
+/// prints a status line but never aborts the caller.
+fn refreshUpstreamRegistry(alloc: std.mem.Allocator) void {
+    const stdout = StdoutWriter{};
+    if (nb.upstream_registry.refreshCache(alloc)) |count| {
+        stdout.print("==> Refreshed upstream registry ({d} records)\n", .{count}) catch {};
+    } else |err| switch (err) {
+        error.RemoteRegistryDisabled => {},
+        else => stdout.print("==> Could not refresh upstream registry ({s}); using cached/embedded data\n", .{@errorName(err)}) catch {},
+    }
+}
+
+/// `nb update-registry` — refresh only the verified-upstream registry cache.
+fn runUpdateRegistry(alloc: std.mem.Allocator) void {
+    const stdout = StdoutWriter{};
+    stdout.print("==> Refreshing upstream registry...\n", .{}) catch {};
+    refreshUpstreamRegistry(alloc);
+}
+
 fn runUpdate(alloc: std.mem.Allocator) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
 
     stdout.print("==> Updating nanobrew...\n", .{}) catch {};
+
+    // Refresh pinned upstream metadata too — otherwise a current binary keeps
+    // stale pins until the next rebuild (#308/#310).
+    refreshUpstreamRegistry(alloc);
 
     // Detect OS and arch at comptime
     const os_name = comptime switch (@import("builtin").os.tag) {
@@ -2690,12 +2773,16 @@ fn collectCaskDbEntries(
     }
 }
 
-/// True when nanobrew's Caskroom already has a directory for this token (a prior
-/// nanobrew install placed it). Used to safely adopt an on-disk-but-untracked
-/// cask without ever claiming a foreign, manually-installed app (issue #302).
-fn caskAlreadyOnDisk(token: []const u8) bool {
+/// True when nanobrew's Caskroom already has a payload directory for this
+/// token at this exact version (a prior nanobrew install placed it). Used to
+/// safely adopt an on-disk-but-untracked cask without claiming a foreign,
+/// manually-installed app — and without recording a version that was never
+/// installed: the API may have moved past the interrupted run's version, and
+/// adopting under the newer version would freeze `nb upgrade` on a stale
+/// payload (issue #302, review follow-up).
+fn caskAlreadyOnDisk(token: []const u8, version: []const u8) bool {
     var buf: [512]u8 = undefined;
-    const dir = std.fmt.bufPrint(&buf, "{s}/{s}", .{ paths.CASKROOM_DIR, token }) catch return false;
+    const dir = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ paths.CASKROOM_DIR, token, version }) catch return false;
     std.Io.Dir.accessAbsolute(g_io, dir, .{}) catch return false;
     return true;
 }
@@ -2757,7 +2844,7 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
             // into the DB instead of refusing, so `nb list`/`upgrade` see it
             // again. A foreign app (no Caskroom dir) is still refused so
             // `nb remove` never deletes something nanobrew didn't install (#302).
-            if (caskAlreadyOnDisk(token)) {
+            if (caskAlreadyOnDisk(token, cask_meta.version)) {
                 var apps: std.ArrayList([]const u8) = .empty;
                 defer apps.deinit(alloc);
                 var binaries: std.ArrayList([]const u8) = .empty;
@@ -2849,8 +2936,6 @@ fn getDisplayVersion() []const u8 {
     return VERSION;
 }
 
-
-
 fn printUsage() void {
     const stdout = StdoutWriter{};
     stdout.print("\x1b[1mnanobrew\x1b[0m \x1b[90mv{s}\x1b[0m — The fastest package manager\n", .{getDisplayVersion()}) catch {};
@@ -2882,7 +2967,8 @@ fn printUsage() void {
         \\  upgrade [formula]        Upgrade packages (or all if none specified)
         \\  upgrade --cask [app]     Upgrade casks (or all if none specified)
         \\  upgrade --deb            Upgrade all installed .deb packages
-        \\  update                   Self-update nanobrew to the latest version
+        \\  update                   Self-update nanobrew (also refreshes the upstream registry)
+        \\  update-registry          Refresh only the verified-upstream version registry
         \\  doctor                   Check installation health
         \\  cleanup [--dry-run]      Remove stale caches and orphaned files
         \\  outdated                 List packages with newer versions available
@@ -3021,13 +3107,19 @@ fn runDoctor(alloc: std.mem.Allocator) void {
                 if (entry.kind != .directory) continue;
                 var found = false;
                 for (kegs) |keg| {
-                    if (std.mem.eql(u8, keg.sha256, entry.name)) { found = true; break; }
+                    if (std.mem.eql(u8, keg.sha256, entry.name)) {
+                        found = true;
+                        break;
+                    }
                 }
                 if (!found) {
                     for (kegs) |keg| {
                         const hist = db.getHistory(keg.name);
                         for (hist) |h| {
-                            if (std.mem.eql(u8, h.sha256, entry.name)) { found = true; break; }
+                            if (std.mem.eql(u8, h.sha256, entry.name)) {
+                                found = true;
+                                break;
+                            }
                         }
                         if (found) break;
                     }
@@ -3216,12 +3308,10 @@ fn runNuke(args: []const []const u8) void {
         if (std.mem.eql(u8, arg, "--yes") or std.mem.eql(u8, arg, "-y")) force = true;
     }
 
-    stdout.print(
-        "\n\x1b[31;1m  WARNING: This will completely remove nanobrew and all installed packages.\x1b[0m\n\n" ++
+    stdout.print("\n\x1b[31;1m  WARNING: This will completely remove nanobrew and all installed packages.\x1b[0m\n\n" ++
         "  The following will be deleted:\n" ++
         "    - /opt/nanobrew          (all packages, cache, database)\n" ++
-        "    - ~/.local/bin/nb        (nanobrew binary)\n\n"
-    , .{}) catch {};
+        "    - ~/.local/bin/nb        (nanobrew binary)\n\n", .{}) catch {};
 
     if (!force) {
         stdout.print("  Type \x1b[1myes\x1b[0m to confirm: ", .{}) catch {};
@@ -3279,11 +3369,9 @@ fn runNuke(args: []const []const u8) void {
         }
     }
 
-    stdout.print(
-        "\n\x1b[32;1m  nanobrew has been removed.\x1b[0m\n\n" ++
+    stdout.print("\n\x1b[32;1m  nanobrew has been removed.\x1b[0m\n\n" ++
         "  You may also want to remove the PATH entry from your shell config:\n" ++
-        "    ~/.zshrc or ~/.bashrc — delete the line containing /opt/nanobrew\n\n"
-    , .{}) catch {};
+        "    ~/.zshrc or ~/.bashrc — delete the line containing /opt/nanobrew\n\n", .{}) catch {};
 }
 
 fn cleanupCacheDir(dir_path: []const u8, dry_run: bool, reclaimed: *u64, stdout: anytype) void {
@@ -3942,6 +4030,7 @@ fn runCompletions(args: []const []const u8) void {
             \\    'where:Find packages by pattern (installed, files, index)'
             \\    'upgrade:Upgrade packages'
             \\    'update:Self-update nanobrew'
+            \\    'update-registry:Refresh the verified-upstream registry'
             \\    'doctor:Check installation health'
             \\    'cleanup:Remove stale caches'
             \\    'outdated:List outdated packages'
@@ -4042,6 +4131,7 @@ fn runCompletions(args: []const []const u8) void {
             \\complete -c nb -n '__fish_use_subcommand' -a 'where' -d 'Find packages by pattern'
             \\complete -c nb -n '__fish_use_subcommand' -a 'upgrade' -d 'Upgrade packages'
             \\complete -c nb -n '__fish_use_subcommand' -a 'update' -d 'Self-update nanobrew'
+            \\complete -c nb -n '__fish_use_subcommand' -a 'update-registry' -d 'Refresh the verified-upstream registry'
             \\complete -c nb -n '__fish_use_subcommand' -a 'doctor' -d 'Check installation health'
             \\complete -c nb -n '__fish_use_subcommand' -a 'cleanup' -d 'Remove stale caches'
             \\complete -c nb -n '__fish_use_subcommand' -a 'outdated' -d 'List outdated packages'
@@ -4076,7 +4166,6 @@ const DebInstallOptions = struct {
     skip_postinst: bool = false,
     no_verify: bool = false,
 };
-
 
 /// Install .deb packages from Ubuntu/Debian repositories (Linux only).
 fn runDebInstall(alloc: std.mem.Allocator, packages: []const []const u8, repo_spec: ?[]const u8, opts: DebInstallOptions) void {
@@ -4413,7 +4502,10 @@ fn runDebInstall(alloc: std.mem.Allocator, packages: []const []const u8, repo_sp
         // Validate package name
         var unsafe = false;
         for (pkg.name) |c| {
-            if (c == '/' or c == 0) { unsafe = true; break; }
+            if (c == '/' or c == 0) {
+                unsafe = true;
+                break;
+            }
         }
         if (unsafe or std.mem.indexOf(u8, pkg.name, "..") != null) continue;
 
@@ -4960,16 +5052,14 @@ fn checkForUpdate(alloc: std.mem.Allocator) void {
     // New version available — print colored banner to stderr (not stdout,
     // so shell completion scripts that parse `nb list` output aren't polluted)
     const stderr = StderrWriter{};
-    stderr.print(
-        "\n\x1b[33m╭─────────────────────────────────────────╮\x1b[0m\n" ++
+    stderr.print("\n\x1b[33m╭─────────────────────────────────────────╮\x1b[0m\n" ++
         "\x1b[33m│\x1b[0m  \x1b[1mUpdate available!\x1b[0m " ++
         "\x1b[90m{s}\x1b[0m → \x1b[32;1m{s}\x1b[0m" ++
         "{s}" ++
         "  \x1b[33m│\x1b[0m\n" ++
         "\x1b[33m│\x1b[0m  Run \x1b[36;1mnb update\x1b[0m to upgrade" ++
         "                \x1b[33m│\x1b[0m\n" ++
-        "\x1b[33m╰─────────────────────────────────────────╯\x1b[0m\n"
-    , .{
+        "\x1b[33m╰─────────────────────────────────────────╯\x1b[0m\n", .{
         VERSION,
         latest_ver,
         padSpaces(VERSION.len + latest_ver.len),
@@ -5062,10 +5152,10 @@ fn runMigrate(alloc: std.mem.Allocator) void {
     if (formula_count > 0 or cask_count > 0) {
         stdout.print(
             "\nNote: migrate only records package names in nanobrew's database so commands\n" ++
-            "      like `nb list`, `nb outdated`, and `nb bundle dump` know about them.\n" ++
-            "      The actual binaries still live in Homebrew's prefix — `nb where <pkg>`\n" ++
-            "      will show the package as installed but with no entry in /opt/nanobrew/prefix/bin/.\n" ++
-            "      To install a migrated package fully under nanobrew, run `nb install <pkg>`.\n",
+                "      like `nb list`, `nb outdated`, and `nb bundle dump` know about them.\n" ++
+                "      The actual binaries still live in Homebrew's prefix — `nb where <pkg>`\n" ++
+                "      will show the package as installed but with no entry in /opt/nanobrew/prefix/bin/.\n" ++
+                "      To install a migrated package fully under nanobrew, run `nb install <pkg>`.\n",
             .{},
         ) catch {};
     }
