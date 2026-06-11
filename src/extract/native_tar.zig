@@ -74,10 +74,12 @@ fn fieldStr(field: []const u8) []const u8 {
 
 /// Check if a header block is all zeros (end-of-archive marker).
 fn isZeroBlock(block: *const [BLOCK_SIZE]u8) bool {
-    // Check 8 bytes at a time for speed
-    const words: *const [BLOCK_SIZE / 8]u64 = @ptrCast(@alignCast(block));
-    for (words) |w| {
-        if (w != 0) return false;
+    // Check 8 bytes at a time for speed. readInt performs unaligned loads,
+    // so this is safe for caller-provided buffers of any alignment (the old
+    // @alignCast to *const u64 panicked on align-1 tar data).
+    var i: usize = 0;
+    while (i < BLOCK_SIZE) : (i += 8) {
+        if (std.mem.readInt(u64, block[i..][0..8], .little) != 0) return false;
     }
     return true;
 }
