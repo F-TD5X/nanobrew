@@ -187,8 +187,7 @@ const RepoChecksStep = struct {
         try requireSnapshotEntry(step, snapshot, "src/build/source.zig");
         try requireSnapshotEntry(step, snapshot, "src/build/postinstall.zig");
         try requireSnapshotEntry(step, snapshot, "src/test_module.zig");
-        try rejectSnapshotEntry(step, snapshot, "worker/.wrangler/");
-        try rejectSnapshotEntry(step, snapshot, "worker/.wrangler");
+        try rejectSnapshotPathPrefix(step, snapshot, "worker/.wrangler");
 
         try rejectProcessRunWithGlobalIo(step, root, "src/build/postinstall.zig");
         try rejectProcessRunWithGlobalIo(step, root, "src/services/launchd.zig");
@@ -214,9 +213,13 @@ fn requireSnapshotEntry(step: *std.Build.Step, snapshot: []const u8, needle: []c
     }
 }
 
-fn rejectSnapshotEntry(step: *std.Build.Step, snapshot: []const u8, needle: []const u8) !void {
+fn rejectSnapshotPathPrefix(step: *std.Build.Step, snapshot: []const u8, prefix: []const u8) !void {
+    const b = step.owner;
+    const needle = try std.fmt.allocPrint(b.allocator, "\"path\":\"{s}", .{prefix});
+    defer b.allocator.free(needle);
+
     if (std.mem.indexOf(u8, snapshot, needle) != null) {
-        return step.fail("codedb snapshot contains ignored/generated path '{s}'", .{needle});
+        return step.fail("codedb snapshot contains ignored/generated path prefix '{s}'", .{prefix});
     }
 }
 
