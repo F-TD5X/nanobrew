@@ -1726,7 +1726,11 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
                 const idx = ctx.next_idx.fetchAdd(1, .monotonic);
                 if (idx >= ctx.kegs_.len) break;
                 const keg = ctx.kegs_[idx];
-                const formula = nb.api_client.fetchFormulaWithClient(ctx.alloc_, &client, keg.name) catch continue;
+                // Leaves only needs dependency lists — prefer the local
+                // cache/bulk-list lookup; the full fetch (upstream registry,
+                // network) is the fallback for packages outside the bulk list.
+                const formula = nb.api_client.fetchFormulaLocal(ctx.alloc_, keg.name) orelse
+                    (nb.api_client.fetchFormulaWithClient(ctx.alloc_, &client, keg.name) catch continue);
                 ctx.slots_[idx].formula = formula;
                 ctx.slots_[idx].state = .filled;
             }
@@ -2104,6 +2108,25 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
 
     stdout.print("==> Checking {d} package(s) for updates...\n", .{to_check.items.len}) catch {};
 
+    // Bulk fast path: resolve available versions from the cached Homebrew
+    // bulk lists (one streaming scan each, shared with `nb search`, 1h TTL)
+    // instead of one API round trip per installed package. Packages missing
+    // from the lists (tap formulas, upstream-only records) fall through to
+    // the per-name fetch workers below.
+    var formula_index: ?nb.bulk_versions.VersionIndex = null;
+    defer if (formula_index) |*idx| idx.deinit();
+    var cask_index: ?nb.bulk_versions.VersionIndex = null;
+    defer if (cask_index) |*idx| idx.deinit();
+    {
+        var want_formula = false;
+        var want_cask = false;
+        for (to_check.items) |item| {
+            if (item.is_cask) want_cask = true else want_formula = true;
+        }
+        if (want_formula) formula_index = nb.bulk_versions.loadFormulaIndex(alloc) catch null;
+        if (want_cask) cask_index = nb.bulk_versions.loadCaskIndex(alloc) catch null;
+    }
+
     // Parallel version check — each thread gets its own HTTP client
     const VersionResult = struct {
         new_ver_buf: [128]u8 = undefined,
@@ -2115,8 +2138,30 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
     defer alloc.free(version_results);
     for (version_results) |*r| r.* = .{};
 
+    // Resolve what we can locally; queue only the misses for network fetch.
+    var fetch_queue: std.ArrayList(usize) = .empty;
+    defer fetch_queue.deinit(alloc);
+    for (to_check.items, 0..) |item, i| {
+        const idx_ref: ?*const nb.bulk_versions.VersionIndex = if (item.is_cask)
+            (if (cask_index) |*ci| ci else null)
+        else
+            (if (formula_index) |*fi| fi else null);
+        const latest: ?[]const u8 = if (idx_ref) |ir| ir.get(item.name) else null;
+        if (latest) |new_ver| {
+            if (nb.version.isNewer(new_ver, item.old_ver)) {
+                const len = @min(new_ver.len, 128);
+                @memcpy(version_results[i].new_ver_buf[0..len], new_ver[0..len]);
+                version_results[i].new_ver_len = len;
+                version_results[i].has_update = true;
+            }
+        } else {
+            fetch_queue.append(alloc, i) catch {};
+        }
+    }
+
     const CheckCtx = struct {
         items: []const CheckItem,
+        queue: []const usize,
         results: []VersionResult,
         next_idx: *std.atomic.Value(usize),
         alloc_: std.mem.Allocator,
@@ -2128,8 +2173,9 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
             defer client.deinit();
 
             while (true) {
-                const idx = ctx.next_idx.fetchAdd(1, .monotonic);
-                if (idx >= ctx.items.len) break;
+                const qpos = ctx.next_idx.fetchAdd(1, .monotonic);
+                if (qpos >= ctx.queue.len) break;
+                const idx = ctx.queue[qpos];
                 const item = ctx.items[idx];
 
                 if (item.is_cask) {
@@ -2155,23 +2201,26 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
         }
     }.run;
 
-    var next_idx = std.atomic.Value(usize).init(0);
-    const ctx = CheckCtx{
-        .items = to_check.items,
-        .results = version_results,
-        .next_idx = &next_idx,
-        .alloc_ = alloc,
-    };
+    if (fetch_queue.items.len > 0) {
+        var next_idx = std.atomic.Value(usize).init(0);
+        const ctx = CheckCtx{
+            .items = to_check.items,
+            .queue = fetch_queue.items,
+            .results = version_results,
+            .next_idx = &next_idx,
+            .alloc_ = alloc,
+        };
 
-    const n_threads = @min(to_check.items.len, 8);
-    var threads: [8]std.Thread = undefined;
-    var spawned: usize = 0;
+        const n_threads = @min(fetch_queue.items.len, 8);
+        var threads: [8]std.Thread = undefined;
+        var spawned: usize = 0;
 
-    for (0..n_threads) |_| {
-        threads[spawned] = std.Thread.spawn(.{}, checkWorkerFn, .{ctx}) catch continue;
-        spawned += 1;
+        for (0..n_threads) |_| {
+            threads[spawned] = std.Thread.spawn(.{}, checkWorkerFn, .{ctx}) catch continue;
+            spawned += 1;
+        }
+        for (threads[0..spawned]) |t| t.join();
     }
-    for (threads[0..spawned]) |t| t.join();
 
     // Collect results
     for (to_check.items, 0..) |item, i| {

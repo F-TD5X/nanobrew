@@ -12,6 +12,7 @@ const Cask = @import("cask.zig").Cask;
 const Artifact = @import("cask.zig").Artifact;
 const PostField = @import("cask.zig").PostField;
 const tap = @import("tap.zig");
+const search_api = @import("search.zig");
 const fetch = @import("../net/fetch.zig");
 const upstream_github = @import("../upstream/github.zig");
 const upstream_registry = @import("../upstream/registry.zig");
@@ -276,6 +277,30 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
 /// Fetch a formula directly from the live Homebrew API (cache → network),
 /// bypassing the verified-upstream registry. Used both as the no-upstream path
 /// and for the freshness comparison above.
+/// Local-only formula lookup: per-name disk cache, then a slice out of the
+/// fresh bulk list. No network and no upstream-registry resolution — callers
+/// that only need metadata (version, dependencies) try this before paying
+/// for a full fetch.
+pub fn fetchFormulaLocal(alloc: std.mem.Allocator, name: []const u8) ?Formula {
+    var cache_path_buf: [512]u8 = undefined;
+    const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}.json", .{ API_CACHE_DIR, name }) catch return null;
+
+    if (readCached(alloc, cache_path)) |cached_json| {
+        defer alloc.free(cached_json);
+        if (parseFormulaJson(alloc, cached_json)) |formula| return formula else |_| {}
+    }
+
+    if (search_api.bulkFormulaEntryJson(alloc, name)) |entry_json| {
+        defer alloc.free(entry_json);
+        if (parseFormulaJson(alloc, entry_json)) |formula| {
+            writeCacheFile(cache_path, entry_json);
+            return formula;
+        } else |_| {}
+    }
+
+    return null;
+}
+
 fn fetchFormulaLive(alloc: std.mem.Allocator, client: ?*std.http.Client, name: []const u8) !Formula {
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}.json", .{ API_CACHE_DIR, name }) catch return error.NameTooLong;
@@ -287,6 +312,18 @@ fn fetchFormulaLive(alloc: std.mem.Allocator, client: ?*std.http.Client, name: [
         };
         alloc.free(cached_json);
         return formula;
+    }
+
+    // Bulk-list fast path: a fresh `nb search`/`outdated` bulk cache already
+    // holds this formula's full API object — slice it out locally instead of
+    // making a network round trip, and warm the per-name cache so follow-up
+    // commands hit the cheaper path above.
+    if (search_api.bulkFormulaEntryJson(alloc, name)) |entry_json| {
+        defer alloc.free(entry_json);
+        if (parseFormulaJson(alloc, entry_json)) |formula| {
+            writeCacheFile(cache_path, entry_json);
+            return formula;
+        } else |_| {}
     }
 
     return fetchAndCache(alloc, client, name, cache_path);
@@ -359,6 +396,16 @@ fn fetchCaskLive(alloc: std.mem.Allocator, token: []const u8) !Cask {
         };
         alloc.free(cached_json);
         return cask;
+    }
+
+    // Bulk-list fast path — see fetchFormulaLive. A fresh bulk cask cache
+    // serves the token's full API object without a network round trip.
+    if (search_api.bulkCaskEntryJson(alloc, token)) |entry_json| {
+        defer alloc.free(entry_json);
+        if (parseCaskJson(alloc, entry_json)) |cask| {
+            writeCacheFile(cache_path, entry_json);
+            return cask;
+        } else |_| {}
     }
 
     return fetchAndCacheCask(alloc, token, cache_path);
@@ -753,6 +800,14 @@ fn resolveUserAgent(ua: []const u8) ?[]const u8 {
         return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15";
     }
     return ua;
+}
+
+fn writeCacheFile(cache_path: []const u8, data: []const u8) void {
+    std.Io.Dir.createDirAbsolute(paths.safe_io, API_CACHE_DIR, .default_dir) catch {};
+    if (std.Io.Dir.createFileAbsolute(paths.safe_io, cache_path, .{})) |file| {
+        defer file.close(paths.safe_io);
+        file.writeStreamingAll(paths.safe_io, data) catch {};
+    } else |_| {}
 }
 
 fn fetchAndCache(alloc: std.mem.Allocator, shared_client: ?*std.http.Client, name: []const u8, cache_path: []const u8) !Formula {

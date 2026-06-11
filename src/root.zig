@@ -35,6 +35,7 @@ pub const cask_installer = @import("cask/install.zig");
 pub const source_builder = @import("build/source.zig");
 pub const postinstall = @import("build/postinstall.zig");
 pub const search_api = @import("api/search.zig");
+pub const bulk_versions = @import("api/bulk_versions.zig");
 pub const tap = @import("api/tap.zig");
 pub const services = @import("services/services.zig");
 pub const version = @import("version.zig");
@@ -74,6 +75,8 @@ comptime {
     _ = version;
     _ = upstream_registry;
     _ = upstream_github;
+    _ = search_api;
+    _ = bulk_versions;
     _ = telemetry;
     _ = tar;
     _ = native_tar;
