@@ -1213,8 +1213,10 @@ test "findBottleTag - fallback to all" {
 }
 
 test "findBottleTag - no matching tag returns null" {
+    // Use a tag that is not BOTTLE_TAG on any supported platform — the old
+    // fixture used x86_64_linux, which *matches* when the tests run on Linux.
     const json =
-        \\{"x86_64_linux":{"url":"u1"}}
+        \\{"riscv64_solaris":{"url":"u1"}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();

@@ -294,6 +294,11 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
     defer deps.deinit(alloc);
     var build_deps: std.ArrayList([]const u8) = .empty;
     defer build_deps.deinit(alloc);
+    // Binaries declared via `def install / bin.install "name"`. Tap formulas
+    // that ship prebuilt tarballs rely on Homebrew's Ruby install DSL to move
+    // the executable from the tarball root into `bin/`. nanobrew does not
+    // execute Ruby, so without this extraction the binary lands in the keg
+    // root and is never symlinked into `prefix/bin`. See #286.
     var install_bins: std.ArrayList([]const u8) = .empty;
     defer install_bins.deinit(alloc);
 
@@ -306,11 +311,53 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
     // shell_output, etc.) and must not be parsed as formula metadata.
     // See the extractQuotedAfter docs for the concrete failure mode.
     var test_depth: u32 = 0;
+    // `def install ... end` is a Ruby method, not a `do` block — track its
+    // own nesting so a nested `do ... end` inside the body doesn't confuse
+    // the outer block_depth counter.
+    var in_install_method: bool = false;
+    var install_inner_depth: u32 = 0;
 
     var line_iter = std.mem.splitScalar(u8, src, '\n');
     while (line_iter.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
+
+        // --- def install body: capture bin.install targets, skip everything else ---
+        if (in_install_method) {
+            if (endsWith(line, " do") or std.mem.eql(u8, line, "do")) {
+                install_inner_depth += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, line, "end")) {
+                if (install_inner_depth > 0) {
+                    install_inner_depth -= 1;
+                } else {
+                    in_install_method = false;
+                }
+                continue;
+            }
+            if (startsWith(line, "bin.install") or startsWith(line, "sbin.install")) {
+                if (extractBinInstallNames(line)) |names| {
+                    for (names) |maybe_name| {
+                        const bin_name = maybe_name orelse break;
+                        try install_bins.append(alloc, try alloc.dupe(u8, bin_name));
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Detect opening of a `def install` method — Ruby methods don't use
+        // `do`, so the existing block_depth counter doesn't cover them.
+        if (startsWith(line, "def install")) {
+            const after = line["def install".len..];
+            const is_method = after.len == 0 or after[0] == ' ' or after[0] == '\t' or after[0] == '(';
+            if (is_method) {
+                in_install_method = true;
+                install_inner_depth = 0;
+                continue;
+            }
+        }
 
         // Handle Ruby if/else/end for Hardware::CPU conditionals (#68)
         if (startsWith(line, "if Hardware::CPU.intel?")) {
@@ -851,6 +898,74 @@ test "parseRubyFormula - simple formula with version and url" {
     try testing.expectEqualStrings("Command-line ElevenLabs TTS", f.desc);
     try testing.expectEqualStrings("https://github.com/steipete/sag/releases/download/v0.2.2/sag.tar.gz", f.source_url);
     try testing.expectEqualStrings("abc123", f.source_sha256);
+    // Regression: tap formulas with a custom `def install / bin.install`
+    // must surface the binary name so source_builder.installDeclaredBinaries
+    // can place it under keg/bin/. See #286.
+    try testing.expectEqual(@as(usize, 1), f.install_binaries.len);
+    try testing.expectEqualStrings("sag", f.install_binaries[0]);
+}
+
+test "parseRubyFormula - def install bin.install populates install_binaries (#286)" {
+    // Shape mirrors neurosnap/tap/zmx — prebuilt tarball with on_macos/on_arm
+    // platform blocks and a custom `def install` containing `bin.install`.
+    const src =
+        \\class Zmx < Formula
+        \\  desc "Session persistence for terminal processes"
+        \\  version "0.5.0"
+        \\  on_macos do
+        \\    on_arm do
+        \\      url "https://zmx.sh/a/zmx-0.5.0-macos-aarch64.tar.gz"
+        \\      sha256 "deadbeef"
+        \\    end
+        \\  end
+        \\  def install
+        \\    bin.install "zmx"
+        \\    generate_completions_from_executable(bin/"zmx", "completions")
+        \\  end
+        \\  test do
+        \\    assert_match "Usage: zmx", shell_output("#{bin}/zmx help")
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "zmx", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqualStrings("zmx", f.name);
+    try testing.expectEqualStrings("0.5.0", f.version);
+    try testing.expectEqual(@as(usize, 1), f.install_binaries.len);
+    try testing.expectEqualStrings("zmx", f.install_binaries[0]);
+}
+
+test "parseRubyFormula - bin.install with multiple binaries" {
+    const src =
+        \\class Multi < Formula
+        \\  version "1.0"
+        \\  url "https://example.com/multi.tar.gz"
+        \\  sha256 "abc"
+        \\  def install
+        \\    bin.install "foo", "bar", "baz"
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "multi", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), f.install_binaries.len);
+    try testing.expectEqualStrings("foo", f.install_binaries[0]);
+    try testing.expectEqualStrings("bar", f.install_binaries[1]);
+    try testing.expectEqualStrings("baz", f.install_binaries[2]);
+}
+
+test "parseRubyFormula - def install absent yields empty install_binaries" {
+    // Bottle-style formula that never lists explicit binaries.
+    const src =
+        \\class Hello < Formula
+        \\  version "2.12.1"
+        \\  url "https://example.com/hello.tar.gz"
+        \\  sha256 "abc"
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "hello", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), f.install_binaries.len);
 }
 
 test "parseRubyFormula - version interpolation in url" {
@@ -888,6 +1003,8 @@ test "parseRubyFormula - dependencies" {
 }
 
 test "parseRubyFormula - bottle block with root_url" {
+    // Carry a sha for every CI platform so findBottleSha256 resolves the
+    // current BOTTLE_TAG on macOS and Linux alike.
     const src =
         \\class Bpb < Formula
         \\  version "1.3.0"
@@ -896,6 +1013,8 @@ test "parseRubyFormula - bottle block with root_url" {
         \\  bottle do
         \\    root_url "https://github.com/indirect/homebrew-tap/releases/download/bpb-v1.3.0"
         \\    sha256 cellar: :any_skip_relocation, arm64_sonoma: "32aab73b"
+        \\    sha256 cellar: :any_skip_relocation, x86_64_linux: "32aab73b"
+        \\    sha256 cellar: :any_skip_relocation, aarch64_linux: "32aab73b"
         \\  end
         \\end
     ;
