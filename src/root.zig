@@ -18,6 +18,7 @@
 
 pub const api_client = @import("api/client.zig");
 pub const formula = @import("api/formula.zig");
+pub const ghcr = @import("api/ghcr.zig");
 pub const deps = @import("resolve/deps.zig");
 pub const downloader = @import("net/downloader.zig");
 pub const fetch = @import("net/fetch.zig");
@@ -61,6 +62,7 @@ pub const security_test = @import("security_test.zig");
 comptime {
     _ = api_client;
     _ = formula;
+    _ = ghcr;
     _ = cask;
     _ = cask_installer;
     _ = tap;

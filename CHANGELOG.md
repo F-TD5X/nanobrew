@@ -8,9 +8,35 @@ All notable changes to nanobrew are documented here.
 - **Cask DMG mount ~23x faster on cold mounts** — `hdiutil attach` now runs with `-noverify -noautofsck -readonly`. The download path already SHA256-verifies the DMG bytes, so hdiutil's per-attach checksum was duplicate work that dominated cold-mount time on large DMGs (the deficits called out in #259: `bruno` -2123 ms, `raycast` -1858 ms, `orbstack` -691 ms). Measured on a 350 MB DMG: cold mount went 4983 ms → 215 ms. `hdiutil detach` also gets `-force` so a stuck handle on the mount can't hang cleanup. Refs #259.
 - **DMG detach no longer blocks install return** — `hdiutil detach` is now spawned in the background and not awaited. The volume unmounts while `nb` is already returning to the user; the kernel reaps the still-running child on `nb` exit. Eliminates a 200–500 ms stall from the `cleanup` phase on every DMG cask.
 - **Quarantine clear uses `removexattr(2)` directly on the non-recursive path** — the .dmg and .pkg quarantine-removal paths used to fork+exec `/usr/bin/xattr -p` to probe and then `/usr/bin/xattr -d` to remove, a 2-subprocess pattern that fired up to four times per cask. Replaced with a direct `removexattr` syscall, with the recursive .app path keeping the subprocess but dropping the redundant probe. Cuts ~40–60 ms per DMG cask off the `mount_dmg` and `artifacts` phases.
+- **Batch installs share one HTTP client and GHCR token** — install workers now borrow a batch-wide `std.http.Client` (one TLS connection pool, no per-package handshake) and a single anonymous GHCR pull token fetched once per batch. The 16-slot install window also reclaims any finished worker slot instead of always joining the oldest, so a long source build scheduled first no longer stalls the pipeline. (#36)
 
 ### Fixed
 - **Tap formulas with `def install / bin.install` now symlink correctly** — `parseRubyFormula` now extracts binaries named in a Ruby `def install` block and surfaces them via `Formula.install_binaries`. Previously, prebuilt-tarball tap formulas (e.g. `neurosnap/tap/zmx`, `steipete/tap/sag`) installed into the keg root with no `prefix/bin` symlink, so the binary was missing from `PATH`. Source-build now feeds these names through `installDeclaredBinaries` into `keg/bin/`, where the existing linker picks them up. (#286)
+- **Casks installed via `nb bundle install` were missing from `nb list`** — the install now persists the database after each cask, and a cask whose payload is already on disk (e.g. from an interrupted run) is re-adopted into the database instead of silently skipped, so `nb list`, `nb bundle dump`, and `nb upgrade` stay in sync with the Caskroom. (#302)
+- **Casks delivered via a `suite`/`artifact` stanza (e.g. KiCad) now install correctly** — the cask parser handles `suite` and `artifact` artifacts (previously dropped), `/Applications` payloads are copied and de-quarantined like `app` artifacts, and a `binary` symlink is no longer created when its source is absent — so a failed cask reports an error instead of falsely succeeding with broken symlinks. (#303)
+
+## [0.1.195] - 2026-06-02
+
+### Added
+- **`nb install <pkg>@<version>`** — versioned installs resolved from GHCR/OCI bottle tags, with automatic pinning and an "offer latest" fallback when the requested version has no bottle for the current platform. (#300)
+
+### Fixed
+- **Post-install SIGSEGV on versioned install** — the daily update check now runs on a dedicated single-threaded HTTP client and `nb` exits cleanly, eliminating the crash during runtime teardown. (#298)
+- **Relocate literal Homebrew paths in Mach-O binaries** — embedded `/opt/homebrew` and `/usr/local` paths are rewritten so relocated kegs work outside the default prefix, fixing packages such as imagemagick and libheif. (#297)
+- **Misnamed binary inside release tarballs** — the notarize/packaging step stages the binary as `nb`, and the install / `nb update` paths fall back to an `nb-<arch>` entry when present. (#293, #296)
+- **Linker shim promotion** — kegs that ship `libexec/git-core` are auto-promoted to a shim wrapper.
+
+### Performance
+- **GHCR pull token fetched once per versioned install** — a single anonymous pull token is reused across tag listing, manifest, and blob download, removing two cold round-trips per versioned install.
+
+### Docs
+- Documented the package-manager CLI policy in the upstream registry docs. (#253)
+
+## [0.1.194] - 2026-05-25
+
+### Fixed
+- Tap symlink creation, the update banner, the `git` shim, and Linux CI. (#292)
+- `nb update` now falls back to curl/wget for the SHA256 download when the primary fetch fails.
 
 ## [0.1.193] - 2026-05-11
 

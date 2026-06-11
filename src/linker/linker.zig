@@ -194,6 +194,7 @@ fn renderShimWrapper(
     alloc: std.mem.Allocator,
     actual_bin: []const u8,
     path_entries: []const []const u8,
+    extra_env: []const [2][]const u8,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -212,8 +213,17 @@ fn renderShimWrapper(
     try writer.writeAll(
         \\$PATH"
         \\export PATH
-        \\exec "
+        \\
     );
+    for (extra_env) |kv| {
+        try writer.writeAll(kv[0]);
+        try writer.writeAll("=\"");
+        try writer.writeAll(kv[1]);
+        try writer.writeAll("\"\nexport ");
+        try writer.writeAll(kv[0]);
+        try writer.writeAll("\n");
+    }
+    try writer.writeAll("exec \"");
     try writer.writeAll(actual_bin);
     try writer.writeAll(
         \\" "$@"
@@ -246,8 +256,22 @@ fn installShimLink(
     var wrapper_path_buf: [1024]u8 = undefined;
     const wrapper_path = std.fmt.bufPrint(&wrapper_path_buf, "{s}/{s}", .{ wrapper_dir, entry_name }) catch return;
 
+    // Detect per-package env vars (e.g. GIT_EXEC_PATH for git)
+    var extra_env_buf: [2][2][]const u8 = undefined;
+    var extra_env_count: usize = 0;
+    var git_core_buf: [512]u8 = undefined;
+    const git_core_path = std.fmt.bufPrint(&git_core_buf, "{s}/libexec/git-core", .{keg_dir}) catch "";
+    if (git_core_path.len > 0) {
+        if (std.Io.Dir.openDirAbsolute(lib_io, git_core_path, .{})) |d| {
+            var bd = d;
+            bd.close(lib_io);
+            extra_env_buf[extra_env_count] = .{ "GIT_EXEC_PATH", git_core_path };
+            extra_env_count += 1;
+        } else |_| {}
+    }
+
     const alloc = std.heap.smp_allocator;
-    const wrapper_content = renderShimWrapper(alloc, source, path_entries) catch return;
+    const wrapper_content = renderShimWrapper(alloc, source, path_entries, extra_env_buf[0..extra_env_count]) catch return;
     defer alloc.free(wrapper_content);
 
     std.Io.Dir.deleteFileAbsolute(lib_io, wrapper_path) catch {};
@@ -493,12 +517,33 @@ pub fn linkKegWithOptions(name: []const u8, version: []const u8, options: LinkOp
 
     if (options.mode == .private_dependency) unlinkShimLinks(keg_dir);
 
+    // Detect kegs that need wrapper shims for env vars even in global mode
+    // (e.g. git with libexec/git-core needs GIT_EXEC_PATH)
+    var needs_env_shim = false;
+    if (options.mode == .global) {
+        var git_core_buf: [512]u8 = undefined;
+        const git_core_path = std.fmt.bufPrint(&git_core_buf, "{s}/libexec/git-core", .{keg_dir}) catch "";
+        if (git_core_path.len > 0) {
+            if (std.Io.Dir.openDirAbsolute(lib_io, git_core_path, .{})) |d| {
+                var bd = d;
+                bd.close(lib_io);
+                needs_env_shim = true;
+            } else |_| {}
+        }
+    }
+
     for (subdir_mappings) |mapping| {
         var sub_buf: [512]u8 = undefined;
         const keg_subdir = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ keg_dir, mapping.src }) catch continue;
         if (isExecutableSubdir(mapping.src)) {
             switch (options.mode) {
-                .global => linkSubdir(keg_subdir, mapping.dest, keg_dir),
+                .global => {
+                    if (needs_env_shim) {
+                        linkSubdirAsShims(keg_subdir, mapping.dest, keg_dir, &.{});
+                    } else {
+                        linkSubdir(keg_subdir, mapping.dest, keg_dir);
+                    }
+                },
                 .shim_root => linkSubdirAsShims(keg_subdir, mapping.dest, keg_dir, options.shim_path_entries),
                 .private_dependency => unlinkSubdir(keg_subdir, mapping.dest),
             }
@@ -622,9 +667,21 @@ test "renderShimWrapper prepends private PATH entries and execs actual binary" {
         "/opt/nanobrew/prefix/opt/deno/bin",
         "/opt/nanobrew/prefix/opt/python@3.14/bin",
     };
-    const script = try renderShimWrapper(std.testing.allocator, "/opt/nanobrew/prefix/Cellar/yt-dlp/1.0/bin/yt-dlp", &entries);
+    const script = try renderShimWrapper(std.testing.allocator, "/opt/nanobrew/prefix/Cellar/yt-dlp/1.0/bin/yt-dlp", &entries, &.{});
     defer std.testing.allocator.free(script);
 
     try std.testing.expect(std.mem.indexOf(u8, script, "PATH=\"/opt/nanobrew/prefix/opt/deno/bin:/opt/nanobrew/prefix/opt/python@3.14/bin:$PATH\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "exec \"/opt/nanobrew/prefix/Cellar/yt-dlp/1.0/bin/yt-dlp\" \"$@\"") != null);
+}
+
+test "renderShimWrapper includes extra env vars" {
+    const env = [_][2][]const u8{
+        .{ "GIT_EXEC_PATH", "/opt/nanobrew/prefix/Cellar/git/2.47.0/libexec/git-core" },
+    };
+    const script = try renderShimWrapper(std.testing.allocator, "/opt/nanobrew/prefix/Cellar/git/2.47.0/bin/git", &.{}, &env);
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "GIT_EXEC_PATH=\"/opt/nanobrew/prefix/Cellar/git/2.47.0/libexec/git-core\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "export GIT_EXEC_PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "exec \"/opt/nanobrew/prefix/Cellar/git/2.47.0/bin/git\" \"$@\"") != null);
 }

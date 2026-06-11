@@ -263,3 +263,45 @@ Example:
   ]
 }
 ```
+
+## Package-Manager CLI Policy
+
+Some high-demand CLIs are distributed primarily through npm, pip, or other language package managers rather than standalone binary releases. This section defines when nanobrew should and should not install them.
+
+### Allow criteria
+
+A package-manager CLI is eligible for the upstream registry when ALL of the following hold:
+
+1. **Standalone binary available**: The project publishes pre-built binaries (GitHub Releases, vendor downloads) that do not require a language runtime at install time. These use existing `github_release` or `vendor_url` resolver classes.
+2. **Deterministic verification**: The binary has a SHA256 checksum, GitHub asset digest, or attestation that can be pinned in the registry.
+3. **No bootstrap toolchain**: Installation does not require npm/pip/cargo/go to be present on the user's system.
+
+### Deny criteria
+
+A CLI is NOT eligible when ANY of the following apply:
+
+1. **Runtime-only distribution**: The package is only available as an npm/pip/gem package with no standalone binary releases (e.g., requires `npx` or `pip install` to run).
+2. **Non-deterministic install**: The install process pulls transitive dependencies at runtime with no lockfile or checksum pinning.
+3. **Build-from-source only**: The package requires compilation with a language toolchain (cargo, go build) and has no pre-built release assets.
+
+### First batch (safe to support now)
+
+These CLIs have standalone binary releases and fit the existing resolver classes:
+
+| Token | Source | Resolver | Status |
+|-------|--------|----------|--------|
+| `ruff` | GitHub Releases (astral-sh/ruff) | `github_release` | Already seeded |
+| `uv` | GitHub Releases (astral-sh/uv) | `github_release` | Already seeded |
+| `bun` | GitHub Releases (oven-sh/bun) | `github_release` | Already seeded |
+| `deno` | GitHub Releases (denoland/deno) | `github_release` | Already seeded |
+
+### Deferred (needs new resolver class)
+
+These CLIs are npm/pip-only and would require a new `npm_package` or `pypi_package` resolver class tracked in #257:
+
+- `claude-code` — npm only, no standalone binary
+- `codex` — npm only, no standalone binary
+- `gemini-cli` — npm only, no standalone binary
+- `copilot-cli` — npm only, no standalone binary
+
+These are explicitly deferred until the native upstream registry path is further along.

@@ -417,6 +417,14 @@ pub const Database = struct {
         self.dirty = true;
     }
 
+    /// Persist the database to disk now if there are unsaved changes, without
+    /// closing it. close() still flushes implicitly; this lets a long-running
+    /// multi-item install checkpoint progress so an interrupted run does not
+    /// lose records for items that already completed (issue #302).
+    pub fn flush(self: *Database) !void {
+        return self.save();
+    }
+
     pub fn recordCaskRemoval(self: *Database, token: []const u8, alloc: std.mem.Allocator) !void {
         _ = alloc;
         var i: usize = 0;
