@@ -23,6 +23,10 @@ const CASK_DOWNLOAD_HEADERS = [_]std.http.Header{
     .{ .name = "User-Agent", .value = "Homebrew/4 (nanobrew)" },
 };
 
+// Darwin extended-attribute syscall used in place of spawning `/usr/bin/xattr`
+// for the common non-recursive quarantine-removal path.
+extern "c" fn removexattr(path: [*:0]const u8, name: [*:0]const u8, options: c_int) c_int;
+
 pub const DestinationConflict = struct {
     kind: []const u8,
     path: []const u8,
@@ -605,7 +609,7 @@ fn caskBlobCacheEnabled(sha256: []const u8) bool {
 fn mountDmg(alloc: std.mem.Allocator, io: std.Io, dmg_path: []const u8, out_buf: []u8) ![]const u8 {
     const lib_io = io;
     const result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "hdiutil", "attach", "-nobrowse", "-noautoopen", "-plist", dmg_path },
+        .argv = &.{ "hdiutil", "attach", "-nobrowse", "-noautoopen", "-noverify", "-noautofsck", "-readonly", "-plist", dmg_path },
         .stdout_limit = .limited(64 * 1024),
     }) catch return error.MountFailed;
     defer alloc.free(result.stdout);
@@ -636,13 +640,16 @@ fn mountDmg(alloc: std.mem.Allocator, io: std.Io, dmg_path: []const u8, out_buf:
 }
 
 fn unmountDmg(alloc: std.mem.Allocator, io: std.Io, mount_point: []const u8) void {
-    const lib_io = io;
-    const result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "hdiutil", "detach", mount_point, "-quiet" },
-        .stdout_limit = .limited(1024),
+    _ = alloc;
+    // Background detach: spawn `hdiutil detach` and drop the Child handle.
+    // The volume unmounts while `nb` is already returning to the user; the
+    // kernel reaps the still-running child when this process exits.
+    _ = std.process.spawn(io, .{
+        .argv = &.{ "hdiutil", "detach", "-force", "-quiet", mount_point },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch return;
-    alloc.free(result.stdout);
-    alloc.free(result.stderr);
 }
 
 fn installFastCaskArtifact(
@@ -1177,24 +1184,26 @@ fn clearQuarantineIfPresent(alloc: std.mem.Allocator, io: std.Io, path: []const 
     if (builtin.os.tag != .macos) return;
     if (!quarantineClearingEnabled()) return;
 
-    const check = std.process.run(alloc, io, .{
-        .argv = &.{ "xattr", "-p", "com.apple.quarantine", path },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    }) catch return;
-    defer alloc.free(check.stdout);
-    defer alloc.free(check.stderr);
-    if (switch (check.term) {
-        .exited => |code| code != 0,
-        else => true,
-    }) return;
+    if (!recursive) {
+        // Direct removexattr syscall: skips two `/usr/bin/xattr` subprocess
+        // spawns (~20 ms each) per non-recursive call. The probe-then-remove
+        // pattern that lived here before was redundant — removexattr returns
+        // -1 with errno=ENOATTR when the attribute is absent, which is the
+        // common case and is silently ignored.
+        if (path.len >= 1024) return;
+        var path_z: [1024]u8 = undefined;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        _ = removexattr(@ptrCast(&path_z), "com.apple.quarantine", 0);
+        return;
+    }
 
-    const argv: []const []const u8 = if (recursive)
-        &.{ "xattr", "-dr", "com.apple.quarantine", path }
-    else
-        &.{ "xattr", "-d", "com.apple.quarantine", path };
+    // Recursive case (newly-copied .app bundle): keep the subprocess for the
+    // recursive walk, but drop the prior `xattr -p` pre-check. `xattr -dr`
+    // is a silent no-op when the attribute is absent, so probing first was
+    // an unnecessary fork+exec.
     const clear = std.process.run(alloc, io, .{
-        .argv = argv,
+        .argv = &.{ "xattr", "-dr", "com.apple.quarantine", path },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(4096),
     }) catch return;
