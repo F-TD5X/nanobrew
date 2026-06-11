@@ -43,6 +43,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        // Linux: extern "c" symbols (symlink, fchmod, getenv, ...) reached via
+        // the extract/tar paths need an explicit libc link; macOS always links
+        // libSystem so null keeps the default there.
+        .link_libc = if (target.result.os.tag == .linux) true else null,
     });
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
@@ -92,6 +96,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test_module.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = if (target.result.os.tag == .linux) true else null,
         });
         mod.addOptions("module_test_options", opts);
 

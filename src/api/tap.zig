@@ -1003,6 +1003,8 @@ test "parseRubyFormula - dependencies" {
 }
 
 test "parseRubyFormula - bottle block with root_url" {
+    // Carry a sha for every CI platform so findBottleSha256 resolves the
+    // current BOTTLE_TAG on macOS and Linux alike.
     const src =
         \\class Bpb < Formula
         \\  version "1.3.0"
@@ -1011,6 +1013,8 @@ test "parseRubyFormula - bottle block with root_url" {
         \\  bottle do
         \\    root_url "https://github.com/indirect/homebrew-tap/releases/download/bpb-v1.3.0"
         \\    sha256 cellar: :any_skip_relocation, arm64_sonoma: "32aab73b"
+        \\    sha256 cellar: :any_skip_relocation, x86_64_linux: "32aab73b"
+        \\    sha256 cellar: :any_skip_relocation, aarch64_linux: "32aab73b"
         \\  end
         \\end
     ;

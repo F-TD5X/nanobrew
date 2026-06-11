@@ -921,6 +921,8 @@ test "globMatch supports wildcard asset patterns" {
 }
 
 test "caskFromReleaseJson maps GitHub release asset to Cask" {
+    // Cask asset selection is keyed on macOS platforms; skip elsewhere.
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const registry_json =
         \\{
         \\  "schema_version": 1,
@@ -1232,10 +1234,14 @@ fn caskFromReleaseJsonAllocationProbe(alloc: std.mem.Allocator) !void {
 }
 
 test "caskFromReleaseJson handles allocation failures" {
+    // Cask asset selection is keyed on macOS platforms; skip elsewhere.
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     try testing.checkAllAllocationFailures(testing.allocator, caskFromReleaseJsonAllocationProbe, .{});
 }
 
 test "caskFromReleaseJson requires asset digest for verified casks" {
+    // Cask asset selection is keyed on macOS platforms; skip elsewhere.
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const registry_json =
         \\{
         \\  "schema_version": 1,
