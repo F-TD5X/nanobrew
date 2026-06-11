@@ -414,7 +414,9 @@ fn runLocalRbInstall(alloc: std.mem.Allocator, path: []const u8) void {
     var phase = std.atomic.Value(u8).init(@intFromEnum(Phase.waiting));
     const local_formulae = [_]nb.formula.Formula{f};
     const local_requested = [_][]const u8{f.name};
-    fullInstallOne(alloc, f, &had_error, &phase, false, &local_requested, &local_formulae);
+    // Single-formula path: no batch sharing benefit — pass nulls so the
+    // worker creates its own one-shot client (existing behavior).
+    fullInstallOne(alloc, f, &had_error, &phase, false, &local_requested, &local_formulae, null, null);
 
     if (had_error.load(.acquire)) {
         stderr.print("nb: failed to install '{s}'\n", .{f.name}) catch {};
@@ -660,25 +662,63 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         for (install_order, 0..) |f, idx| names[idx] = f.name;
 
         var had_error = std.atomic.Value(bool).init(false);
-        var threads: std.ArrayList(std.Thread) = .empty;
-        defer threads.deinit(alloc);
+
+        // Batch-scoped HTTP client + GHCR token: one TLS connection pool
+        // shared across every install worker, and one bearer-token lookup
+        // shared across every ghcr.io bottle download. Workers borrow these
+        // read-only; the pool lives only for the duration of `runInstall`.
+        var shared_client: std.http.Client = .{ .allocator = alloc, .io = paths.safe_io };
+        defer shared_client.deinit();
+        const shared_ghcr_token: ?[]const u8 = blk: {
+            for (install_order) |f_check| {
+                if (std.mem.startsWith(u8, f_check.bottleUrl(), "https://ghcr.io")) {
+                    break :blk nb.downloader.fetchGhcrToken(alloc, &shared_client, f_check.bottleUrl()) catch null;
+                }
+            }
+            break :blk null;
+        };
+        defer if (shared_ghcr_token) |t| alloc.free(t);
+        // Each in-flight slot carries the OS thread handle plus the task index
+        // it owns. The task index lets us look up the matching `phases[ti]`
+        // entry when scanning for a worker that has already reached a terminal
+        // phase (`done` or `failed`), so we can reclaim its slot without
+        // blocking on whichever task happened to be spawned first.
+        const ThreadSlot = struct { handle: std.Thread, task_idx: usize };
+        var slots: std.ArrayList(ThreadSlot) = .empty;
+        defer slots.deinit(alloc);
 
         const max_concurrent: usize = 16;
 
         for (install_order, 0..) |f, pi| {
-            // Sliding window: when at capacity, wait for the oldest thread to finish
-            // before spawning a new one. This keeps ~16 threads running at all times
-            // instead of bursting 16, waiting for all, then bursting 16 again. (#36)
-            if (threads.items.len >= max_concurrent) {
-                threads.items[0].join();
-                _ = threads.orderedRemove(0);
+            // Sliding window: when at capacity, free a slot before spawning a
+            // new worker. The original implementation always joined the oldest
+            // (`slots.items[0]`), which stalled the pipeline whenever a long
+            // task (e.g. a cmake source build) was scheduled first while
+            // shorter bottle workers finished behind it. Now we first scan for
+            // any worker whose phase has reached `done`/`failed` and reclaim
+            // that slot; only when every slot is still mid-pipeline do we fall
+            // back to blocking on the oldest. This keeps the window saturated
+            // under skewed install times without busy-waiting. (#36)
+            if (slots.items.len >= max_concurrent) {
+                var reclaim_idx: ?usize = null;
+                for (slots.items, 0..) |slot, si| {
+                    const raw: u8 = phases[slot.task_idx].load(.acquire);
+                    const ph: Phase = @enumFromInt(raw);
+                    if (ph == .done or ph == .failed) {
+                        reclaim_idx = si;
+                        break;
+                    }
+                }
+                const idx = reclaim_idx orelse 0;
+                slots.items[idx].handle.join();
+                _ = slots.orderedRemove(idx);
             }
-            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], use_shims, formulae.items, all_formulae }) catch {
+            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], use_shims, formulae.items, all_formulae, &shared_client, shared_ghcr_token }) catch {
                 had_error.store(true, .release);
                 phases[pi].store(@intFromEnum(Phase.failed), .release);
                 continue;
             };
-            threads.append(alloc, t) catch {
+            slots.append(alloc, .{ .handle = t, .task_idx = pi }) catch {
                 // Couldn't track this handle. The worker is already running and
                 // borrows `phases` / `formulae.items` / `names`; if we let it
                 // outlive runInstall we get a use-after-free. Joining inline
@@ -695,7 +735,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
             renderProgress(names, phases);
         }
 
-        for (threads.items) |t| t.join();
+        for (slots.items) |slot| slot.handle.join();
 
         // Non-TTY: print final status for each package
         if (!is_tty) {
@@ -957,6 +997,11 @@ fn formulaLinkNeedsRepair(
 
 /// Full per-package pipeline: download → extract → materialize → relocate → link
 /// Runs in its own thread — no barriers between phases.
+///
+/// `shared_client` / `shared_ghcr_token`, when non-null, route the bottle
+/// download through a batch-wide `std.http.Client` so all install workers
+/// share its TLS connection pool (avoiding a fresh handshake per package)
+/// and skip per-package GHCR token lookups.
 fn fullInstallOne(
     alloc: std.mem.Allocator,
     f: nb.formula.Formula,
@@ -965,6 +1010,8 @@ fn fullInstallOne(
     use_shims: bool,
     requested: []const []const u8,
     all_formulae: []const nb.formula.Formula,
+    shared_client: ?*std.http.Client,
+    shared_ghcr_token: ?[]const u8,
 ) void {
     const stderr = StderrWriter{};
 
@@ -1015,12 +1062,20 @@ fn fullInstallOne(
         };
 
         if (!fileExists(blob_path)) {
-            nb.downloader.downloadOne(alloc, .{
+            const dl_req: nb.downloader.DownloadRequest = .{
                 .url = f.bottleUrl(),
                 .expected_sha256 = f.bottle_sha256,
                 .target_kind = .formula,
                 .target_name = f.name,
-            }) catch |err| {
+            };
+            // Prefer the batch-shared client+token when runInstall provided
+            // one: keeps the TLS connection pool warm across workers and
+            // skips a per-package GHCR token lookup.
+            const dl_result = if (shared_client) |c|
+                nb.downloader.downloadOneWithClient(alloc, c, dl_req, shared_ghcr_token)
+            else
+                nb.downloader.downloadOne(alloc, dl_req);
+            dl_result catch |err| {
                 stderr.print("nb: {s}: download failed: {}\n", .{ f.name, err }) catch {};
                 had_error.store(true, .release);
                 phase.store(@intFromEnum(Phase.failed), .release);
