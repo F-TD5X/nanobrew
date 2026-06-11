@@ -123,19 +123,28 @@ pub const EntryRange = struct { start: usize, end: usize };
 /// unless the bulk JSON cache is fresh and the sidecar matches it — callers
 /// fall back to a network fetch.
 pub fn bulkFormulaEntryJson(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
+    return bulkEntryJson(alloc, FORMULA_CACHE, FORMULA_IDX, name);
+}
+
+/// Cask analogue of bulkFormulaEntryJson, keyed by token.
+pub fn bulkCaskEntryJson(alloc: std.mem.Allocator, token: []const u8) ?[]u8 {
+    return bulkEntryJson(alloc, CASK_CACHE, CASK_IDX, token);
+}
+
+fn bulkEntryJson(alloc: std.mem.Allocator, json_path: []const u8, idx_path: []const u8, name: []const u8) ?[]u8 {
     const lib_io = paths.safe_io;
-    const json_mtime = fileMtimeNs(FORMULA_CACHE) orelse return null;
+    const json_mtime = fileMtimeNs(json_path) orelse return null;
     const now_ts = std.Io.Timestamp.now(lib_io, .real);
     if (now_ts.nanoseconds - json_mtime > CACHE_TTL_NS) return null;
-    const idx_mtime = fileMtimeNs(FORMULA_IDX) orelse return null;
+    const idx_mtime = fileMtimeNs(idx_path) orelse return null;
     if (idx_mtime < json_mtime) return null;
 
-    const tsv = readFileAlloc(alloc, FORMULA_IDX) orelse return null;
+    const tsv = readFileAlloc(alloc, idx_path) orelse return null;
     defer alloc.free(tsv);
     const range = findEntryRange(tsv, name) orelse return null;
 
-    // pread exactly the entry's bytes out of the 30 MB bulk JSON.
-    const file = std.Io.Dir.openFileAbsolute(lib_io, FORMULA_CACHE, .{}) catch return null;
+    // pread exactly the entry's bytes out of the bulk JSON.
+    const file = std.Io.Dir.openFileAbsolute(lib_io, json_path, .{}) catch return null;
     defer file.close(lib_io);
     const st = file.stat(lib_io) catch return null;
     if (range.end > st.size or range.start >= range.end) return null;

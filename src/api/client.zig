@@ -374,6 +374,16 @@ fn fetchCaskLive(alloc: std.mem.Allocator, token: []const u8) !Cask {
         return cask;
     }
 
+    // Bulk-list fast path — see fetchFormulaLive. A fresh bulk cask cache
+    // serves the token's full API object without a network round trip.
+    if (search_api.bulkCaskEntryJson(alloc, token)) |entry_json| {
+        defer alloc.free(entry_json);
+        if (parseCaskJson(alloc, entry_json)) |cask| {
+            writeCacheFile(cache_path, entry_json);
+            return cask;
+        } else |_| {}
+    }
+
     return fetchAndCacheCask(alloc, token, cache_path);
 }
 
