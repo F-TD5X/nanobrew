@@ -4,6 +4,10 @@ All notable changes to nanobrew are documented here.
 
 ## Unreleased
 
+### Performance
+- **`nb outdated` ~1,170x faster (3,640 ms → 3.1 ms), `nb leaves` ~1,140x faster (4,690 ms → 4.1 ms), `nb search` ~30x faster (93 ms → 3.1 ms)** — a TSV index sidecar (`name`, `version`, `desc`, plus entry byte offsets) is built once per bulk-list cache refresh (1h TTL) and replaces both the per-installed-package API round trips (`outdated`/`upgrade` checks, `leaves`) and the 46 MB JSON re-scan per `search`. Packages outside the bulk lists (taps, upstream-only) still use the parallel per-name fetch fallback.
+- **Cold dependency resolution ~7x faster (1,077 ms → 150 ms for ffmpeg's graph)** — formula and cask metadata fetches slice the package's full API object out of the fresh bulk cache via one `pread` (using the sidecar's byte offsets) instead of a network round trip, then warm the per-name cache. `nb install` resolve, `nb info`, and the upstream freshness checks all ride this path; outputs verified byte-identical to network fetches.
+
 ### Added
 - **`nb switch <pkg>@<version>`** — reactivate a previously-installed version. Instant when the keg is still in the Cellar (switch keeps the outgoing version on disk, unlike `rollback`); otherwise re-materializes from the content-addressed store, and suggests `nb install pkg@version` when the payload is gone. `nb list --versions` shows each package's install history with the switchable versions marked.
 
