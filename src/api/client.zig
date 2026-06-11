@@ -277,6 +277,30 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
 /// Fetch a formula directly from the live Homebrew API (cache → network),
 /// bypassing the verified-upstream registry. Used both as the no-upstream path
 /// and for the freshness comparison above.
+/// Local-only formula lookup: per-name disk cache, then a slice out of the
+/// fresh bulk list. No network and no upstream-registry resolution — callers
+/// that only need metadata (version, dependencies) try this before paying
+/// for a full fetch.
+pub fn fetchFormulaLocal(alloc: std.mem.Allocator, name: []const u8) ?Formula {
+    var cache_path_buf: [512]u8 = undefined;
+    const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}.json", .{ API_CACHE_DIR, name }) catch return null;
+
+    if (readCached(alloc, cache_path)) |cached_json| {
+        defer alloc.free(cached_json);
+        if (parseFormulaJson(alloc, cached_json)) |formula| return formula else |_| {}
+    }
+
+    if (search_api.bulkFormulaEntryJson(alloc, name)) |entry_json| {
+        defer alloc.free(entry_json);
+        if (parseFormulaJson(alloc, entry_json)) |formula| {
+            writeCacheFile(cache_path, entry_json);
+            return formula;
+        } else |_| {}
+    }
+
+    return null;
+}
+
 fn fetchFormulaLive(alloc: std.mem.Allocator, client: ?*std.http.Client, name: []const u8) !Formula {
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}.json", .{ API_CACHE_DIR, name }) catch return error.NameTooLong;

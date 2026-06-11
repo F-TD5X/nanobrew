@@ -1726,7 +1726,11 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
                 const idx = ctx.next_idx.fetchAdd(1, .monotonic);
                 if (idx >= ctx.kegs_.len) break;
                 const keg = ctx.kegs_[idx];
-                const formula = nb.api_client.fetchFormulaWithClient(ctx.alloc_, &client, keg.name) catch continue;
+                // Leaves only needs dependency lists — prefer the local
+                // cache/bulk-list lookup; the full fetch (upstream registry,
+                // network) is the fallback for packages outside the bulk list.
+                const formula = nb.api_client.fetchFormulaLocal(ctx.alloc_, keg.name) orelse
+                    (nb.api_client.fetchFormulaWithClient(ctx.alloc_, &client, keg.name) catch continue);
                 ctx.slots_[idx].formula = formula;
                 ctx.slots_[idx].state = .filled;
             }
