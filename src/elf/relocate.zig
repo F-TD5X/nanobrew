@@ -1,11 +1,23 @@
 // nanobrew — ELF relocator for Linux
 //
-// Mirrors the Mach-O relocator architecture:
-// 1. Detect ELF files (0x7f ELF magic)
-// 2. Parse ELF headers natively to check for placeholders
-// 3. Use patchelf --set-rpath when changes needed
-// 4. Replace placeholders in .pc, .cmake, .la text files
-// 5. No codesign step (Linux doesn't need it)
+// Native-first design (no patchelf for the common case):
+// 1. Detect ELF files (0x7f ELF magic), read each file once.
+// 2. Rewrite Homebrew placeholders and Linuxbrew literals IN PLACE with
+//    strictly-shorter replacements, NUL-padding each containing C string's
+//    tail. Because every replacement is shorter, .dynstr (RPATH/RUNPATH and
+//    DT_NEEDED), PT_INTERP, and .rodata strings can all be patched without
+//    moving a single byte offset — no section resizing, no patchelf.
+//    The shorter-prefix guarantee comes from the /opt/nb → <PREFIX> symlink
+//    (Nix-style short prefix): @@HOMEBREW_PREFIX@@ (19) → /opt/nb (7),
+//    @@HOMEBREW_CELLAR@@ (19) → /opt/nb/Cellar (14),
+//    @@HOMEBREW_REPOSITORY@@ (23) → /opt/nanobrew (13).
+// 3. Repair PT_INTERP natively when the rewritten interpreter doesn't exist
+//    (no glibc keg) by swapping in the system loader for the binary's arch.
+// 4. patchelf remains only as a fallback for the case where the /opt/nb
+//    symlink can't be created (non-root upgrade of an old install) — and is
+//    bootstrapped lazily, on first actual need, instead of before every keg.
+// 5. Replace placeholders in .pc, .cmake, .la text files (unchanged).
+// 6. No codesign step (Linux doesn't need it).
 //
 // Note: every std.process.run call below threads the caller's `io` rather
 // than paths.safe_io. Zig 0.16's process
@@ -24,6 +36,25 @@ const ELF_MAGIC = [4]u8{ 0x7f, 'E', 'L', 'F' };
 // Text config file extensions that may contain placeholders
 const TEXT_EXTS = [_][]const u8{ ".pc", ".cmake", ".la", ".sh", ".cfg" };
 
+const LINUXBREW_LITERAL = "/home/linuxbrew/.linuxbrew/";
+const PREFIX_SLASH = paths.PREFIX ++ "/";
+
+/// Short prefix symlink target: /opt/nb → <PREFIX>. Strictly shorter than
+/// every @@HOMEBREW_*@@ placeholder, which is what makes in-place ELF
+/// patching universally valid (replacement never grows a string).
+pub const SHORT_PREFIX = "/opt/nb";
+const SHORT_CELLAR = SHORT_PREFIX ++ "/Cellar";
+
+comptime {
+    if (SHORT_PREFIX.len > paths.PLACEHOLDER_PREFIX.len or
+        SHORT_CELLAR.len > paths.PLACEHOLDER_CELLAR.len or
+        paths.REAL_REPOSITORY.len > paths.PLACEHOLDER_REPOSITORY.len or
+        PREFIX_SLASH.len > LINUXBREW_LITERAL.len)
+    {
+        @compileError("ELF in-place relocation requires every replacement to be no longer than its source");
+    }
+}
+
 // Process-wide coordination for the auto-install path. When `nb install`
 // fans out parallel workers and patchelf is missing, every worker would
 // otherwise race to run `apt-get install` simultaneously — but apt holds
@@ -34,6 +65,54 @@ const TEXT_EXTS = [_][]const u8{ ".pc", ".cmake", ".la", ".sh", ".cfg" };
 const PatchelfState = enum(u8) { unknown, present, install_failed };
 var patchelf_mutex: std.Io.Mutex = .init;
 var patchelf_state: PatchelfState = .unknown;
+
+// Same memoization pattern for the /opt/nb short-prefix symlink: one
+// readlink/symlink attempt per process, shared across install workers.
+const ShortLinkState = enum(u8) { unknown, ok, unavailable };
+var short_link_mutex: std.Io.Mutex = .init;
+var short_link_state: ShortLinkState = .unknown;
+
+/// Ensure /opt/nb → <PREFIX> exists. Returns false when it can't be created
+/// (no permission on /opt and not already present) or when /opt/nb exists
+/// but is not ours — in that case the caller must use the patchelf fallback.
+pub fn ensureShortPrefixLink(io: std.Io) bool {
+    short_link_mutex.lockUncancelable(io);
+    defer short_link_mutex.unlock(io);
+
+    switch (short_link_state) {
+        .ok => return true,
+        .unavailable => return false,
+        .unknown => {},
+    }
+
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.Io.Dir.readLinkAbsolute(io, SHORT_PREFIX, &target_buf)) |n| {
+        short_link_state = if (std.mem.eql(u8, target_buf[0..n], paths.PREFIX)) .ok else .unavailable;
+        return short_link_state == .ok;
+    } else |_| {}
+
+    // Exists but isn't a symlink (a real dir/file someone put there) — leave it alone.
+    if (std.Io.Dir.accessAbsolute(io, SHORT_PREFIX, .{})) |_| {
+        short_link_state = .unavailable;
+        return false;
+    } else |_| {}
+
+    if (std.c.symlink(paths.PREFIX, SHORT_PREFIX) == 0) {
+        short_link_state = .ok;
+        return true;
+    }
+
+    // Lost a race with a concurrent nb process? Accept its link if correct.
+    if (std.Io.Dir.readLinkAbsolute(io, SHORT_PREFIX, &target_buf)) |n| {
+        if (std.mem.eql(u8, target_buf[0..n], paths.PREFIX)) {
+            short_link_state = .ok;
+            return true;
+        }
+    } else |_| {}
+
+    short_link_state = .unavailable;
+    return false;
+}
 
 /// Ensure patchelf is available, attempting a one-shot auto-install on
 /// first call. Safe to call concurrently — only one caller drives the
@@ -106,14 +185,10 @@ pub fn ensurePatchelf(alloc: std.mem.Allocator, io: std.Io) error{PatchelfNotFou
     }
 }
 
-/// Relocate all ELF files and text configs in a keg.
+/// Relocate all ELF files and text configs in a keg. Native in-place
+/// patching needs no external tooling; patchelf is bootstrapped lazily
+/// inside relocateFile only when a file actually requires it.
 pub fn relocateKeg(alloc: std.mem.Allocator, io: std.Io, name: []const u8, version: []const u8) !void {
-    ensurePatchelf(alloc, io) catch {
-        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: {s}: could not install patchelf — ELF binary relocation skipped\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(io, _tmp) catch {}; });
-        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: install patchelf manually (e.g. apt install patchelf) and re-run: nb reinstall {s}\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(io, _tmp) catch {}; });
-        return error.PatchelfNotFound;
-    };
-
     var keg_buf: [512]u8 = undefined;
     const keg_dir = std.fmt.bufPrint(&keg_buf, "{s}/{s}/{s}", .{ paths.CELLAR_DIR, name, version }) catch return error.PathTooLong;
 
@@ -207,115 +282,166 @@ fn relocateLaFiles(io: std.Io, dir_path: []const u8) !void {
 }
 
 fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
-    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
-    defer file.close(io);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return;
+    var file_open = true;
+    defer if (file_open) file.close(io);
 
-    // Read ELF header to detect format
-    var header: [16]u8 = undefined;
-    const n = file.readPositionalAll(io, &header, 0) catch return;
-    if (n < 16) return;
-    if (!std.mem.eql(u8, header[0..4], &ELF_MAGIC)) return;
+    const stat = file.stat(io) catch return;
+    if (stat.size < 16 or stat.size > 256 * 1024 * 1024) return;
+    const size: usize = @intCast(stat.size);
 
-    // Always attempt interpreter fixup — bottles may have hardcoded
-    // /home/linuxbrew/.linuxbrew/ paths without @@HOMEBREW markers
-    patchInterpreter(alloc, io, path);
+    const heap = std.heap.smp_allocator;
+    const buf = heap.alloc(u8, size) catch return;
+    defer heap.free(buf);
+    const read_n = file.readPositionalAll(io, buf, 0) catch return;
+    const data = buf[0..read_n];
+    if (data.len < 16 or !std.mem.eql(u8, data[0..4], &ELF_MAGIC)) return;
+
+    const has_placeholder = std.mem.indexOf(u8, data, "@@HOMEBREW") != null;
+    const has_linuxbrew = std.mem.indexOf(u8, data, LINUXBREW_LITERAL) != null;
+    if (!has_placeholder and !has_linuxbrew) return; // clean file: 1 read, 0 writes, 0 subprocesses
+
+    var changed = false;
 
     // Linuxbrew bottles routinely bake the literal Linuxbrew prefix into
     // .rodata for compile-time MAGICKCORE_CONFIGURE_PATH-style strings
     // (imagemagick), pkg-config metadata embedded in tools, perl @INC,
-    // python sys.path defaults, etc. patchelf only rewrites RPATH /
-    // DT_NEEDED / interpreter; it can't touch arbitrary string data, so
-    // we do a NUL-padded in-place rewrite of `/home/linuxbrew/.linuxbrew/`
-    // → `<PREFIX>/`. The replacement is strictly shorter (27→21 bytes
-    // for /opt/nanobrew/prefix/), so we keep the trailing portion of
-    // the original string and pad the gap with NULs. Every consumer is
-    // a NUL-terminated C string, so the effective strlen shrinks while
-    // every other byte offset in the binary stays put — load commands
-    // and addend tables are untouched. See issue #269.
-    rewriteLiteralLinuxbrewPaths(io, path) catch {};
+    // python sys.path defaults, etc. The replacement is strictly shorter,
+    // so we keep the trailing portion of the original string and pad the
+    // gap with NULs. Every consumer is a NUL-terminated C string, so the
+    // effective strlen shrinks while every other byte offset in the binary
+    // stays put — load commands and addend tables are untouched. See #269.
+    if (has_linuxbrew) {
+        rewriteAllInPlace(data, LINUXBREW_LITERAL, PREFIX_SLASH);
+        changed = true;
+    }
 
-    // Only do rpath/needed if placeholders are present (saves subprocess cost)
-    if (!elfContainsPlaceholder(io, file)) return;
-
-    patchelfRelocateRpathAndNeeded(alloc, io, path);
-}
-
-const LINUXBREW_LITERAL = "/home/linuxbrew/.linuxbrew/";
-const PREFIX_SLASH = paths.PREFIX ++ "/";
-
-/// Find every occurrence of the literal Linuxbrew prefix in an ELF file
-/// and overwrite it in place with `<PREFIX>/`, NUL-padding the trailing
-/// bytes so the surrounding offsets are preserved. Skips files that have
-/// no occurrences (single read, no write).
-fn rewriteLiteralLinuxbrewPaths(io: std.Io, path: []const u8) !void {
-    comptime {
-        if (PREFIX_SLASH.len > LINUXBREW_LITERAL.len) {
-            @compileError("rewriteLiteralLinuxbrewPaths: replacement must not be longer than source");
+    // Placeholder rewrites (rpath, DT_NEEDED, interpreter, .rodata) — all
+    // strictly shorter via the /opt/nb short prefix, so the same in-place
+    // strategy covers everything patchelf used to do for us, in one pass.
+    var needs_patchelf = false;
+    if (has_placeholder) {
+        rewriteAllInPlace(data, paths.PLACEHOLDER_REPOSITORY, paths.REAL_REPOSITORY);
+        changed = true;
+        if (ensureShortPrefixLink(io)) {
+            rewriteAllInPlace(data, paths.PLACEHOLDER_CELLAR, SHORT_CELLAR);
+            rewriteAllInPlace(data, paths.PLACEHOLDER_PREFIX, SHORT_PREFIX);
+            // @@HOMEBREW_LIBRARY@@ and friends may remain in .rodata; they
+            // are not linkage-relevant and were never patched before either.
+        } else {
+            // No short prefix available (e.g. non-root upgrade of an old
+            // install): PREFIX/CELLAR can't shrink in place — fall back to
+            // patchelf for rpath/needed/interp on this file.
+            needs_patchelf = true;
         }
     }
-    const pad = LINUXBREW_LITERAL.len - PREFIX_SLASH.len;
 
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return;
-    defer file.close(io);
+    // Repair PT_INTERP when the (rewritten) interpreter points into the
+    // nanobrew tree but doesn't exist (no glibc keg installed): swap in the
+    // system loader for the binary's actual architecture.
+    if (!needs_patchelf) {
+        if (fixInterpreterInPlace(io, data)) changed = true;
+    }
 
-    const stat = file.stat(io) catch return;
-    const size: usize = @intCast(stat.size);
-    if (size == 0 or size > 256 * 1024 * 1024) return;
+    if (changed) {
+        file.writePositionalAll(io, data, 0) catch return;
+    }
+    file.close(io);
+    file_open = false;
 
-    const alloc = std.heap.smp_allocator;
-    const buf = alloc.alloc(u8, size) catch return;
-    defer alloc.free(buf);
+    if (needs_patchelf) {
+        ensurePatchelf(alloc, io) catch {
+            ({
+                const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: {s}: patchelf unavailable and /opt/nb not creatable — run `sudo nb init` and reinstall\n", .{path}) catch "";
+                defer std.heap.smp_allocator.free(_tmp);
+                std.Io.File.stderr().writeStreamingAll(io, _tmp) catch {};
+            });
+            return;
+        };
+        patchInterpreter(alloc, io, path);
+        patchelfRelocateRpathAndNeeded(alloc, io, path);
+    }
+}
 
-    const read_n = file.readPositionalAll(io, buf, 0) catch return;
-    if (read_n == 0) return;
-    const data = buf[0..read_n];
-
-    // First pass: detect any hit so we skip the write on the common case.
-    if (std.mem.indexOf(u8, data, LINUXBREW_LITERAL) == null) return;
-
-    // Second pass: rewrite every occurrence in place. We don't try to
-    // identify "section starts" — strings can sit in .rodata, .data,
-    // .dynstr, .comment, etc. The C string that contains the prefix
-    // looks like  PREFIX/Cellar/imagemagick/.../etc/ImageMagick-7\0; we
-    // need to keep that whole string functional after replacement, not
-    // just the prefix. Strategy: locate the trailing NUL that ends the
-    // string, shift the tail (everything between the prefix's end and
-    // the NUL) leftward by `pad` bytes, write the new prefix at `hit`,
-    // and NUL-pad the freed-up tail bytes. This preserves every byte
-    // offset in the file (so other sections / addends are unaffected)
-    // and yields a correct C string of length `original_len - pad`.
+/// In-place replace every occurrence of `needle` with the no-longer
+/// `replacement`: the containing C string's tail shifts left to close the
+/// gap and the freed bytes are NUL-padded, so the file's byte offsets are
+/// all preserved. Rescans from just past each written replacement so a
+/// second occurrence inside the same C string (colon-separated rpath
+/// lists like `@@HOMEBREW_CELLAR@@/x/lib:@@HOMEBREW_PREFIX@@/lib`) is
+/// found after the tail shift moves it.
+fn rewriteAllInPlace(data: []u8, needle: []const u8, replacement: []const u8) void {
+    std.debug.assert(replacement.len <= needle.len);
+    const pad = needle.len - replacement.len;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, data, i, LINUXBREW_LITERAL)) |hit| {
-        const tail_start = hit + LINUXBREW_LITERAL.len;
-        const null_pos_rel = std.mem.indexOfScalarPos(u8, data, tail_start, 0) orelse data.len;
-        const tail_len = null_pos_rel - tail_start;
-        // Shift the path tail left by `pad` to close the size gap, then
-        // overwrite the prefix and NUL-pad the freed bytes at the end.
-        std.mem.copyForwards(u8, data[hit + PREFIX_SLASH.len ..][0..tail_len], data[tail_start..null_pos_rel]);
-        @memcpy(data[hit..][0..PREFIX_SLASH.len], PREFIX_SLASH);
-        @memset(data[hit + PREFIX_SLASH.len + tail_len ..][0..pad], 0);
-        i = hit + PREFIX_SLASH.len + tail_len;
+    while (std.mem.indexOfPos(u8, data, i, needle)) |hit| {
+        const tail_start = hit + needle.len;
+        const null_pos = std.mem.indexOfScalarPos(u8, data, tail_start, 0) orelse data.len;
+        const tail_len = null_pos - tail_start;
+        std.mem.copyForwards(u8, data[hit + replacement.len ..][0..tail_len], data[tail_start..null_pos]);
+        @memcpy(data[hit..][0..replacement.len], replacement);
+        @memset(data[hit + replacement.len + tail_len ..][0..pad], 0);
+        i = hit + replacement.len;
     }
-
-    file.writePositionalAll(io, data, 0) catch return;
 }
 
-fn elfContainsPlaceholder(io: std.Io, file: std.Io.File) bool {
-    var buf: [65536]u8 = undefined;
-    var overlap: usize = 0;
-    const needle = "@@HOMEBREW";
-    while (true) {
-        if (overlap > 0) {
-            const src = buf[buf.len - overlap ..];
-            std.mem.copyForwards(u8, buf[0..overlap], src);
-        }
-        const n = file.readStreaming(io, &.{buf[overlap..]}) catch return false;
-        if (n == 0) break;
-        const total = overlap + n;
-        if (std.mem.indexOf(u8, buf[0..total], needle) != null) return true;
-        overlap = @min(needle.len - 1, total);
+/// Find PT_INTERP in a 64-bit little-endian ELF and, when the interpreter
+/// points into the nanobrew tree but the file doesn't exist, overwrite it
+/// in place with the system loader for the binary's architecture. Returns
+/// true when the buffer was modified.
+fn fixInterpreterInPlace(io: std.Io, data: []u8) bool {
+    if (data.len < 64) return false;
+    if (data[4] != 2 or data[5] != 1) return false; // ELFCLASS64, little-endian only
+
+    const e_phoff = std.mem.readInt(u64, data[32..40], .little);
+    const e_phentsize = std.mem.readInt(u16, data[54..56], .little);
+    const e_phnum = std.mem.readInt(u16, data[56..58], .little);
+    if (e_phentsize < 56 or e_phnum == 0) return false;
+
+    var idx: usize = 0;
+    while (idx < e_phnum) : (idx += 1) {
+        const off_u64 = e_phoff + @as(u64, idx) * e_phentsize;
+        if (off_u64 + 56 > data.len) return false;
+        const off: usize = @intCast(off_u64);
+        const p_type = std.mem.readInt(u32, data[off..][0..4], .little);
+        if (p_type != 3) continue; // PT_INTERP
+
+        const p_offset = std.mem.readInt(u64, data[off + 8 ..][0..8], .little);
+        const p_filesz = std.mem.readInt(u64, data[off + 32 ..][0..8], .little);
+        if (p_filesz == 0 or p_filesz > 4096 or p_offset + p_filesz > data.len) return false;
+        const seg = data[@intCast(p_offset)..][0..@intCast(p_filesz)];
+        const interp_len = std.mem.indexOfScalar(u8, seg, 0) orelse return false;
+        const interp = seg[0..interp_len];
+
+        // Only repair interpreters that point into our tree; system loaders
+        // and unrewritten (still-placeholder'd) paths are left alone.
+        const ours = std.mem.startsWith(u8, interp, SHORT_PREFIX ++ "/") or
+            std.mem.startsWith(u8, interp, paths.ROOT ++ "/");
+        if (!ours) return false;
+
+        if (std.Io.Dir.accessAbsolute(io, interp, .{})) |_| {
+            return false; // exists (glibc keg installed) — keep it
+        } else |_| {}
+
+        const sys = systemInterpreterFor(data) orelse return false;
+        if (sys.len + 1 > seg.len) return false;
+        @memcpy(seg[0..sys.len], sys);
+        @memset(seg[sys.len..], 0);
+        return true;
     }
     return false;
+}
+
+/// System dynamic linker for the ELF buffer's e_machine.
+fn systemInterpreterFor(data: []const u8) ?[]const u8 {
+    if (data.len < 20) return null;
+    const e_machine = std.mem.readInt(u16, data[18..20], .little);
+    return switch (e_machine) {
+        0xB7 => "/lib/ld-linux-aarch64.so.1", // EM_AARCH64
+        0x3E => "/lib64/ld-linux-x86-64.so.2", // EM_X86_64
+        0x03 => "/lib/ld-linux.so.2", // EM_386
+        else => null,
+    };
 }
 
 fn patchelfRelocateRpathAndNeeded(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
@@ -396,12 +522,87 @@ fn detectInterpreter(io: std.Io, path: []const u8) ?[]const u8 {
     if (n < 20) return null;
     if (!std.mem.eql(u8, header[0..4], &ELF_MAGIC)) return null;
 
-    // e_machine is at offset 18, little-endian u16
-    const e_machine = std.mem.readInt(u16, header[18..20], .little);
-    return switch (e_machine) {
-        0xB7 => "/lib/ld-linux-aarch64.so.1", // EM_AARCH64
-        0x3E => "/lib64/ld-linux-x86-64.so.2", // EM_X86_64
-        0x03 => "/lib/ld-linux.so.2", // EM_386
-        else => null,
-    };
+    return systemInterpreterFor(&header);
+}
+
+const testing = std.testing;
+
+test "rewriteAllInPlace - single occurrence shrinks string and NUL-pads tail" {
+    var buf = "xx@@HOMEBREW_PREFIX@@/lib\x00yy".*;
+    rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    // "/opt/nb/lib" + NULs, trailing bytes after the original NUL untouched
+    try testing.expectEqualStrings("/opt/nb/lib", std.mem.sliceTo(buf[2..], 0));
+    try testing.expectEqual(@as(u8, 'y'), buf[buf.len - 2]);
+    try testing.expectEqual(@as(u8, 'y'), buf[buf.len - 1]);
+    // every byte between the shrunk string's NUL and the original NUL is NUL
+    const s = "/opt/nb/lib";
+    for (buf[2 + s.len .. buf.len - 2]) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "rewriteAllInPlace - two placeholders inside one colon-separated rpath string" {
+    var buf = "@@HOMEBREW_CELLAR@@/x265/4.0/lib:@@HOMEBREW_PREFIX@@/lib\x00tail".*;
+    rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
+    rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    try testing.expectEqualStrings("/opt/nb/Cellar/x265/4.0/lib:/opt/nb/lib", std.mem.sliceTo(&buf, 0));
+    // bytes after the original string's NUL are untouched
+    try testing.expectEqualStrings("tail", buf[buf.len - 4 ..]);
+}
+
+test "rewriteAllInPlace - equal-length replacement leaves length unchanged" {
+    var buf = "a/home/linuxbrew/.linuxbrew/lib\x00".*;
+    rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
+    try testing.expectEqualStrings("/opt/nanobrew/prefix/lib", std.mem.sliceTo(buf[1..], 0));
+}
+
+test "fixInterpreterInPlace - swaps missing /opt/nb interpreter for system loader" {
+    // Minimal synthetic ELF64-LE x86_64: ehdr (64B) + one PT_INTERP phdr
+    // (56B) + interp segment.
+    const interp = "/opt/nb/lib/ld.so";
+    const ehdr_size = 64;
+    const phdr_size = 56;
+    const interp_off = ehdr_size + phdr_size;
+    const interp_sz = interp.len + 8; // room for NUL + padding
+    var img = [_]u8{0} ** (ehdr_size + phdr_size + interp_sz);
+
+    @memcpy(img[0..4], &ELF_MAGIC);
+    img[4] = 2; // ELFCLASS64
+    img[5] = 1; // little-endian
+    std.mem.writeInt(u16, img[18..20], 0x3E, .little); // EM_X86_64
+    std.mem.writeInt(u64, img[32..40], ehdr_size, .little); // e_phoff
+    std.mem.writeInt(u16, img[54..56], phdr_size, .little); // e_phentsize
+    std.mem.writeInt(u16, img[56..58], 1, .little); // e_phnum
+
+    std.mem.writeInt(u32, img[ehdr_size..][0..4], 3, .little); // PT_INTERP
+    std.mem.writeInt(u64, img[ehdr_size + 8 ..][0..8], interp_off, .little); // p_offset
+    std.mem.writeInt(u64, img[ehdr_size + 32 ..][0..8], interp_sz, .little); // p_filesz
+    @memcpy(img[interp_off..][0..interp.len], interp);
+
+    try testing.expect(fixInterpreterInPlace(testing.io, &img));
+    try testing.expectEqualStrings("/lib64/ld-linux-x86-64.so.2", std.mem.sliceTo(img[interp_off..], 0));
+    // last byte of the segment stays NUL (kernel requires it)
+    try testing.expectEqual(@as(u8, 0), img[interp_off + interp_sz - 1]);
+}
+
+test "fixInterpreterInPlace - leaves existing system interpreter alone" {
+    const interp = "/usr/lib/ld-something.so.2";
+    const ehdr_size = 64;
+    const phdr_size = 56;
+    const interp_off = ehdr_size + phdr_size;
+    const interp_sz = interp.len + 1;
+    var img = [_]u8{0} ** (ehdr_size + phdr_size + interp_sz);
+
+    @memcpy(img[0..4], &ELF_MAGIC);
+    img[4] = 2;
+    img[5] = 1;
+    std.mem.writeInt(u16, img[18..20], 0x3E, .little);
+    std.mem.writeInt(u64, img[32..40], ehdr_size, .little);
+    std.mem.writeInt(u16, img[54..56], phdr_size, .little);
+    std.mem.writeInt(u16, img[56..58], 1, .little);
+    std.mem.writeInt(u32, img[ehdr_size..][0..4], 3, .little);
+    std.mem.writeInt(u64, img[ehdr_size + 8 ..][0..8], interp_off, .little);
+    std.mem.writeInt(u64, img[ehdr_size + 32 ..][0..8], interp_sz, .little);
+    @memcpy(img[interp_off..][0..interp.len], interp);
+
+    try testing.expect(!fixInterpreterInPlace(testing.io, &img));
+    try testing.expectEqualStrings(interp, std.mem.sliceTo(img[interp_off..], 0));
 }

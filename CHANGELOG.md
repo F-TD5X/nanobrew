@@ -4,6 +4,18 @@ All notable changes to nanobrew are documented here.
 
 ## Unreleased
 
+### Performance
+- **Linux cold installs ~5x faster on fresh machines (hexyl 5,876 ms → 1,110 ms; relocate phase 4,777 ms → 6 ms)** — ELF relocation is now native and in-place instead of shelling out to patchelf. A `/opt/nb → <prefix>` short symlink (created by `nb init` and lazily by the relocator) makes every `@@HOMEBREW_*@@` replacement strictly shorter than its placeholder, so RPATH/RUNPATH, DT_NEEDED, PT_INTERP, and `.rodata` strings are all rewritten in one read+write pass with NUL padding — no section resizing, no subprocesses, and no `apt-get install patchelf` bootstrap (which alone cost ~4.8 s on every fresh machine and made installs *fail* where no package manager was available). PT_INTERP repair (missing glibc keg → system loader) is also native. patchelf remains only as a fallback when `/opt/nb` can't be created (non-root upgrades of old installs), bootstrapped lazily on first need. Also fixes a latent bug where only the first of several placeholders inside one colon-separated rpath string was rewritten.
+- **Warm `nb install` ~80x faster (147 ms → 1.8 ms)** — resolving any package that isn't in the verified-upstream registry (the vast majority) re-downloaded the ~650 KB registry from GitHub on every resolve. Two fixes in `loadRecordWithOptions`: a fresh registry cache is now authoritative for misses too (no remote refetch inside the 6h TTL), and a fetched remote registry is cached even when the requested token isn't in it — previously the cache was only written on a token hit, so after TTL expiry every resolve of a non-registry token re-paid the remote fetch forever. Multi-dependency cold installs save one ~650 KB round trip per dep token.
+- **Cached-bottle reinstalls no longer pay a GHCR token round trip (macOS reinstall 534 ms → 4 ms)** — the batch-shared bearer token was fetched whenever any package had a ghcr.io bottle URL, even when every blob was already in the local cache; it's now fetched only when at least one bottle actually needs downloading.
+- `NB_BENCH=1` now reports per-phase timings (extract / materialize / relocate / placeholders+seal / snapshot / link / postinstall) for each package, not just download.
+
+### Fixed
+- **`@@HOMEBREW_PERL@@` shebangs are now relocated** — autoconf (and any formula whose scripts run under brewed perl) installed with a literal `#!@@HOMEBREW_PERL@@` interpreter line, which made the binary fail with "bad interpreter". The placeholder now maps to `<prefix>/opt/perl/bin/perl` in both text relocation passes. Known limitation surfaced while testing: on Macs with a real Homebrew install at `/opt/homebrew`, baked `.rodata` paths (e.g. perl's `@INC`) resolve into the real Homebrew because the compat symlink can't exist — fixing that needs the `/opt/nb` short-prefix rewrite on macOS plus re-codesigning, tracked as follow-up work.
+
+### Added
+- **`scripts/bottles/nb_bottles.py` + `manage.md` + `bottles.yml` workflow** — nanobrew's own GHCR bottle registry (`ghcr.io/justrach/nb-bottles/<name>`): Tier-1 digest-preserving mirror of the pinned `homebrew_bottle` registry entries (instant OCI cross-repo mounts), Tier-2 repackaging of `github_release` binaries into bottles, publish/verify/record management verbs, and a weekly CI mirror cron. Consumed via `NANOBREW_BOTTLE_DOMAIN` or per-package registry records; verified end-to-end (anonymous pulls, digest match with Homebrew's pins, real `nb install` from the mirror).
+
 ## [0.1.197] - 2026-06-12
 
 ### Performance

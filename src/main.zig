@@ -302,6 +302,27 @@ fn runInit() void {
         else => {},
     };
 
+    // Linux: create the /opt/nb -> PREFIX short-prefix symlink used by the
+    // native ELF relocator. Placeholder replacements must be strictly
+    // shorter than the placeholder tokens for in-place patching; /opt/nb
+    // (7 bytes) guarantees that where /opt/nanobrew/prefix (20 bytes) is
+    // one byte too long for @@HOMEBREW_PREFIX@@ (19 bytes).
+    if (comptime builtin.os.tag == .linux) {
+        std.Io.Dir.symLinkAbsolute(g_io, PREFIX, "/opt/nb", .{}) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                var nb_target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                if (std.Io.Dir.readLinkAbsolute(g_io, "/opt/nb", &nb_target_buf)) |target_n| {
+                    if (!std.mem.eql(u8, nb_target_buf[0..target_n], PREFIX)) {
+                        stdout.print("nb: note: /opt/nb points elsewhere — ELF relocation will fall back to patchelf\n", .{}) catch {};
+                    }
+                } else |_| {
+                    stdout.print("nb: note: /opt/nb exists and is not a symlink — ELF relocation will fall back to patchelf\n", .{}) catch {};
+                }
+            },
+            else => {},
+        };
+    }
+
     // If running as root (sudo), chown to the real user so nb install doesn't need sudo
     if (std.c.getenv("SUDO_USER")) |_sudo_cv| {
         const real_user = std.mem.sliceTo(_sudo_cv, 0);
@@ -860,9 +881,15 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         defer shared_client.deinit();
         const shared_ghcr_token: ?[]const u8 = blk: {
             for (install_order) |f_check| {
-                if (std.mem.startsWith(u8, f_check.bottleUrl(), "https://ghcr.io")) {
-                    break :blk nb.downloader.fetchGhcrToken(alloc, &shared_client, f_check.bottleUrl()) catch null;
-                }
+                if (!std.mem.startsWith(u8, f_check.bottleUrl(), "https://ghcr.io")) continue;
+                // Only pay the token round trip when some ghcr bottle will
+                // actually be downloaded — with every blob already cached
+                // (reinstalls, snapshot restores) the token is dead weight
+                // (~300-500ms once its 4-min disk cache expires).
+                var tok_blob_buf: [512]u8 = undefined;
+                const tok_blob_path = std.fmt.bufPrint(&tok_blob_buf, "/opt/nanobrew/cache/blobs/{s}", .{f_check.bottle_sha256}) catch break :blk null;
+                if (fileExists(tok_blob_path)) continue;
+                break :blk nb.downloader.fetchGhcrToken(alloc, &shared_client, f_check.bottleUrl()) catch null;
             }
             break :blk null;
         };
@@ -1238,6 +1265,8 @@ fn fullInstallOne(
     shared_ghcr_token: ?[]const u8,
 ) void {
     const stderr = StderrWriter{};
+    const bench: bool = std.c.getenv("NB_BENCH") != null;
+    var bench_t: i64 = 0;
 
     const is_source_build = f.bottle_url.len == 0 and f.source_url.len > 0;
 
@@ -1313,6 +1342,7 @@ fn fullInstallOne(
 
         // 2. Extract into store (skip if already there)
         phase.store(@intFromEnum(Phase.extracting), .release);
+        if (bench) bench_t = milliTimestamp();
         if (!nb.store.hasEntry(g_io, f.bottle_sha256)) {
             nb.store.ensureEntry(alloc, g_io, blob_path, f.bottle_sha256) catch |err| {
                 stderr.print("nb: {s}: extract failed: {}\n", .{ f.name, err }) catch {};
@@ -1322,6 +1352,7 @@ fn fullInstallOne(
                 return;
             };
         }
+        if (bench) std.debug.print("[nb-bench] {s} extract: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
 
         // 3. Materialize (clonefile into Cellar)
         phase.store(@intFromEnum(Phase.installing), .release);
@@ -1347,6 +1378,7 @@ fn fullInstallOne(
             phase.store(@intFromEnum(Phase.done), .release);
             return;
         }
+        if (bench) bench_t = milliTimestamp();
         nb.cellar.materialize(g_io, f.bottle_sha256, f.name, f.version) catch |err| {
             stderr.print("nb: {s}: materialize failed: {}\n", .{ f.name, err }) catch {};
             fail_reason.* = "materialize failed";
@@ -1354,12 +1386,14 @@ fn fullInstallOne(
             phase.store(@intFromEnum(Phase.failed), .release);
             return;
         };
+        if (bench) std.debug.print("[nb-bench] {s} materialize: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
     }
 
     // 4. Relocate (fix Homebrew placeholders in Mach-O binaries)
     phase.store(@intFromEnum(Phase.relocating), .release);
     var ver_buf: [256]u8 = undefined;
     const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf) orelse f.version;
+    if (bench) bench_t = milliTimestamp();
     platform.relocate.relocateKeg(alloc, g_io, f.name, actual_ver) catch |err| {
         stderr.print("nb: {s}: relocate failed: {}\n", .{ f.name, err }) catch {};
         fail_reason.* = "relocate failed";
@@ -1367,17 +1401,29 @@ fn fullInstallOne(
         phase.store(@intFromEnum(Phase.failed), .release);
         return;
     };
+    if (bench) {
+        std.debug.print("[nb-bench] {s} relocate: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
+        bench_t = milliTimestamp();
+    }
     // 4b. Replace @@HOMEBREW_*@@ placeholders in text files (shebangs, scripts, configs)
     platform.relocate.replaceKegPlaceholders(g_io, f.name, actual_ver);
     // 4c. Re-seal framework bundles AFTER every file mutation so the
     //     sealed-resource signature matches the final on-disk state.
     platform.relocate.sealKegBundles(alloc, g_io, f.name, actual_ver);
+    if (bench) {
+        std.debug.print("[nb-bench] {s} placeholders+seal: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
+        bench_t = milliTimestamp();
+    }
     // Save post-relocation snapshot so future reinstalls skip steps 4/4b/4c (~1500ms → ~10ms)
     const relocated_cache_key = if (is_source_build and f.install_binaries.len > 0 and nb.store.isValidSha256(f.source_sha256))
         f.source_sha256
     else
         f.bottle_sha256;
     nb.store.saveRelocatedEntry(g_io, relocated_cache_key, f.name, actual_ver) catch {};
+    if (bench) {
+        std.debug.print("[nb-bench] {s} snapshot: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
+        bench_t = milliTimestamp();
+    }
 
     // 5. Link binaries
     phase.store(@intFromEnum(Phase.linking), .release);
@@ -1388,11 +1434,16 @@ fn fullInstallOne(
         phase.store(@intFromEnum(Phase.failed), .release);
         return;
     };
+    if (bench) {
+        std.debug.print("[nb-bench] {s} link: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
+        bench_t = milliTimestamp();
+    }
 
     // 6. Post-install (non-fatal)
     nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
         stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
     };
+    if (bench) std.debug.print("[nb-bench] {s} postinstall: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
 
     phase.store(@intFromEnum(Phase.done), .release);
 }

@@ -270,19 +270,35 @@ pub fn loadRecordWithOptions(alloc: std.mem.Allocator, options: LoadOptions, tok
     var stale_record: ?Record = null;
     errdefer if (stale_record) |record| record.deinit(alloc);
 
+    // A fresh cache is authoritative for misses as well as hits: within the
+    // TTL a remote refetch returns the same snapshot we already have, so a
+    // token that isn't in the cached registry (most formulae) must not pay a
+    // ~650KB network round trip on every resolve — that made a warm
+    // single-package install ~150ms instead of ~2ms. The embedded-registry
+    // fallback below still runs on a miss, preserving the cache∪embedded
+    // union semantics.
+    var cache_fresh = false;
     if (readRegistryCache(alloc, options.cache_path, options.cache_ttl_ns)) |cached_json| {
         defer alloc.free(cached_json.data);
+        cache_fresh = cached_json.fresh;
         if (parseRecordFromRegistryJson(alloc, cached_json.data, token, kind)) |record| {
             if (cached_json.fresh) return record;
             stale_record = record;
         } else |_| {}
     }
 
-    if (options.allow_remote and options.remote_url.len > 0) {
+    if (!cache_fresh and options.allow_remote and options.remote_url.len > 0) {
         if (fetchRemoteRegistryJson(alloc, options.remote_url)) |remote_json| {
             defer alloc.free(remote_json);
-            if (parseRecordFromRegistryJson(alloc, remote_json, token, kind)) |record| {
+            // Refresh the cache whenever the payload is a valid registry,
+            // even when this token isn't in it. Caching only on a token hit
+            // left the cache permanently stale for non-registry tokens, which
+            // re-paid the remote fetch on every resolve after TTL expiry.
+            if (parseRegistry(alloc, remote_json)) |parsed_registry| {
+                parsed_registry.deinit(alloc);
                 writeRegistryCache(options.cache_path, remote_json);
+            } else |_| {}
+            if (parseRecordFromRegistryJson(alloc, remote_json, token, kind)) |record| {
                 if (stale_record) |old_record| old_record.deinit(alloc);
                 stale_record = null;
                 return record;
@@ -1082,6 +1098,38 @@ test "loadRegistryWithOptions falls back to embedded registry when cache is inva
 
     try testing.expect(registry.find("alt-tab", .cask) != null);
     try testing.expect(registry.find("cache-only", .cask) == null);
+}
+
+test "loadRecordWithOptions fresh-cache miss skips remote and still unions embedded registry" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Fresh cache that does NOT contain 'gh'. The remote URL points at a
+    // closed local port so an (incorrect) remote attempt can never succeed;
+    // with the fresh-cache-miss short-circuit it isn't attempted at all.
+    const json =
+        \\{ "schema_version": 1, "records": [] }
+    ;
+    const cache_path = try writeTempCacheFile(&tmp_dir, "upstream.json", json);
+    defer testing.allocator.free(cache_path);
+
+    // 'gh' is in the embedded default registry — a fresh-cache miss must
+    // still fall through to it.
+    const record = try loadRecordWithOptions(testing.allocator, .{
+        .cache_path = cache_path,
+        .allow_remote = true,
+        .remote_url = "http://127.0.0.1:1/upstream.json",
+    }, "gh", .formula);
+    defer record.deinit(testing.allocator);
+    try testing.expectEqualStrings("gh", record.token);
+
+    // A token in neither the fresh cache nor the embedded registry is a
+    // clean miss — no remote refetch within the TTL.
+    try testing.expectError(error.UpstreamRecordNotFound, loadRecordWithOptions(testing.allocator, .{
+        .cache_path = cache_path,
+        .allow_remote = true,
+        .remote_url = "http://127.0.0.1:1/upstream.json",
+    }, "definitely-not-a-real-token", .formula));
 }
 
 test "parseRegistry parses default registry file" {
