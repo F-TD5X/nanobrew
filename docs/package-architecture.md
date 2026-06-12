@@ -160,8 +160,9 @@ Linux included) against fresh grype data:
   without a binary release.
 - `unrevoke <name>` clears both fields once the pin moves to a patched
   version.
-- 🔲 follow-up: `nb doctor`/`nb outdated` flag *already-installed*
-  revoked versions.
+- `nb doctor` flags *already-installed* revoked versions — machines
+  that installed before the revocation get the advisory and the exact
+  remove/reinstall fix (which lands on the safe fallback).
 - Caveat: falling back only helps when the previous version isn't
   equally affected (e.g. toolchain CVEs like the Go stdlib usually hit
   neighboring releases too — there the remedy is a pin bump, not a
@@ -210,10 +211,16 @@ remains pulled-able by its digest, forever.**
 3. ✅ `revoked`/`fallback` registry fields + nb-side enforcement
    (fallback install with warning, fail-closed without fallback,
    freshness-override and formula-cache exemptions).
-4. 🔲 Upstream checksum/attestation verification in `repackage`; add
-   `upstream.attestation` to records.
-5. 🔲 `nb doctor`/`nb outdated` flag installed revoked versions.
-6. ✅ OCI referrer push for SBOMs + scan reports (`push-evidence`,
+4. ✅ `nb doctor` flags installed revoked versions with the fix command.
+5. ✅ OCI referrer push for SBOMs + scan reports (`push-evidence`,
    `scan --push-evidence`, weekly rescan pushes automatically).
-7. 🔲 osv-scanner + govulncheck as second/third scanners.
-8. 🔲 Tag-overwrite guard in `publish`.
+6. ✅ Tag-overwrite guard in `push_manifest` — version tags are
+   immutable; a different digest under an existing tag is refused.
+7. 🔲 Upstream checksum/attestation verification in `repackage`; add
+   `upstream.attestation` to records.
+8. 🔲 osv-scanner + govulncheck as second/third scanners.
+
+Propagation nuance (verified live): a *fresh* remote-registry cache
+shadows a newer embedded registry for up to the 6h TTL — revocations
+reach binaries via the published `registry/upstream.json`, so the
+commit landing on main is what starts the clock, not a release.

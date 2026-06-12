@@ -187,6 +187,29 @@ def push_blob(repo, data, token, mount_from=None, digest=None):
 
 
 def push_manifest(repo, tag, layer_digest, layer_size, platform, token, annotations=None):
+    # Version tags are immutable contracts. nb itself never trusts tags (it
+    # pulls by pinned digest), but the tag is what pins the blob against GC
+    # and what humans audit — re-tagging different bytes under an existing
+    # version corrupts both. A version bump is a NEW tag; same-digest
+    # re-pushes stay idempotent.
+    status, _, existing = http(
+        "GET",
+        f"{GHCR}/v2/{repo}/manifests/{tag}",
+        {"Authorization": f"Bearer {token}", "Accept": MT_MANIFEST},
+        ok=(200, 404),
+    )
+    if status == 200:
+        try:
+            old_layers = [l["digest"] for l in json.loads(existing).get("layers", [])]
+        except json.JSONDecodeError:
+            old_layers = []
+        if old_layers and layer_digest not in old_layers:
+            die(
+                f"refusing to overwrite tag '{tag}' on {repo}: it points at "
+                f"{old_layers[0][:19]}…, not {layer_digest[:19]}… — version "
+                f"tags are immutable; bump the version instead"
+            )
+
     os_name, arch = {
         "macos-arm64": ("darwin", "arm64"),
         "macos-x86_64": ("darwin", "amd64"),

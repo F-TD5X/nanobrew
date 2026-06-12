@@ -3254,6 +3254,30 @@ fn runDoctor(alloc: std.mem.Allocator) void {
                 }
             }
         } else |_| {}
+
+        // 5b. Installed versions whose registry pin has since been revoked
+        // (CVE'd): new installs already fall back, but machines that
+        // installed before the revocation only find out here.
+        if (nb.upstream_registry.loadRegistry(alloc)) |registry| {
+            defer registry.deinit(alloc);
+            for (kegs) |keg| {
+                const record = registry.find(keg.name, .formula) orelse continue;
+                const resolved = record.resolved orelse continue;
+                const revoked = resolved.revoked orelse continue;
+                if (!std.mem.startsWith(u8, keg.version, resolved.version)) continue;
+                const advisory = if (revoked.advisory.len > 0) revoked.advisory else "security advisory";
+                stdout.print("  ✗ {s} {s} is installed but its pin was revoked ({s})\n", .{ keg.name, keg.version, advisory }) catch {};
+                if (revoked.reason.len > 0) {
+                    stdout.print("      {s}\n", .{revoked.reason}) catch {};
+                }
+                if (resolved.fallback) |fallback| {
+                    stdout.print("      fix: nb remove {s} && nb install {s}  (installs safe version {s})\n", .{ keg.name, keg.name, fallback.version }) catch {};
+                } else {
+                    stdout.print("      fix: nb remove {s}  (no safe fallback recorded yet)\n", .{keg.name}) catch {};
+                }
+                issues += 1;
+            }
+        } else |_| {}
     }
 
     // 6. Platform-specific checks
