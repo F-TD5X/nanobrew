@@ -380,15 +380,19 @@ fn scopeToCacheName(repo: []const u8, buf: *[256]u8) ?[]const u8 {
     return buf[0..repo.len];
 }
 
-/// Returns true for errors that are worth retrying (transient network/server
-/// conditions or rate limits). Permanent failures (404, auth) and a full-body
-/// checksum mismatch are not retried — a mismatch means the bytes received were
-/// wrong/stale (a genuinely truncated transfer surfaces as a stream error, i.e.
-/// DownloadFailed), so retrying just wastes time.
+/// Returns true for errors worth retrying (transient network/server
+/// conditions, rate limits, or a failed GHCR token fetch — the token is
+/// re-fetched on the next attempt). Everything else is deterministic:
+/// permanent HTTP failures (404, auth-with-token), a full-body checksum
+/// mismatch (the bytes were wrong/stale, not truncated — truncation surfaces
+/// as a stream error, i.e. DownloadFailed), and local failures (OOM,
+/// PathTooLong, rename AccessDenied) that two more attempts plus 750ms of
+/// backoff can never fix. The explicit whitelist replaces an `else => true`
+/// that retried all of those (#314).
 fn isRetryable(err: anyerror) bool {
     return switch (err) {
-        error.BottleNotFound, error.AuthFailed, error.PathTooLong, error.ChecksumMismatch => false,
-        else => true,
+        error.DownloadFailed, error.RateLimited, error.TokenUnavailable => true,
+        else => false,
     };
 }
 
@@ -427,7 +431,12 @@ pub fn downloadOneWithClient(
     }
 
     var dest_path_buf: [512]u8 = undefined;
-    const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch return;
+    // The download itself succeeded by this point — a path-format failure may
+    // only cost us the size lookup, never the started telemetry event (#314).
+    const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch {
+        telemetry_event.succeed(0);
+        return;
+    };
     telemetry_event.succeed(telemetry.fileSize(dest_path));
 }
 
@@ -504,15 +513,25 @@ fn downloadAttempt(
         // permanent failure (404/auth) from a transient one (5xx/429). (#311)
         return switch (response.head.status) {
             .not_found, .gone => error.BottleNotFound,
-            .unauthorized, .forbidden => error.AuthFailed,
+            // A ghcr 401 with no token means the token *fetch* failed this
+            // attempt (it's swallowed to null inside fetchGhcrToken) — that's
+            // the transient case, and a retry re-fetches the token. With a
+            // token present the rejection is genuine and permanent. (#314)
+            .unauthorized, .forbidden => if (is_ghcr and token == null) error.TokenUnavailable else error.AuthFailed,
             .too_many_requests => error.RateLimited,
             else => error.DownloadFailed,
         };
     }
 
-    // Stream body to tmp file with SHA256 hashing in single pass
+    // Stream body to tmp file with SHA256 hashing in single pass. The tmp
+    // path carries a pid+tid suffix: two parallel workers fetching the same
+    // sha must not interleave writes into one shared file — that corrupted
+    // the blob and surfaced as a hard ChecksumMismatch now that mismatches
+    // aren't retried (#314). The rename below stays atomic; first one wins.
     var tmp_path_buf: [512]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}/{s}.dl", .{ TMP_DIR, req.expected_sha256 }) catch return error.PathTooLong;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}/{s}.{d}-{d}.dl", .{
+        TMP_DIR, req.expected_sha256, std.c.getpid(), std.Thread.getCurrentId(),
+    }) catch return error.PathTooLong;
 
     {
         const _lio_dl = paths.safe_io;
@@ -551,8 +570,10 @@ fn downloadAttempt(
         }
     }
 
-    // Atomic rename to final path
+    // Atomic rename to final path. On any failure delete the tmp file —
+    // per-worker tmp names mean nothing else will ever reuse or clean it.
     std.Io.Dir.renameAbsolute(tmp_path, dest_path, paths.safe_io) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(paths.safe_io, tmp_path) catch {};
         if (err == error.PathAlreadyExists) {
             if (bench) {
                 const sha = req.expected_sha256;
@@ -612,4 +633,20 @@ test "scopeToCacheName - repo too long returns null" {
     var buf: [256]u8 = undefined;
     const long = "a" ** 257;
     try testing.expectEqual(@as(?[]const u8, null), scopeToCacheName(long, &buf));
+}
+
+test "isRetryable whitelists transient failures only" {
+    // Transient: network/5xx, rate limits, and a failed token fetch
+    // (re-fetched on the next attempt).
+    try testing.expect(isRetryable(error.DownloadFailed));
+    try testing.expect(isRetryable(error.RateLimited));
+    try testing.expect(isRetryable(error.TokenUnavailable));
+    // Deterministic: permanent HTTP failures, checksum mismatch, and local
+    // errors that used to slip through the old `else => true`.
+    try testing.expect(!isRetryable(error.BottleNotFound));
+    try testing.expect(!isRetryable(error.AuthFailed));
+    try testing.expect(!isRetryable(error.ChecksumMismatch));
+    try testing.expect(!isRetryable(error.PathTooLong));
+    try testing.expect(!isRetryable(error.OutOfMemory));
+    try testing.expect(!isRetryable(error.AccessDenied));
 }

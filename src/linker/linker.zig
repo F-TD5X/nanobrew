@@ -566,7 +566,7 @@ pub fn linkKegWithOptions(name: []const u8, version: []const u8, options: LinkOp
     };
 }
 
-fn executableLinksNeedRepair(keg_subdir: []const u8, prefix_dest: []const u8, keg_dir: []const u8, mode: LinkMode) bool {
+fn executableLinksNeedRepair(keg_subdir: []const u8, prefix_dest: []const u8, keg_dir: []const u8, mode: LinkMode, env_shim: bool) bool {
     const lib_io = paths.safe_io;
     var dir = std.Io.Dir.openDirAbsolute(lib_io, keg_subdir, .{ .iterate = true }) catch return false;
     defer dir.close(lib_io);
@@ -580,7 +580,7 @@ fn executableLinksNeedRepair(keg_subdir: []const u8, prefix_dest: []const u8, ke
         const dest = std.fmt.bufPrint(&dest_buf, "{s}/{s}", .{ prefix_dest, entry.name }) catch continue;
 
         if (entry.kind == .directory) {
-            if (executableLinksNeedRepair(src, dest, keg_dir, mode)) return true;
+            if (executableLinksNeedRepair(src, dest, keg_dir, mode, env_shim)) return true;
             continue;
         }
 
@@ -588,7 +588,16 @@ fn executableLinksNeedRepair(keg_subdir: []const u8, prefix_dest: []const u8, ke
 
         switch (mode) {
             .global => {
-                if (!symlinkTargetEquals(dest, src)) return true;
+                if (env_shim) {
+                    // Env-shim kegs (git's GIT_EXEC_PATH, …) link through
+                    // .nb-wrappers/, not at the keg binary — that IS the
+                    // correct global end state. Comparing against the keg
+                    // binary made these kegs permanently "need repair" and
+                    // relinked on every install: pure churn (#314).
+                    var wrapper_path_buf: [1024]u8 = undefined;
+                    const wrapper_path = std.fmt.bufPrint(&wrapper_path_buf, "{s}/{s}/{s}", .{ keg_dir, WRAPPER_DIR, entry.name }) catch return true;
+                    if (!symlinkTargetEquals(dest, wrapper_path)) return true;
+                } else if (!symlinkTargetEquals(dest, src)) return true;
             },
             .shim_root => {
                 var wrapper_path_buf: [1024]u8 = undefined;
@@ -615,11 +624,25 @@ pub fn needsLinkRepair(name: []const u8, version: []const u8, options: LinkOptio
     const opt_link = std.fmt.bufPrint(&opt_buf, "{s}/{s}", .{ OPT_DIR, name }) catch return true;
     if (!symlinkTargetEquals(opt_link, keg_dir)) return true;
 
+    // Mirror linkKegWithOptions' env-shim detection so the repair check
+    // compares against the same link target the linker actually creates.
+    var env_shim = false;
+    if (options.mode == .global) {
+        var git_core_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&git_core_buf, "{s}/libexec/git-core", .{keg_dir})) |git_core_path| {
+            if (std.Io.Dir.openDirAbsolute(paths.safe_io, git_core_path, .{})) |d| {
+                var bd = d;
+                bd.close(paths.safe_io);
+                env_shim = true;
+            } else |_| {}
+        } else |_| {}
+    }
+
     for (subdir_mappings) |mapping| {
         if (!isExecutableSubdir(mapping.src)) continue;
         var sub_buf: [512]u8 = undefined;
         const keg_subdir = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ keg_dir, mapping.src }) catch continue;
-        if (executableLinksNeedRepair(keg_subdir, mapping.dest, keg_dir, options.mode)) return true;
+        if (executableLinksNeedRepair(keg_subdir, mapping.dest, keg_dir, options.mode, env_shim)) return true;
     }
 
     return false;
