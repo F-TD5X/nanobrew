@@ -11,6 +11,14 @@ All notable changes to nanobrew are documented here.
 - **`nb_bottles.py attest` verifies provenance of pinned upstream assets** — ranks each release asset by the strongest upstream vouching available (`github-attestation` via sigstore/gh CLI > `checksum-file` > `pin-only`), dies on any disagreement between our pin and upstream's published checksums, and `--require` gates CI on a minimum level.
 
 ### Performance
+
+| Operation | Before | After | Speedup |
+|---|---:|---:|---:|
+| ELF relocate phase (Linux) | 4,777 ms | 6 ms | **~800x** |
+| Cached-bottle reinstall (macOS) | 534 ms | 4 ms | **~130x** |
+| Warm `nb install` resolve | 147 ms | 1.8 ms | **~80x** |
+| Linux cold install, fresh machine (hexyl) | 5,876 ms | 1,110 ms | **~5x** |
+
 - **Linux cold installs ~5x faster on fresh machines (hexyl 5,876 ms → 1,110 ms; relocate phase 4,777 ms → 6 ms)** — ELF relocation is now native and in-place instead of shelling out to patchelf. A `/opt/nb → <prefix>` short symlink (created by `nb init` and lazily by the relocator) makes every `@@HOMEBREW_*@@` replacement strictly shorter than its placeholder, so RPATH/RUNPATH, DT_NEEDED, PT_INTERP, and `.rodata` strings are all rewritten in one read+write pass with '/' padding at the path boundary (valid for C-string and length-delimited consumers alike — perl bakes @INC entries with compile-time lengths, so NUL padding would corrupt them) — no section resizing, no subprocesses, and no `apt-get install patchelf` bootstrap (which alone cost ~4.8 s on every fresh machine and made installs *fail* where no package manager was available). PT_INTERP repair (missing glibc keg → system loader) is also native. patchelf remains only as a fallback when `/opt/nb` can't be created (non-root upgrades of old installs), bootstrapped lazily on first need. Also fixes a latent bug where only the first of several placeholders inside one colon-separated rpath string was rewritten.
 - **Warm `nb install` ~80x faster (147 ms → 1.8 ms)** — resolving any package that isn't in the verified-upstream registry (the vast majority) re-downloaded the ~650 KB registry from GitHub on every resolve. Two fixes in `loadRecordWithOptions`: a fresh registry cache is now authoritative for misses too (no remote refetch inside the 6h TTL), and a fetched remote registry is cached even when the requested token isn't in it — previously the cache was only written on a token hit, so after TTL expiry every resolve of a non-registry token re-paid the remote fetch forever. Multi-dependency cold installs save one ~650 KB round trip per dep token.
 - **Cached-bottle reinstalls no longer pay a GHCR token round trip (macOS reinstall 534 ms → 4 ms)** — the batch-shared bearer token was fetched whenever any package had a ghcr.io bottle URL, even when every blob was already in the local cache; it's now fetched only when at least one bottle actually needs downloading.
