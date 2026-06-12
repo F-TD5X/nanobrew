@@ -4,6 +4,8 @@ All notable changes to nanobrew are documented here.
 
 ## Unreleased
 
+## [0.1.197] - 2026-06-12
+
 ### Performance
 - **`nb outdated` ~1,170x faster (3,640 ms → 3.1 ms), `nb leaves` ~1,140x faster (4,690 ms → 4.1 ms), `nb search` ~30x faster (93 ms → 3.1 ms)** — a TSV index sidecar (`name`, `version`, `desc`, plus entry byte offsets) is built once per bulk-list cache refresh (1h TTL) and replaces both the per-installed-package API round trips (`outdated`/`upgrade` checks, `leaves`) and the 46 MB JSON re-scan per `search`. Packages outside the bulk lists (taps, upstream-only) still use the parallel per-name fetch fallback.
 - **Cold dependency resolution ~7x faster (1,077 ms → 150 ms for ffmpeg's graph)** — formula and cask metadata fetches slice the package's full API object out of the fresh bulk cache via one `pread` (using the sidecar's byte offsets) instead of a network round trip, then warm the per-name cache. `nb install` resolve, `nb info`, and the upstream freshness checks all ride this path; outputs verified byte-identical to network fetches.
@@ -18,6 +20,9 @@ All notable changes to nanobrew are documented here.
 - **Stale verified-upstream pins no longer downgrade installs** — the registry pin is cross-checked against the live Homebrew API and the newer version wins (falling back to the pin offline); `python3` resolves 3.14.5 instead of the embedded 3.14.4, `claude-code` resolves latest instead of 2.1.109. Opt out with `NANOBREW_DISABLE_UPSTREAM_FRESHNESS=1`. The registry itself is refreshable via `nb update` / `nb update-registry`. (#308, #310)
 - **`bin.install` parsing is strict** — `bin.install_symlink` is no longer mistaken for `bin.install`, and non-literal arguments (`#{version}` interpolation, `Dir[...]` globs, keg-rooted paths) drop the declared-binaries list so the source build keeps its generic whole-payload copy instead of failing.
 - **Interrupted cask installs are only re-adopted at the exact on-disk version** — adoption no longer records the API's current version for a payload installed at an older one, which froze `nb upgrade` on a stale app. (#302 follow-up)
+
+### CI
+- **`zig build test` now actually runs `search.zig`'s tests** — the root test aggregation was silently skipping them; they're included, and the search/bulk-index tests run in CI.
 
 ## [0.1.196] - 2026-06-02
 
