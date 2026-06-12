@@ -2,7 +2,13 @@
 
 All notable changes to nanobrew are documented here.
 
-## Unreleased
+## [0.1.198] - 2026-06-12
+
+### Security
+- **Bottle vulnerability scanning + CVE revocation with version fallback** — `nb_bottles.py scan` extracts each pinned bottle (all four platforms), SBOMs it with syft, matches with grype, and exits non-zero at/above `--gate` (default high); the first full run caught a real finding (gh 2.91.0 ships Go 1.26.2 stdlib HIGH CVEs). `revoke`/`unrevoke` mark a CVE'd pin revoked and record the previous known-good version as `resolved.fallback`. The `nb` resolver installs a revoked pin's fallback with a warning naming the advisory (revoked without fallback fails closed); the live-API freshness override is disabled for fallbacks so it can't silently undo the deliberate downgrade. Revocations propagate via the remote registry (6h TTL) — no binary release needed. `push-evidence` attaches SBOM + scan report to the bottle's GHCR manifest as OCI referrer artifacts, and `bottles.yml` rescans every pinned bottle weekly against fresh CVE data, auto-opening a security-labeled issue on a gate hit.
+- **`nb doctor` flags installed revoked versions** — kegs whose registry pin has since been revoked are reported with the advisory and the exact fix (remove + reinstall lands on the safe fallback), covering machines that installed before the revocation. Verified live against CVE-2026-33814 on gh 2.91.0.
+- **Immutable version tags on the bottle registry** — `push_manifest` refuses to re-tag a different blob under an existing version tag (same-digest re-pushes stay idempotent); version tags are what humans audit, so bumps are new tags.
+- **`nb_bottles.py attest` verifies provenance of pinned upstream assets** — ranks each release asset by the strongest upstream vouching available (`github-attestation` via sigstore/gh CLI > `checksum-file` > `pin-only`), dies on any disagreement between our pin and upstream's published checksums, and `--require` gates CI on a minimum level.
 
 ### Performance
 - **Linux cold installs ~5x faster on fresh machines (hexyl 5,876 ms → 1,110 ms; relocate phase 4,777 ms → 6 ms)** — ELF relocation is now native and in-place instead of shelling out to patchelf. A `/opt/nb → <prefix>` short symlink (created by `nb init` and lazily by the relocator) makes every `@@HOMEBREW_*@@` replacement strictly shorter than its placeholder, so RPATH/RUNPATH, DT_NEEDED, PT_INTERP, and `.rodata` strings are all rewritten in one read+write pass with '/' padding at the path boundary (valid for C-string and length-delimited consumers alike — perl bakes @INC entries with compile-time lengths, so NUL padding would corrupt them) — no section resizing, no subprocesses, and no `apt-get install patchelf` bootstrap (which alone cost ~4.8 s on every fresh machine and made installs *fail* where no package manager was available). PT_INTERP repair (missing glibc keg → system loader) is also native. patchelf remains only as a fallback when `/opt/nb` can't be created (non-root upgrades of old installs), bootstrapped lazily on first need. Also fixes a latent bug where only the first of several placeholders inside one colon-separated rpath string was rewritten.
@@ -19,6 +25,7 @@ All notable changes to nanobrew are documented here.
 
 ### Added
 - **`scripts/bottles/nb_bottles.py` + `manage.md` + `bottles.yml` workflow** — nanobrew's own GHCR bottle registry (`ghcr.io/justrach/nb-bottles/<name>`): Tier-1 digest-preserving mirror of the pinned `homebrew_bottle` registry entries (instant OCI cross-repo mounts), Tier-2 repackaging of `github_release` binaries into bottles, publish/verify/record management verbs, and a weekly CI mirror cron. Consumed via `NANOBREW_BOTTLE_DOMAIN` or per-package registry records; verified end-to-end (anonymous pulls, digest match with Homebrew's pins, real `nb install` from the mirror).
+- **37 new verified-upstream packages with pinned bottle digests for all four platforms** — bash, zsh, nginx, qemu, colima, postgresql@14/16/18, mysql, node@24, rustup, gradle, poetry, fastlane, tailscale, mkcert, sops, gitleaks, httpie, eza, btop, direnv, aria2, rsync, telnet, automake, expat, lcov, composer, ghostscript, hexyl, kubeconform, xclogparser, xcresultparser, flyctl, whisper-cpp, and summarize — mirrored into the embedded default registry.
 
 ## [0.1.197] - 2026-06-12
 
