@@ -11,6 +11,7 @@ const fetch = @import("../net/fetch.zig");
 
 const sandbox = @import("sandbox.zig");
 const formula_cache = @import("formula_cache.zig");
+const certs = @import("certs.zig");
 
 pub const ParsedCommand = struct {
     argv: []const []const u8,
@@ -23,6 +24,13 @@ pub const ParsedCommand = struct {
 
 pub fn runPostInstall(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !void {
     const lib_io = io;
+
+    // Native post-install steps first: things Homebrew does in Ruby that
+    // the heuristic script parser below can't execute (install_symlink,
+    // keychain extraction). Runs even when post_install_defined is false
+    // or the formula source can't be fetched — TLS trust wiring must not
+    // depend on a network round trip to raw.githubusercontent.com.
+    certs.nativePostInstall(lib_io, formula.name);
 
     // Execute post_install if defined
     if (formula.post_install_defined) {

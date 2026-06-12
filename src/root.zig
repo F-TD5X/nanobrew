@@ -34,6 +34,7 @@ pub const cask = @import("api/cask.zig");
 pub const cask_installer = @import("cask/install.zig");
 pub const source_builder = @import("build/source.zig");
 pub const postinstall = @import("build/postinstall.zig");
+pub const certs = @import("build/certs.zig");
 pub const search_api = @import("api/search.zig");
 pub const bulk_versions = @import("api/bulk_versions.zig");
 pub const tap = @import("api/tap.zig");
@@ -80,6 +81,7 @@ comptime {
     _ = telemetry;
     _ = tar;
     _ = native_tar;
+    _ = certs;
     _ = @import("platform/copy.zig");
     _ = @import("platform/placeholder.zig");
     _ = security_test;
