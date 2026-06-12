@@ -603,6 +603,115 @@ def cmd_record(args):
     print(json.dumps(out, indent=2))
 
 
+# ── security: attestation / provenance verification ─────────────────────────
+
+BULK_CHECKSUM_HINTS = ("checksums", "sha256sums", "shasums", "sha256sum.txt")
+
+
+def _release_assets_by_tag(repo, tag):
+    headers = {"Accept": "application/vnd.github+json"}
+    tok = pat()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    _, _, body = http(
+        "GET", f"https://api.github.com/repos/{repo}/releases/tags/{tag}", headers
+    )
+    return json.loads(body).get("assets", [])
+
+
+def _checksum_from_release(rel_assets, asset_name, expected_sha):
+    """Cross-check our pinned sha256 against the checksum file upstream
+    published alongside the release. Returns 'checksum-file' on a match,
+    None when no checksum asset covers this file; dies on a mismatch
+    (a mismatch means the pin and upstream's own statement disagree —
+    never ship that)."""
+    candidates = []
+    for a in rel_assets:
+        low = a["name"].lower()
+        if low in (f"{asset_name.lower()}.sha256", f"{asset_name.lower()}.sha256sum"):
+            candidates.append(a)  # per-file digest
+        elif any(h in low for h in BULK_CHECKSUM_HINTS) and not low.endswith((".sig", ".pem", ".asc")):
+            candidates.append(a)  # bulk digest list
+    for a in candidates:
+        _, _, body = http("GET", a["browser_download_url"])
+        for line in body.decode(errors="replace").splitlines():
+            parts = line.strip().split()
+            if not parts or len(parts[0]) != 64:
+                continue
+            listed = parts[1].lstrip("*").lstrip("./") if len(parts) > 1 else asset_name
+            if listed == asset_name or listed.endswith("/" + asset_name):
+                if parts[0].lower() != expected_sha.lower():
+                    die(
+                        f"CHECKSUM MISMATCH for {asset_name}: upstream "
+                        f"{a['name']} says {parts[0][:16]}…, our pin says "
+                        f"{expected_sha[:16]}… — refusing to continue"
+                    )
+                return "checksum-file"
+    return None
+
+
+def _gh_attestation_verify(path, repo):
+    """GitHub artifact attestation (sigstore provenance) via the gh CLI.
+    Returns True (verified), False (attestation exists but failed / none
+    found), or None (gh unavailable — can't say)."""
+    import shutil
+
+    if not shutil.which("gh"):
+        return None
+    r = subprocess.run(
+        ["gh", "attestation", "verify", str(path), "--repo", repo],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return True
+    # "no attestations found" is an expected miss, not a failure to scream about
+    return False
+
+
+def _verify_upstream_asset(repo, tag, asset_name, payload, expected_sha, rel_assets):
+    """Strongest provenance statement available for one release asset:
+    github-attestation > checksum-file > pin-only. The pinned sha256 is
+    always enforced by the caller; this adds upstream's own vouching."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix="-" + asset_name) as tf:
+        tf.write(payload)
+        tf.flush()
+        attested = _gh_attestation_verify(tf.name, repo)
+    if attested:
+        return "github-attestation"
+    if _checksum_from_release(rel_assets, asset_name, expected_sha):
+        return "checksum-file"
+    return "pin-only"
+
+
+def cmd_attest(args):
+    """Verify provenance of every pinned upstream asset for a package."""
+    rec = find_record(args.name)
+    if rec["upstream"]["type"] != "github_release":
+        die(f"'{args.name}' is {rec['upstream']['type']} — attest covers github_release records")
+    resolved = rec.get("resolved") or die(f"'{args.name}' has no resolved assets")
+    repo = rec["upstream"]["repo"]
+    tag = resolved.get("tag") or "v" + resolved["version"]
+    rel_assets = _release_assets_by_tag(repo, tag)
+    worst, methods = "github-attestation", {}
+    rank = {"github-attestation": 2, "checksum-file": 1, "pin-only": 0}
+    for platform, asset in sorted(resolved["assets"].items()):
+        name = asset["url"].rsplit("/", 1)[-1]
+        _, _, payload = http("GET", asset["url"])
+        got = hashlib.sha256(payload).hexdigest()
+        if got != asset["sha256"]:
+            die(f"pin mismatch downloading {name}: {got}")
+        method = _verify_upstream_asset(repo, tag, name, payload, asset["sha256"], rel_assets)
+        methods[platform] = method
+        if rank[method] < rank[worst]:
+            worst = method
+        log(f"  {args.name} {resolved['version']} {platform}: {method}")
+    log(f"\nweakest link: {worst}")
+    if args.require and rank[worst] < rank[args.require]:
+        die(f"verification below --require {args.require}")
+
+
 # ── security: scan + revoke ──────────────────────────────────────────────────
 
 SEVERITIES = ("negligible", "low", "medium", "high", "critical")
@@ -1105,6 +1214,12 @@ def main():
     ur = sub.add_parser("unrevoke", help="clear a revocation (after the pin is bumped)")
     ur.add_argument("name")
     ur.set_defaults(fn=cmd_unrevoke)
+
+    at = sub.add_parser("attest", help="verify provenance of pinned upstream assets")
+    at.add_argument("name")
+    at.add_argument("--require", choices=("checksum-file", "github-attestation"),
+                    help="exit non-zero unless every asset meets this level")
+    at.set_defaults(fn=cmd_attest)
 
     pe = sub.add_parser("push-evidence",
                         help="attach dist/scan/ SBOM + report to the bottle on GHCR (OCI referrers)")
