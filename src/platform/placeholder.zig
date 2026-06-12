@@ -44,6 +44,11 @@ pub fn replacePlaceholders(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
         {
             try result.appendSlice(alloc, paths.REAL_LIBRARY);
             i += paths.PLACEHOLDER_LIBRARY.len;
+        } else if (i + paths.PLACEHOLDER_PERL.len <= input.len and
+            std.mem.eql(u8, input[i..][0..paths.PLACEHOLDER_PERL.len], paths.PLACEHOLDER_PERL))
+        {
+            try result.appendSlice(alloc, paths.REAL_PERL);
+            i += paths.PLACEHOLDER_PERL.len;
         } else {
             try result.append(alloc, input[i]);
             i += 1;
@@ -197,6 +202,13 @@ pub fn relocateTextFile(io: std.Io, path: []const u8) bool {
             @memcpy(result[out_len..][0..paths.REAL_LIBRARY.len], paths.REAL_LIBRARY);
             out_len += paths.REAL_LIBRARY.len;
             i += paths.PLACEHOLDER_LIBRARY.len;
+        } else if (i + paths.PLACEHOLDER_PERL.len <= n and
+            std.mem.eql(u8, content[i..][0..paths.PLACEHOLDER_PERL.len], paths.PLACEHOLDER_PERL))
+        {
+            if (out_len + paths.REAL_PERL.len > result_cap) return false;
+            @memcpy(result[out_len..][0..paths.REAL_PERL.len], paths.REAL_PERL);
+            out_len += paths.REAL_PERL.len;
+            i += paths.PLACEHOLDER_PERL.len;
         } else if (i + HOMEBREW_USRLOCAL_CELLAR.len <= n and
             std.mem.eql(u8, content[i..][0..HOMEBREW_USRLOCAL_CELLAR.len], HOMEBREW_USRLOCAL_CELLAR))
         {

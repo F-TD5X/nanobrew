@@ -9,3 +9,6 @@ tweet*.md
 registry/upstream-release-db.json
 .wrangler/
 nb-linux-fresh
+dist/
+__pycache__/
+.bench-bin/

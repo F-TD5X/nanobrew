@@ -143,11 +143,23 @@ pub const SecurityWarning = struct {
     }
 };
 
+pub const Revoked = struct {
+    advisory: []const u8,
+    reason: []const u8,
+
+    pub fn deinit(self: Revoked, alloc: std.mem.Allocator) void {
+        alloc.free(self.advisory);
+        alloc.free(self.reason);
+    }
+};
+
 pub const Resolved = struct {
     tag: []const u8,
     version: []const u8,
     assets: []const ResolvedAsset,
     security_warnings: []const SecurityWarning,
+    revoked: ?Revoked = null,
+    fallback: ?*Resolved = null,
 
     pub fn deinit(self: Resolved, alloc: std.mem.Allocator) void {
         alloc.free(self.tag);
@@ -156,12 +168,27 @@ pub const Resolved = struct {
         alloc.free(self.assets);
         for (self.security_warnings) |warning| warning.deinit(alloc);
         alloc.free(self.security_warnings);
+        if (self.revoked) |revoked| revoked.deinit(alloc);
+        if (self.fallback) |fallback| {
+            fallback.deinit(alloc);
+            alloc.destroy(fallback);
+        }
     }
 
     pub fn findAsset(self: *const Resolved, platform: Platform) ?*const ResolvedAsset {
         for (self.assets, 0..) |asset, i| {
             if (asset.platform == platform) return &self.assets[i];
         }
+        return null;
+    }
+
+    /// The pin that should actually be installed: a revoked pin defers to its
+    /// fallback (the previous known-good version) when one is recorded.
+    /// Returns null when the pin is revoked with no fallback — installing it
+    /// would knowingly ship an advisory-affected version.
+    pub fn effective(self: *const Resolved) ?*const Resolved {
+        if (self.revoked == null) return self;
+        if (self.fallback) |fallback| return fallback.effective();
         return null;
     }
 };
@@ -270,19 +297,35 @@ pub fn loadRecordWithOptions(alloc: std.mem.Allocator, options: LoadOptions, tok
     var stale_record: ?Record = null;
     errdefer if (stale_record) |record| record.deinit(alloc);
 
+    // A fresh cache is authoritative for misses as well as hits: within the
+    // TTL a remote refetch returns the same snapshot we already have, so a
+    // token that isn't in the cached registry (most formulae) must not pay a
+    // ~650KB network round trip on every resolve — that made a warm
+    // single-package install ~150ms instead of ~2ms. The embedded-registry
+    // fallback below still runs on a miss, preserving the cache∪embedded
+    // union semantics.
+    var cache_fresh = false;
     if (readRegistryCache(alloc, options.cache_path, options.cache_ttl_ns)) |cached_json| {
         defer alloc.free(cached_json.data);
+        cache_fresh = cached_json.fresh;
         if (parseRecordFromRegistryJson(alloc, cached_json.data, token, kind)) |record| {
             if (cached_json.fresh) return record;
             stale_record = record;
         } else |_| {}
     }
 
-    if (options.allow_remote and options.remote_url.len > 0) {
+    if (!cache_fresh and options.allow_remote and options.remote_url.len > 0) {
         if (fetchRemoteRegistryJson(alloc, options.remote_url)) |remote_json| {
             defer alloc.free(remote_json);
-            if (parseRecordFromRegistryJson(alloc, remote_json, token, kind)) |record| {
+            // Refresh the cache whenever the payload is a valid registry,
+            // even when this token isn't in it. Caching only on a token hit
+            // left the cache permanently stale for non-registry tokens, which
+            // re-paid the remote fetch on every resolve after TTL expiry.
+            if (parseRegistry(alloc, remote_json)) |parsed_registry| {
+                parsed_registry.deinit(alloc);
                 writeRegistryCache(options.cache_path, remote_json);
+            } else |_| {}
+            if (parseRecordFromRegistryJson(alloc, remote_json, token, kind)) |record| {
                 if (stale_record) |old_record| old_record.deinit(alloc);
                 stale_record = null;
                 return record;
@@ -823,11 +866,39 @@ fn parseResolved(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !Resolved {
     const security_warnings = try parseSecurityWarnings(alloc, obj);
     errdefer freeSecurityWarnings(alloc, security_warnings);
 
+    var revoked: ?Revoked = null;
+    errdefer if (revoked) |r| r.deinit(alloc);
+    if (obj.get("revoked")) |revoked_val| {
+        if (revoked_val != .object) return error.InvalidField;
+        const advisory = try dupOptionalString(alloc, revoked_val.object, "advisory");
+        errdefer alloc.free(advisory);
+        const reason = try dupOptionalString(alloc, revoked_val.object, "reason");
+        errdefer alloc.free(reason);
+        if (advisory.len == 0 and reason.len == 0) return error.InvalidField;
+        revoked = .{ .advisory = advisory, .reason = reason };
+    }
+
+    var fallback: ?*Resolved = null;
+    errdefer if (fallback) |f| {
+        f.deinit(alloc);
+        alloc.destroy(f);
+    };
+    if (obj.get("fallback")) |fallback_val| {
+        if (fallback_val != .object) return error.InvalidField;
+        const inner = try parseResolved(alloc, fallback_val.object);
+        errdefer inner.deinit(alloc);
+        const boxed = try alloc.create(Resolved);
+        boxed.* = inner;
+        fallback = boxed;
+    }
+
     return .{
         .tag = tag,
         .version = version,
         .assets = try assets.toOwnedSlice(alloc),
         .security_warnings = security_warnings,
+        .revoked = revoked,
+        .fallback = fallback,
     };
 }
 
@@ -1082,6 +1153,38 @@ test "loadRegistryWithOptions falls back to embedded registry when cache is inva
 
     try testing.expect(registry.find("alt-tab", .cask) != null);
     try testing.expect(registry.find("cache-only", .cask) == null);
+}
+
+test "loadRecordWithOptions fresh-cache miss skips remote and still unions embedded registry" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Fresh cache that does NOT contain 'gh'. The remote URL points at a
+    // closed local port so an (incorrect) remote attempt can never succeed;
+    // with the fresh-cache-miss short-circuit it isn't attempted at all.
+    const json =
+        \\{ "schema_version": 1, "records": [] }
+    ;
+    const cache_path = try writeTempCacheFile(&tmp_dir, "upstream.json", json);
+    defer testing.allocator.free(cache_path);
+
+    // 'gh' is in the embedded default registry — a fresh-cache miss must
+    // still fall through to it.
+    const record = try loadRecordWithOptions(testing.allocator, .{
+        .cache_path = cache_path,
+        .allow_remote = true,
+        .remote_url = "http://127.0.0.1:1/upstream.json",
+    }, "gh", .formula);
+    defer record.deinit(testing.allocator);
+    try testing.expectEqualStrings("gh", record.token);
+
+    // A token in neither the fresh cache nor the embedded registry is a
+    // clean miss — no remote refetch within the TTL.
+    try testing.expectError(error.UpstreamRecordNotFound, loadRecordWithOptions(testing.allocator, .{
+        .cache_path = cache_path,
+        .allow_remote = true,
+        .remote_url = "http://127.0.0.1:1/upstream.json",
+    }, "definitely-not-a-real-token", .formula));
 }
 
 test "parseRegistry parses default registry file" {
@@ -1400,6 +1503,63 @@ test "parseRegistry parses resolved security warnings" {
     try testing.expectEqualStrings("high", warning.severity);
     try testing.expectEqualStrings("< 1.2.4", warning.affected_versions);
     try testing.expectEqualStrings(">= 1.2.4", warning.patched_versions);
+}
+
+test "parseRegistry parses revoked pin with fallback" {
+    const json =
+        \\{
+        \\  "schema_version": 1,
+        \\  "records": [{
+        \\    "token": "cvetool",
+        \\    "name": "cvetool",
+        \\    "kind": "formula",
+        \\    "upstream": {
+        \\      "type": "homebrew_bottle",
+        \\      "verified": true
+        \\    },
+        \\    "resolved": {
+        \\      "version": "2.0.0",
+        \\      "assets": {
+        \\        "linux-x86_64": {
+        \\          "url": "https://ghcr.io/v2/justrach/nb-bottles/cvetool/blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\        }
+        \\      },
+        \\      "revoked": {
+        \\        "advisory": "CVE-2026-9999",
+        \\        "reason": "RCE in archive handling"
+        \\      },
+        \\      "fallback": {
+        \\        "version": "1.9.0",
+        \\        "assets": {
+        \\          "linux-x86_64": {
+        \\            "url": "https://ghcr.io/v2/justrach/nb-bottles/cvetool/blobs/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        \\          }
+        \\        }
+        \\      }
+        \\    },
+        \\    "verification": {
+        \\      "sha256": "required"
+        \\    }
+        \\  }]
+        \\}
+    ;
+    const registry = try parseRegistry(testing.allocator, json);
+    defer registry.deinit(testing.allocator);
+
+    const resolved = &registry.find("cvetool", .formula).?.resolved.?;
+    try testing.expectEqualStrings("CVE-2026-9999", resolved.revoked.?.advisory);
+    try testing.expectEqualStrings("RCE in archive handling", resolved.revoked.?.reason);
+    try testing.expectEqualStrings("1.9.0", resolved.fallback.?.version);
+
+    const safe = resolved.effective().?;
+    try testing.expectEqualStrings("1.9.0", safe.version);
+
+    // A revoked pin without a fallback must not resolve to anything.
+    var no_fallback = resolved.*;
+    no_fallback.fallback = null;
+    try testing.expect(no_fallback.effective() == null);
 }
 
 test "parseRegistry rejects unverified upstreams" {

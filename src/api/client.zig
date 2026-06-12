@@ -233,7 +233,9 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
             // Homebrew's live API. Prefer the live bottle when it's strictly
             // newer so installs aren't stuck on a stale pin (#308). Best-effort:
             // tap refs have no core API and any live-fetch failure keeps the pin.
-            if (!tap_ref and upstreamFreshnessEnabled()) {
+            // Exception: a revoked pin's fallback is a deliberate downgrade —
+            // the registry is authoritative and freshness must not undo it.
+            if (!tap_ref and !upstream_formula.revoked_fallback and upstreamFreshnessEnabled()) {
                 if (fetchFormulaLive(alloc, client, name) catch null) |live| {
                     if (version_cmp.isNewer(live.version, upstream_formula.version)) {
                         upstream_formula.deinit(alloc);
@@ -351,8 +353,9 @@ pub fn fetchCask(alloc: std.mem.Allocator, token: []const u8) !Cask {
         if (upstream_github.fetchCask(alloc, token)) |upstream_cask| {
             // Prefer the live Homebrew cask when it's strictly newer than the
             // pinned verified-upstream version (#310). Best-effort — tap refs and
-            // any live-fetch failure keep the verified pin.
-            if (!tap_ref and upstreamFreshnessEnabled()) {
+            // any live-fetch failure keep the verified pin. A revoked pin's
+            // fallback is a deliberate downgrade — freshness must not undo it.
+            if (!tap_ref and !upstream_cask.revoked_fallback and upstreamFreshnessEnabled()) {
                 if (fetchCaskLive(alloc, token) catch null) |live| {
                     if (version_cmp.isNewer(live.version, upstream_cask.version)) {
                         upstream_cask.deinit(alloc);

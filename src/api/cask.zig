@@ -71,6 +71,10 @@ pub const Cask = struct {
     min_macos: ?[]const u8,
     metadata_source: MetadataSource = .homebrew,
     security_warnings: []const SecurityWarning = &.{},
+    /// True when this metadata came from a revoked registry pin's fallback
+    /// (previous known-good version). The registry is authoritative here:
+    /// live-API freshness checks must not override a security revocation.
+    revoked_fallback: bool = false,
     /// Download method from the cask's `url_specs.using` (e.g. "post"). null = GET.
     download_using: ?[]const u8 = null,
     /// Form fields from `url_specs.data`, sent as the POST body (#305).

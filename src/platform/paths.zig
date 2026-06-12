@@ -53,3 +53,7 @@ pub const REAL_CELLAR = PREFIX ++ "/Cellar";
 pub const REAL_REPOSITORY = ROOT;
 pub const PLACEHOLDER_LIBRARY = "@@HOMEBREW_LIBRARY@@";
 pub const REAL_LIBRARY = ROOT ++ "/Library";
+// Shebang placeholder for formulae whose scripts run under brewed perl
+// (autoconf, automake, …). Homebrew pours it as <prefix>/opt/perl/bin/perl.
+pub const PLACEHOLDER_PERL = "@@HOMEBREW_PERL@@";
+pub const REAL_PERL = PREFIX ++ "/opt/perl/bin/perl";
