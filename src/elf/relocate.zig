@@ -306,11 +306,10 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     // Linuxbrew bottles routinely bake the literal Linuxbrew prefix into
     // .rodata for compile-time MAGICKCORE_CONFIGURE_PATH-style strings
     // (imagemagick), pkg-config metadata embedded in tools, perl @INC,
-    // python sys.path defaults, etc. The replacement is strictly shorter,
-    // so we keep the trailing portion of the original string and pad the
-    // gap with NULs. Every consumer is a NUL-terminated C string, so the
-    // effective strlen shrinks while every other byte offset in the binary
-    // stays put — load commands and addend tables are untouched. See #269.
+    // python sys.path defaults, etc. The replacement is never longer, and
+    // the freed bytes become '/' padding at the path boundary — valid for
+    // C-string and length-delimited consumers alike, with every byte
+    // offset in the binary untouched. See #269 and rewriteAllInPlace.
     if (has_linuxbrew) {
         rewriteAllInPlace(data, LINUXBREW_LITERAL, PREFIX_SLASH);
         changed = true;
@@ -364,24 +363,24 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
 }
 
 /// In-place replace every occurrence of `needle` with the no-longer
-/// `replacement`: the containing C string's tail shifts left to close the
-/// gap and the freed bytes are NUL-padded, so the file's byte offsets are
-/// all preserved. Rescans from just past each written replacement so a
-/// second occurrence inside the same C string (colon-separated rpath
-/// lists like `@@HOMEBREW_CELLAR@@/x/lib:@@HOMEBREW_PREFIX@@/lib`) is
-/// found after the tail shift moves it.
+/// `replacement`, padding the freed bytes with '/' at the path-component
+/// boundary: `@@HOMEBREW_PREFIX@@/lib` → `/opt/nb////////////` + `/lib`.
+/// POSIX resolves any run of slashes as one, so the rewritten bytes are a
+/// valid path for C-string consumers (ld.so, dlopen, execve) AND for
+/// length-delimited ones — perl bakes its @INC entries with compile-time
+/// `sizeof` lengths, so an earlier NUL-padding strategy left embedded NULs
+/// *inside* @INC paths and broke module resolution ("Can't locate
+/// strict.pm"). No tail shift and no length change: every byte offset in
+/// the file stays put, and later occurrences inside the same C string
+/// (colon-separated rpath lists) keep their original offsets.
 fn rewriteAllInPlace(data: []u8, needle: []const u8, replacement: []const u8) void {
     std.debug.assert(replacement.len <= needle.len);
     const pad = needle.len - replacement.len;
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, data, i, needle)) |hit| {
-        const tail_start = hit + needle.len;
-        const null_pos = std.mem.indexOfScalarPos(u8, data, tail_start, 0) orelse data.len;
-        const tail_len = null_pos - tail_start;
-        std.mem.copyForwards(u8, data[hit + replacement.len ..][0..tail_len], data[tail_start..null_pos]);
         @memcpy(data[hit..][0..replacement.len], replacement);
-        @memset(data[hit + replacement.len + tail_len ..][0..pad], 0);
-        i = hit + replacement.len;
+        @memset(data[hit + replacement.len ..][0..pad], '/');
+        i = hit + needle.len;
     }
 }
 
@@ -527,31 +526,43 @@ fn detectInterpreter(io: std.Io, path: []const u8) ?[]const u8 {
 
 const testing = std.testing;
 
-test "rewriteAllInPlace - single occurrence shrinks string and NUL-pads tail" {
+test "rewriteAllInPlace - single occurrence pads with slashes, offsets and length preserved" {
     var buf = "xx@@HOMEBREW_PREFIX@@/lib\x00yy".*;
     rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
-    // "/opt/nb/lib" + NULs, trailing bytes after the original NUL untouched
-    try testing.expectEqualStrings("/opt/nb/lib", std.mem.sliceTo(buf[2..], 0));
+    // Replacement + '/'-padding + untouched tail: same strlen as the original,
+    // NUL in its original position, trailing bytes untouched.
+    const expected = "/opt/nb" ++ "/" ** 12 ++ "/lib";
+    try testing.expectEqualStrings(expected, std.mem.sliceTo(buf[2..], 0));
+    try testing.expectEqual(@as(u8, 0), buf[2 + expected.len]);
     try testing.expectEqual(@as(u8, 'y'), buf[buf.len - 2]);
     try testing.expectEqual(@as(u8, 'y'), buf[buf.len - 1]);
-    // every byte between the shrunk string's NUL and the original NUL is NUL
-    const s = "/opt/nb/lib";
-    for (buf[2 + s.len .. buf.len - 2]) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
 test "rewriteAllInPlace - two placeholders inside one colon-separated rpath string" {
     var buf = "@@HOMEBREW_CELLAR@@/x265/4.0/lib:@@HOMEBREW_PREFIX@@/lib\x00tail".*;
     rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
     rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
-    try testing.expectEqualStrings("/opt/nb/Cellar/x265/4.0/lib:/opt/nb/lib", std.mem.sliceTo(&buf, 0));
+    const expected = "/opt/nb/Cellar" ++ "/" ** 5 ++ "/x265/4.0/lib:/opt/nb" ++ "/" ** 12 ++ "/lib";
+    try testing.expectEqualStrings(expected, std.mem.sliceTo(&buf, 0));
     // bytes after the original string's NUL are untouched
     try testing.expectEqualStrings("tail", buf[buf.len - 4 ..]);
 }
 
-test "rewriteAllInPlace - equal-length replacement leaves length unchanged" {
+test "rewriteAllInPlace - linuxbrew literal pads at the path boundary" {
     var buf = "a/home/linuxbrew/.linuxbrew/lib\x00".*;
     rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
-    try testing.expectEqualStrings("/opt/nanobrew/prefix/lib", std.mem.sliceTo(buf[1..], 0));
+    try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ "/" ** 7 ++ "lib", std.mem.sliceTo(buf[1..], 0));
+}
+
+test "rewriteAllInPlace - no NULs inside the rewritten string (perl @INC regression)" {
+    // perl reads its compiled-in @INC entries with compile-time sizeof
+    // lengths, not strlen — embedded NULs inside the original string extent
+    // broke module resolution ("Can't locate strict.pm in @INC").
+    var buf = "/home/linuxbrew/.linuxbrew/lib/perl5/site_perl/5.42.2\x00".*;
+    rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
+    const extent = buf[0 .. buf.len - 1]; // original string, original length
+    try testing.expect(std.mem.indexOfScalar(u8, extent, 0) == null);
+    try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ "/" ** 7 ++ "lib/perl5/site_perl/5.42.2", extent);
 }
 
 test "fixInterpreterInPlace - swaps missing /opt/nb interpreter for system loader" {
