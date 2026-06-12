@@ -1,0 +1,160 @@
+name: bottles
+
+# Publishes nanobrew's bottle registry at ghcr.io/<owner>/nb-bottles/<name>.
+# CRITICAL: all publishing must happen HERE, not from a laptop — packages
+# created by GITHUB_TOKEN inside a workflow are linked to this public repo
+# and inherit its visibility (public from birth). Locally-pushed packages
+# land private and visibility can only be flipped in the browser, one by
+# one. See manage.md for the operating guide.
+#
+# Triggers:
+#   push to bottles-ci  — full bootstrap: mirror every pinned bottle,
+#                         pin+mirror extras, repackage Tier-2 binaries
+#   weekly cron         — incremental mirror (new pins only; idempotent)
+#   workflow_dispatch   — manual mirror/repackage once this lands on main
+
+on:
+  push:
+    branches: [bottles-ci]
+  schedule:
+    - cron: "23 4 * * 1" # Mondays 04:23 UTC, after Homebrew's weekend churn
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "mirror | repackage | scan"
+        required: true
+        default: "mirror"
+        type: choice
+        options: [mirror, repackage, scan]
+      packages:
+        description: "comma-separated names (mirror --only / repackage targets); empty = all pinned bottles (mirror only)"
+        required: false
+        default: ""
+      dry_run:
+        description: "dry run (mirror only)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  bootstrap:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_USER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: mirror every pinned homebrew bottle
+        # Partial failures must not skip the pin/repackage steps; the mirror
+        # is idempotent and the weekly cron (or a re-push) converges the rest.
+        run: python3 scripts/bottles/nb_bottles.py mirror || echo "::warning::mirror finished with failures — re-run to converge"
+      - name: pin + mirror extras (not yet in the embedded registry)
+        run: python3 scripts/bottles/nb_bottles.py pin hexyl --mirror
+      - name: repackage every eligible Tier-2 upstream binary
+        run: |
+          for p in $(python3 scripts/bottles/nb_bottles.py tier2); do
+            python3 scripts/bottles/nb_bottles.py repackage "$p" || echo "::warning::repackage $p failed, continuing"
+          done
+      - name: visibility report
+        run: |
+          echo "Packages created this run should be PUBLIC (inherited from repo)."
+          echo "Spot-check: https://github.com/${{ github.repository_owner }}?tab=packages"
+
+  scheduled:
+    if: ${{ github.event_name != 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_USER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: mirror
+        if: ${{ github.event_name == 'schedule' || inputs.command == 'mirror' }}
+        run: |
+          ARGS=""
+          [ -n "${{ inputs.packages }}" ] && ARGS="--only ${{ inputs.packages }}"
+          [ "${{ inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          python3 scripts/bottles/nb_bottles.py mirror $ARGS
+
+      - name: repackage
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.command == 'repackage' }}
+        run: |
+          IFS=',' read -ra PKGS <<< "${{ inputs.packages }}"
+          for p in "${PKGS[@]}"; do
+            python3 scripts/bottles/nb_bottles.py repackage "$p"
+          done
+
+      - name: scan freshly repackaged bottles
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.command == 'repackage' }}
+        run: |
+          curl -sSfL https://get.anchore.io/syft | sh -s -- -b /usr/local/bin
+          curl -sSfL https://get.anchore.io/grype | sh -s -- -b /usr/local/bin
+          IFS=',' read -ra PKGS <<< "${{ inputs.packages }}"
+          python3 scripts/bottles/nb_bottles.py scan --push-evidence "${PKGS[@]}"
+
+      - name: upload repackaged tarballs as artifact
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.command == 'repackage' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottles
+          path: dist/*.tar.gz
+          if-no-files-found: ignore
+
+  # Bottles clean on publish day don't stay clean: re-match every pinned
+  # bottle (all four platforms, Linux included) against fresh vulnerability
+  # data weekly and on demand. A gate hit fails the job and opens an issue
+  # naming the affected pins — the fix is `revoke` (falls installs back to
+  # the previous good version) or a pin bump.
+  rescan:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.command == 'scan') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+      packages: write # evidence push (SBOM + report referrers)
+    env:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_USER: ${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install syft + grype
+        run: |
+          curl -sSfL https://get.anchore.io/syft | sh -s -- -b /usr/local/bin
+          curl -sSfL https://get.anchore.io/grype | sh -s -- -b /usr/local/bin
+
+      - name: scan all pinned bottles
+        id: scan
+        shell: bash # explicit => -o pipefail, so the tee can't mask a gate failure
+        run: |
+          ARGS="--all"
+          [ -n "${{ inputs.packages }}" ] && ARGS="$(echo '${{ inputs.packages }}' | tr ',' ' ')"
+          python3 scripts/bottles/nb_bottles.py scan $ARGS --gate high --push-evidence 2>&1 | tee scan.log
+
+      - name: upload SBOMs + reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-reports
+          path: dist/scan/
+          if-no-files-found: ignore
+
+      - name: open issue on gate failure
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="bottle scan: severity gate failed ($(date -u +%F))"
+          BODY="$(sed -n '/GATE FAILED/,$p' scan.log | head -60)"
+          gh issue create --title "$TITLE" --label security \
+            --body "$(printf 'Weekly bottle rescan found findings at/above the gate.\n\n```\n%s\n```\n\nFix: bump the pin, or `python3 scripts/bottles/nb_bottles.py revoke <name> --advisory <id> --reason ...` to fall installs back to the previous good version.' "$BODY")" \
+            || echo "::warning::could not create issue (already open?)"

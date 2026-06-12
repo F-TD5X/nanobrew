@@ -22,6 +22,10 @@ pub const Formula = struct {
     install_binaries: []const []const u8 = &.{},
     caveats: []const u8 = "",
     post_install_defined: bool = false,
+    /// True when this metadata came from a revoked registry pin's fallback
+    /// (previous known-good version). The registry is authoritative here:
+    /// live-API freshness checks must not override a security revocation.
+    revoked_fallback: bool = false,
 
     /// Effective version string including rebuild suffix for bottle paths.
     /// e.g. "3.1.0" or "3.1.0_1" if rebuild > 0

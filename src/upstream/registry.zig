@@ -143,11 +143,23 @@ pub const SecurityWarning = struct {
     }
 };
 
+pub const Revoked = struct {
+    advisory: []const u8,
+    reason: []const u8,
+
+    pub fn deinit(self: Revoked, alloc: std.mem.Allocator) void {
+        alloc.free(self.advisory);
+        alloc.free(self.reason);
+    }
+};
+
 pub const Resolved = struct {
     tag: []const u8,
     version: []const u8,
     assets: []const ResolvedAsset,
     security_warnings: []const SecurityWarning,
+    revoked: ?Revoked = null,
+    fallback: ?*Resolved = null,
 
     pub fn deinit(self: Resolved, alloc: std.mem.Allocator) void {
         alloc.free(self.tag);
@@ -156,12 +168,27 @@ pub const Resolved = struct {
         alloc.free(self.assets);
         for (self.security_warnings) |warning| warning.deinit(alloc);
         alloc.free(self.security_warnings);
+        if (self.revoked) |revoked| revoked.deinit(alloc);
+        if (self.fallback) |fallback| {
+            fallback.deinit(alloc);
+            alloc.destroy(fallback);
+        }
     }
 
     pub fn findAsset(self: *const Resolved, platform: Platform) ?*const ResolvedAsset {
         for (self.assets, 0..) |asset, i| {
             if (asset.platform == platform) return &self.assets[i];
         }
+        return null;
+    }
+
+    /// The pin that should actually be installed: a revoked pin defers to its
+    /// fallback (the previous known-good version) when one is recorded.
+    /// Returns null when the pin is revoked with no fallback — installing it
+    /// would knowingly ship an advisory-affected version.
+    pub fn effective(self: *const Resolved) ?*const Resolved {
+        if (self.revoked == null) return self;
+        if (self.fallback) |fallback| return fallback.effective();
         return null;
     }
 };
@@ -839,11 +866,39 @@ fn parseResolved(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !Resolved {
     const security_warnings = try parseSecurityWarnings(alloc, obj);
     errdefer freeSecurityWarnings(alloc, security_warnings);
 
+    var revoked: ?Revoked = null;
+    errdefer if (revoked) |r| r.deinit(alloc);
+    if (obj.get("revoked")) |revoked_val| {
+        if (revoked_val != .object) return error.InvalidField;
+        const advisory = try dupOptionalString(alloc, revoked_val.object, "advisory");
+        errdefer alloc.free(advisory);
+        const reason = try dupOptionalString(alloc, revoked_val.object, "reason");
+        errdefer alloc.free(reason);
+        if (advisory.len == 0 and reason.len == 0) return error.InvalidField;
+        revoked = .{ .advisory = advisory, .reason = reason };
+    }
+
+    var fallback: ?*Resolved = null;
+    errdefer if (fallback) |f| {
+        f.deinit(alloc);
+        alloc.destroy(f);
+    };
+    if (obj.get("fallback")) |fallback_val| {
+        if (fallback_val != .object) return error.InvalidField;
+        const inner = try parseResolved(alloc, fallback_val.object);
+        errdefer inner.deinit(alloc);
+        const boxed = try alloc.create(Resolved);
+        boxed.* = inner;
+        fallback = boxed;
+    }
+
     return .{
         .tag = tag,
         .version = version,
         .assets = try assets.toOwnedSlice(alloc),
         .security_warnings = security_warnings,
+        .revoked = revoked,
+        .fallback = fallback,
     };
 }
 
@@ -1448,6 +1503,63 @@ test "parseRegistry parses resolved security warnings" {
     try testing.expectEqualStrings("high", warning.severity);
     try testing.expectEqualStrings("< 1.2.4", warning.affected_versions);
     try testing.expectEqualStrings(">= 1.2.4", warning.patched_versions);
+}
+
+test "parseRegistry parses revoked pin with fallback" {
+    const json =
+        \\{
+        \\  "schema_version": 1,
+        \\  "records": [{
+        \\    "token": "cvetool",
+        \\    "name": "cvetool",
+        \\    "kind": "formula",
+        \\    "upstream": {
+        \\      "type": "homebrew_bottle",
+        \\      "verified": true
+        \\    },
+        \\    "resolved": {
+        \\      "version": "2.0.0",
+        \\      "assets": {
+        \\        "linux-x86_64": {
+        \\          "url": "https://ghcr.io/v2/justrach/nb-bottles/cvetool/blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        \\          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        \\        }
+        \\      },
+        \\      "revoked": {
+        \\        "advisory": "CVE-2026-9999",
+        \\        "reason": "RCE in archive handling"
+        \\      },
+        \\      "fallback": {
+        \\        "version": "1.9.0",
+        \\        "assets": {
+        \\          "linux-x86_64": {
+        \\            "url": "https://ghcr.io/v2/justrach/nb-bottles/cvetool/blobs/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        \\            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        \\          }
+        \\        }
+        \\      }
+        \\    },
+        \\    "verification": {
+        \\      "sha256": "required"
+        \\    }
+        \\  }]
+        \\}
+    ;
+    const registry = try parseRegistry(testing.allocator, json);
+    defer registry.deinit(testing.allocator);
+
+    const resolved = &registry.find("cvetool", .formula).?.resolved.?;
+    try testing.expectEqualStrings("CVE-2026-9999", resolved.revoked.?.advisory);
+    try testing.expectEqualStrings("RCE in archive handling", resolved.revoked.?.reason);
+    try testing.expectEqualStrings("1.9.0", resolved.fallback.?.version);
+
+    const safe = resolved.effective().?;
+    try testing.expectEqualStrings("1.9.0", safe.version);
+
+    // A revoked pin without a fallback must not resolve to anything.
+    var no_fallback = resolved.*;
+    no_fallback.fallback = null;
+    try testing.expect(no_fallback.effective() == null);
 }
 
 test "parseRegistry rejects unverified upstreams" {
