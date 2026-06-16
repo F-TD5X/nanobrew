@@ -2,6 +2,11 @@
 
 All notable changes to nanobrew are documented here.
 
+## Unreleased
+
+### Added
+- **`nb doctor --probe [pkg]` — post-install "does it actually work?" probe (#317)** — runs each installed keg's binaries (`--version`, then `version`, then `--help`, with a 2s hard timeout) and reports any that fail to load and run, plus DB entries with no backing Cellar (phantom kegs). Catches the #324 class where a bottle is placed but its interpreter or shared libraries are missing, so the binary exists yet can't execute (a missing interpreter/library surfaces as exit 126/127, death by signal, or a timeout; a working tool that merely requires args and exits 22/64 on `--version` is not flagged). Exits non-zero when any probed package fails. First local-only slice of the trust-tiers design (`docs/design/trust-tiers.md`); `nb list --versions` / `nb switch` shipped earlier in #316.
+
 ## [0.1.198] - 2026-06-12
 
 ### Security

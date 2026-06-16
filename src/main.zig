@@ -154,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
         .update => runUpdate(alloc),
         .update_registry => runUpdateRegistry(alloc),
         .help => printUsage(),
-        .doctor => runDoctor(alloc),
+        .doctor => runDoctor(alloc, args[2..]),
         .cleanup => runCleanup(alloc, args[2..]),
         .outdated => runOutdated(alloc),
         .pin => runPin(alloc, args[2..], true),
@@ -3092,7 +3092,7 @@ fn printUsage() void {
         \\  upgrade --deb            Upgrade all installed .deb packages
         \\  update                   Self-update nanobrew (also refreshes the upstream registry)
         \\  update-registry          Refresh only the verified-upstream version registry
-        \\  doctor                   Check installation health
+        \\  doctor [--probe [pkg]]   Check installation health (--probe: verify installed binaries run)
         \\  cleanup [--dry-run]      Remove stale caches and orphaned files
         \\  outdated                 List packages with newer versions available
         \\  pin <package>            Pin a package (skip during upgrade)
@@ -3143,7 +3143,142 @@ fn printUsage() void {
 
 // ── nb doctor ──
 
-fn runDoctor(alloc: std.mem.Allocator) void {
+// ── Post-install probe (#317) ───────────────────────────────────────────────
+// "Does it actually work?" — run each of a keg's binaries and assert it loads
+// and executes. This catches the #324-class failure where a bottle is placed
+// but its interpreter or shared libraries are missing, so the binary exists yet
+// can't run. Cheap and uniform; no per-package scripting.
+
+/// Run `<bin> <flag>` with stdio discarded and a 2s hard timeout. Returns the
+/// exit code, or null on spawn failure / timeout / death by signal.
+fn probeRunFlag(alloc: std.mem.Allocator, bin_path: []const u8, flag: []const u8) ?u8 {
+    const result = std.process.run(alloc, g_io, .{
+        .argv = &.{ bin_path, flag },
+        // Hard timeout: std.process.run kills the child and errors if it hasn't
+        // exited, so a binary that hangs on `--version` can't wedge the probe.
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(2), .clock = .awake } },
+    }) catch return null;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code,
+        else => null,
+    };
+}
+
+/// "Loads and runs": run the binary with `--version`, then `version`, then
+/// `--help` (cheap ways to make it execute and exit quickly). The probe asserts
+/// the binary *executes*, not its CLI semantics — so any clean exit counts as a
+/// pass, EXCEPT the exec/loader-failure codes 126/127 (e.g. a missing perl
+/// interpreter or `libcrypt.so.2`, the #324 class), death by signal, a spawn
+/// failure, or a timeout (all surface as null / a load-failure code). This
+/// avoids false-flagging working tools that require args and exit with a usage
+/// code like 22/64 on `--version`.
+fn probeBinaryRuns(alloc: std.mem.Allocator, bin_path: []const u8) bool {
+    const flags = [_][]const u8{ "--version", "version", "--help" };
+    for (flags) |flag| {
+        if (probeRunFlag(alloc, bin_path, flag)) |code| {
+            if (code != 126 and code != 127) return true;
+        }
+    }
+    return false;
+}
+
+/// Probe one installed keg: its Cellar dir exists and every binary in the keg's
+/// `bin/` runs. Returns true on pass; prints a one-line verdict.
+fn probeKeg(alloc: std.mem.Allocator, stdout: StdoutWriter, name: []const u8, version: []const u8) bool {
+    if (!kegHasBackingCellar(name, version)) {
+        stdout.print("  ✗ {s} {s}: no Cellar directory (phantom DB entry)\n", .{ name, version }) catch {};
+        return false;
+    }
+    var bin_buf: [768]u8 = undefined;
+    const bin_dir = std.fmt.bufPrint(&bin_buf, "{s}/Cellar/{s}/{s}/bin", .{ PREFIX, name, version }) catch return false;
+    var dir = std.Io.Dir.openDirAbsolute(g_io, bin_dir, .{ .iterate = true }) catch {
+        // No bin/ — a library-only keg. DB + Cellar present, nothing to run.
+        stdout.print("  ✓ {s} {s}: installed (no binaries)\n", .{ name, version }) catch {};
+        return true;
+    };
+    defer dir.close(g_io);
+    var iter = dir.iterate();
+    var checked: usize = 0;
+    var bad_buf: [256]u8 = undefined;
+    var bad: ?[]const u8 = null;
+    while (iter.next(g_io) catch null) |entry| {
+        if (entry.kind == .directory) continue;
+        var path_buf: [1024]u8 = undefined;
+        const bin_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ bin_dir, entry.name }) catch continue;
+        checked += 1;
+        if (!probeBinaryRuns(alloc, bin_path)) {
+            bad = std.fmt.bufPrint(&bad_buf, "{s}", .{entry.name}) catch entry.name;
+            break;
+        }
+    }
+    if (bad) |b| {
+        stdout.print("  ✗ {s} {s}: '{s}' did not run (missing interpreter or libraries?)\n", .{ name, version, b }) catch {};
+        return false;
+    }
+    stdout.print("  ✓ {s} {s}: {d} binar{s} run\n", .{ name, version, checked, if (checked == 1) @as([]const u8, "y") else "ies" }) catch {};
+    return true;
+}
+
+/// `nb doctor --probe [pkg]` — run the post-install probe over every installed
+/// keg (or just `pkg`). A later phase runs this automatically on install (#317);
+/// for now it's an on-demand "is it actually working?" diagnostic.
+fn runProbe(alloc: std.mem.Allocator, only: ?[]const u8) void {
+    const stdout = StdoutWriter{};
+    const stderr = StderrWriter{};
+    stdout.print("==> Probing installed packages (does each binary run?)...\n", .{}) catch {};
+
+    var db = nb.database.Database.open(alloc) catch {
+        stderr.print("nb: could not open database\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer db.close();
+
+    const kegs = db.listInstalled(alloc) catch &.{};
+    defer if (kegs.len > 0) alloc.free(kegs);
+
+    var probed: usize = 0;
+    var failed: usize = 0;
+    for (kegs) |keg| {
+        if (only) |o| {
+            if (!std.mem.eql(u8, keg.name, o)) continue;
+        }
+        probed += 1;
+        if (!probeKeg(alloc, stdout, keg.name, keg.version)) failed += 1;
+    }
+
+    if (only != null and probed == 0) {
+        stderr.print("nb: '{s}' is not installed\n", .{only.?}) catch {};
+        std.process.exit(1);
+    }
+    if (failed > 0) {
+        stdout.print("==> Probe: {d}/{d} package(s) failed\n", .{ failed, probed }) catch {};
+        std.process.exit(1);
+    } else {
+        stdout.print("==> Probe: all {d} package(s) OK\n", .{probed}) catch {};
+    }
+}
+
+fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
+    // `nb doctor --probe [pkg]` runs the post-install probe instead of the
+    // installation checks (#317).
+    {
+        var do_probe = false;
+        var probe_pkg: ?[]const u8 = null;
+        for (args) |arg| {
+            if (std.mem.eql(u8, arg, "--probe")) {
+                do_probe = true;
+            } else if (!std.mem.startsWith(u8, arg, "-")) {
+                probe_pkg = arg;
+            }
+        }
+        if (do_probe or probe_pkg != null) {
+            runProbe(alloc, probe_pkg);
+            return;
+        }
+    }
+
     const stdout = StdoutWriter{};
     var issues: usize = 0;
 
