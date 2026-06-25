@@ -628,6 +628,20 @@ fn parseCaskJsonArch(alloc: std.mem.Allocator, json_data: []const u8, prefer_int
                             }
                         }
                     }
+                } else if (obj.get("font")) |font_val| {
+                    // Homebrew shape: {"font": ["ttf/Name.ttf"], "target": "..."}.
+                    // The value is an array of source paths inside the archive; the
+                    // install step derives the ~/Library/Fonts destination from each
+                    // basename, so only the source path is stored. Without this branch
+                    // font casks parse to an empty artifacts slice and install as a
+                    // silent no-op (#331).
+                    if (font_val == .array) {
+                        for (font_val.array.items) |f| {
+                            if (f == .string) {
+                                try artifacts.append(alloc, .{ .font = try rewriteVersion(alloc, f.string, root_version, version) });
+                            }
+                        }
+                    }
                 } else if (obj.get("uninstall")) |uninst_val| {
                     if (uninst_val == .array) {
                         for (uninst_val.array.items) |u| {

@@ -49,10 +49,13 @@ fn splitUserAgent(
 fn requestOptions(
     ua: ?[]const u8,
     rest: []const std.http.Header,
+    redirect_limit: u8,
 ) std.http.Client.RequestOptions {
     return .{
-        // Reduced from 5; HTTPS-to-HTTP downgrade not yet detectable in std.http
-        .redirect_behavior = @enumFromInt(3),
+        // Reduced from 5; HTTPS-to-HTTP downgrade not yet detectable in std.http.
+        // POST callers pass 0 and handle 301/302/303 themselves so std.http's
+        // POST→GET conversion cannot leak the synthetic Content-Type header.
+        .redirect_behavior = @enumFromInt(redirect_limit),
         .extra_headers = rest,
         .headers = if (ua) |v|
             .{ .user_agent = .{ .override = v } }
@@ -87,7 +90,7 @@ pub fn getWithClientHeaders(alloc: std.mem.Allocator, client: *std.http.Client, 
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
     const split = splitUserAgent(alloc, extra_headers);
     defer if (split.rest.ptr != extra_headers.ptr and split.rest.len > 0) alloc.free(split.rest);
-    var req = client.request(.GET, uri, requestOptions(split.ua, split.rest)) catch return error.FetchFailed;
+    var req = client.request(.GET, uri, requestOptions(split.ua, split.rest, 3)) catch return error.FetchFailed;
 
     req.sendBodiless() catch {
         req.deinit();
@@ -178,7 +181,8 @@ fn downloadCore(
     } else split.rest;
 
     const method: std.http.Method = if (body != null) .POST else .GET;
-    var req = client.request(method, uri, requestOptions(split.ua, effective_rest)) catch return error.FetchFailed;
+    const redirect_limit: u8 = if (body != null) 0 else 3;
+    var req = client.request(method, uri, requestOptions(split.ua, effective_rest, redirect_limit)) catch return error.FetchFailed;
 
     if (body) |b| {
         req.sendBodyComplete(b) catch {
@@ -198,6 +202,26 @@ fn downloadCore(
         return error.FetchFailed;
     };
     if (response.head.status != .ok) {
+        if (body != null) switch (response.head.status) {
+            .moved_permanently, .found, .see_other => {
+                const location = response.head.location orelse {
+                    req.deinit();
+                    return error.FetchFailed;
+                };
+                const redirect_url = client.allocator.dupe(u8, location) catch {
+                    req.deinit();
+                    return error.OutOfMemory;
+                };
+                req.deinit();
+                defer client.allocator.free(redirect_url);
+                return downloadCore(client, redirect_url, dest_path, expected_sha256, extra_headers, null);
+            },
+            .temporary_redirect, .permanent_redirect => {
+                req.deinit();
+                return error.PostRedirectUnsupported;
+            },
+            else => {},
+        };
         req.deinit();
         return error.FetchFailed;
     }
@@ -343,12 +367,12 @@ test "splitUserAgent: passes through when no UA present" {
 }
 
 test "requestOptions: omits user_agent override when UA absent" {
-    const opts = requestOptions(null, &.{});
+    const opts = requestOptions(null, &.{}, 3);
     try std.testing.expectEqual(std.http.Client.Request.Headers.Value.default, opts.headers.user_agent);
 }
 
 test "requestOptions: sets user_agent override when UA present" {
-    const opts = requestOptions("Homebrew/4 (nanobrew)", &.{});
+    const opts = requestOptions("Homebrew/4 (nanobrew)", &.{}, 3);
     switch (opts.headers.user_agent) {
         .override => |v| try std.testing.expectEqualStrings("Homebrew/4 (nanobrew)", v),
         else => try std.testing.expect(false),

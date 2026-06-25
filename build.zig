@@ -19,6 +19,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Linux: src/main.zig and the extract/tar paths reach extern "c"
+            // symbols (read, symlink, fchmod, getenv, clock_gettime), so a
+            // native Linux `zig build` needs libc linked explicitly — same as
+            // the test and linux cross-compile modules below. macOS always
+            // links libSystem, so null keeps the default there.
+            .link_libc = if (target.result.os.tag == .linux) true else null,
             .imports = &.{
                 .{ .name = "nanobrew", .module = nb_mod },
             },

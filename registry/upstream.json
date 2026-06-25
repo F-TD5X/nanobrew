@@ -254,24 +254,24 @@
         }
       ],
       "resolved": {
-        "tag": "v2.91.0",
-        "version": "2.91.0",
+        "tag": "v2.93.0",
+        "version": "2.93.0",
         "assets": {
           "macos-arm64": {
-            "url": "https://github.com/cli/cli/releases/download/v2.91.0/gh_2.91.0_macOS_arm64.zip",
-            "sha256": "20446cd714d9fa1b69fbd410deade3731f38fe09a2b980c8488aa388dd320ada"
+            "url": "https://github.com/cli/cli/releases/download/v2.93.0/gh_2.93.0_macOS_arm64.zip",
+            "sha256": "a86be4e0a86c26456cf71177d6572d6f1165cf1679e532b72f7f15918ee51fd2"
           },
           "macos-x86_64": {
-            "url": "https://github.com/cli/cli/releases/download/v2.91.0/gh_2.91.0_macOS_amd64.zip",
-            "sha256": "8806784f93603fe6d3f95c3583a08df38f175df9ebc123dc8b15f919329980e2"
+            "url": "https://github.com/cli/cli/releases/download/v2.93.0/gh_2.93.0_macOS_amd64.zip",
+            "sha256": "009425b9d175c482037fe25181817fd6b1ea3ae1f51cfae0e18f29f33d3152ac"
           },
           "linux-x86_64": {
-            "url": "https://github.com/cli/cli/releases/download/v2.91.0/gh_2.91.0_linux_amd64.tar.gz",
-            "sha256": "304a0d2460f4a8847d2f192bad4e2a32cd9420d28716e7ae32198181b65b5f9c"
+            "url": "https://github.com/cli/cli/releases/download/v2.93.0/gh_2.93.0_linux_amd64.tar.gz",
+            "sha256": "02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0"
           },
           "linux-aarch64": {
-            "url": "https://github.com/cli/cli/releases/download/v2.91.0/gh_2.91.0_linux_arm64.tar.gz",
-            "sha256": "ccbed39c472d3dc1c501d1e164a9cffd934c5f6fce1012811a1a59d24cb7d7c6"
+            "url": "https://github.com/cli/cli/releases/download/v2.93.0/gh_2.93.0_linux_arm64.tar.gz",
+            "sha256": "c55feb33684abba57e9909737340d5b39282257c0363e1edde6785ac4a413be7"
           }
         }
       },

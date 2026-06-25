@@ -36,6 +36,8 @@ const Command = enum {
     unpin,
     rollback,
     switch_version,
+    link,
+    unlink,
     bundle,
     deps,
     services,
@@ -154,13 +156,15 @@ pub fn main(init: std.process.Init) !void {
         .update => runUpdate(alloc),
         .update_registry => runUpdateRegistry(alloc),
         .help => printUsage(),
-        .doctor => runDoctor(alloc),
+        .doctor => runDoctor(alloc, args[2..]),
         .cleanup => runCleanup(alloc, args[2..]),
         .outdated => runOutdated(alloc),
         .pin => runPin(alloc, args[2..], true),
         .unpin => runPin(alloc, args[2..], false),
         .rollback => runRollback(alloc, args[2..]),
         .switch_version => runSwitch(alloc, args[2..]),
+        .link => runLink(alloc, args[2..]),
+        .unlink => runUnlink(alloc, args[2..]),
         .bundle => runBundle(alloc, args[2..]),
         .deps => runDeps(alloc, args[2..]),
         .services => runServices(alloc, args[2..]),
@@ -216,6 +220,8 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "rollback", Command.rollback },
         .{ "rb", Command.rollback },
         .{ "switch", Command.switch_version },
+        .{ "link", Command.link },
+        .{ "unlink", Command.unlink },
         .{ "bundle", Command.bundle },
         .{ "deps", Command.deps },
         .{ "services", Command.services },
@@ -1443,6 +1449,9 @@ fn fullInstallOne(
     nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
         stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
     };
+    if (!probeInstalledFormula(alloc, null, f.name, actual_ver, f.install_binaries)) {
+        stderr.print("nb: {s}: post-install probe warning: declared binaries or linked executables missing\n", .{f.name}) catch {};
+    }
     if (bench) std.debug.print("[nb-bench] {s} postinstall: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
 
     phase.store(@intFromEnum(Phase.done), .release);
@@ -1865,6 +1874,78 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb info ──
 
+fn probeInstalledFormula(
+    alloc: std.mem.Allocator,
+    stdout: ?StdoutWriter,
+    name: []const u8,
+    version: []const u8,
+    declared_binaries: []const []const u8,
+) bool {
+    var ok = true;
+    var keg_buf: [512]u8 = undefined;
+    const keg_dir = std.fmt.bufPrint(&keg_buf, "{s}/Cellar/{s}/{s}", .{ PREFIX, name, version }) catch return false;
+    std.Io.Dir.accessAbsolute(g_io, keg_dir, .{}) catch {
+        if (stdout) |out| out.print("  ✗ {s}: missing Cellar dir {s}\n", .{ name, keg_dir }) catch {};
+        return false;
+    };
+
+    if (declared_binaries.len > 0) {
+        for (declared_binaries) |rel| {
+            const base = std.fs.path.basename(rel);
+            var cellar_bin_buf: [512]u8 = undefined;
+            const cellar_bin = std.fmt.bufPrint(&cellar_bin_buf, "{s}/{s}", .{ keg_dir, rel }) catch {
+                ok = false;
+                continue;
+            };
+            std.Io.Dir.accessAbsolute(g_io, cellar_bin, .{ .execute = true }) catch {
+                if (stdout) |out| out.print("  ✗ {s}: declared binary not executable: {s}\n", .{ name, cellar_bin }) catch {};
+                ok = false;
+            };
+            var linked_buf: [512]u8 = undefined;
+            const linked = std.fmt.bufPrint(&linked_buf, "{s}/bin/{s}", .{ PREFIX, base }) catch {
+                ok = false;
+                continue;
+            };
+            std.Io.Dir.accessAbsolute(g_io, linked, .{ .execute = true }) catch {
+                if (stdout) |out| out.print("  ✗ {s}: linked binary not executable: {s}\n", .{ name, linked }) catch {};
+                ok = false;
+            };
+        }
+    } else {
+        // No declared binaries in metadata: discover executable files in keg/bin
+        // and verify any that exist are linked. Library-only kegs with no bin/
+        // executables still pass the DB↔disk part of the probe.
+        var bin_buf: [512]u8 = undefined;
+        const bin_dir = std.fmt.bufPrint(&bin_buf, "{s}/bin", .{keg_dir}) catch return false;
+        if (std.Io.Dir.openDirAbsolute(g_io, bin_dir, .{ .iterate = true })) |d| {
+            var dir = d;
+            defer dir.close(g_io);
+            var iter = dir.iterate();
+            while (iter.next(g_io) catch null) |entry| {
+                if (entry.kind != .file and entry.kind != .sym_link) continue;
+                var keg_bin_buf: [512]u8 = undefined;
+                const keg_bin = std.fmt.bufPrint(&keg_bin_buf, "{s}/{s}", .{ bin_dir, entry.name }) catch continue;
+                std.Io.Dir.accessAbsolute(g_io, keg_bin, .{ .execute = true }) catch continue;
+                var linked_buf: [512]u8 = undefined;
+                const linked = std.fmt.bufPrint(&linked_buf, "{s}/bin/{s}", .{ PREFIX, entry.name }) catch {
+                    ok = false;
+                    continue;
+                };
+                std.Io.Dir.accessAbsolute(g_io, linked, .{ .execute = true }) catch {
+                    if (stdout) |out| out.print("  ✗ {s}: discovered binary not linked/executable: {s}\n", .{ name, linked }) catch {};
+                    ok = false;
+                };
+            }
+        } else |_| {}
+    }
+
+    if (ok) {
+        if (stdout) |out| out.print("  ✓ {s} {s}: local probe passed\n", .{ name, version }) catch {};
+    }
+    _ = alloc;
+    return ok;
+}
+
 fn runInfo(alloc: std.mem.Allocator, args: []const []const u8) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
@@ -1912,6 +1993,23 @@ fn runInfo(alloc: std.mem.Allocator, args: []const []const u8) void {
             if (f.desc.len > 0) stdout.print("  {s}\n", .{f.desc}) catch {};
             if (f.homepage.len > 0) stdout.print("  homepage: {s}\n", .{f.homepage}) catch {};
             if (f.license.len > 0) stdout.print("  license: {s}\n", .{f.license}) catch {};
+            var trust_tier: []const u8 = if (bottled and f.bottle_sha256.len >= 64) "checksum-verified" else "unverified";
+            if (nb.upstream_registry.loadRegistry(alloc)) |registry| {
+                defer registry.deinit(alloc);
+                if (registry.find(f.name, .formula)) |record| {
+                    if (record.upstream.verified) trust_tier = "source-verified";
+                }
+            } else |_| {}
+            if (nb.database.Database.open(alloc)) |db_handle| {
+                var db = db_handle;
+                defer db.close();
+                if (db.findKeg(f.name)) |keg| {
+                    if (probeInstalledFormula(alloc, null, f.name, keg.version, f.install_binaries)) {
+                        trust_tier = "install-verified";
+                    }
+                }
+            } else |_| {}
+            stdout.print("  trust: {s} (evidence: local, {d})\n", .{ trust_tier, monoUnixSeconds() }) catch {};
             if (bottled) {
                 stdout.print("  url: {s}\n", .{f.bottle_url}) catch {};
                 if (f.bottle_sha256.len > 0) stdout.print("  sha256: {s}\n", .{f.bottle_sha256}) catch {};
@@ -2447,6 +2545,26 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
 /// Refresh the verified-upstream registry cache from the remote so pinned
 /// versions stop going stale between binary releases (#308/#310). Best-effort:
 /// prints a status line but never aborts the caller.
+fn isValidSelfUpdateBinary(path: []const u8) bool {
+    const file = std.Io.Dir.openFileAbsolute(g_io, path, .{}) catch return false;
+    defer file.close(g_io);
+
+    const st = file.stat(g_io) catch return false;
+    if (st.size < 4) return false;
+
+    var magic: [4]u8 = undefined;
+    const n = file.readPositionalAll(g_io, &magic, 0) catch return false;
+    if (n != magic.len) return false;
+
+    return switch (builtin.os.tag) {
+        .linux => magic[0] == 0x7f and magic[1] == 'E' and magic[2] == 'L' and magic[3] == 'F',
+        .macos => std.mem.eql(u8, &magic, &.{ 0xcf, 0xfa, 0xed, 0xfe }) or
+            std.mem.eql(u8, &magic, &.{ 0xca, 0xfe, 0xba, 0xbe }) or
+            std.mem.eql(u8, &magic, &.{ 0xca, 0xfe, 0xba, 0xbf }),
+        else => false,
+    };
+}
+
 fn refreshUpstreamRegistry(alloc: std.mem.Allocator) void {
     const stdout = StdoutWriter{};
     if (nb.upstream_registry.refreshCache(alloc)) |count| {
@@ -2775,7 +2893,8 @@ fn runUpdate(alloc: std.mem.Allocator) void {
         std.process.exit(1);
     };
 
-    // Fallback: if tarball contains "nb-<arch>" instead of "nb", find it
+    // Fallback: accept only the expected release binary names, not an arbitrary
+    // first "nb*" directory entry, then validate the binary magic before install.
     const bin_exists = blk: {
         const f = std.Io.Dir.openFileAbsolute(g_io, extracted_bin, .{}) catch break :blk false;
         f.close(g_io);
@@ -2783,6 +2902,8 @@ fn runUpdate(alloc: std.mem.Allocator) void {
     };
     var fallback_bin_buf: [512]u8 = undefined;
     const final_extracted_bin = if (bin_exists) extracted_bin else fb: {
+        const expected_fallback = "nb-" ++ arch_name ++ "-" ++ asset_os_name;
+        const legacy_fallback = "nb-" ++ arch_name;
         var dir = std.Io.Dir.openDirAbsolute(g_io, tmp_dir, .{ .iterate = true }) catch {
             stderr.print("nb: update failed: could not open extract dir\n", .{}) catch {};
             std.process.exit(1);
@@ -2790,17 +2911,25 @@ fn runUpdate(alloc: std.mem.Allocator) void {
         defer dir.close(g_io);
         var iter = dir.iterate();
         while (iter.next(g_io) catch null) |entry| {
-            if (std.mem.startsWith(u8, entry.name, "nb") and entry.kind == .file) {
+            if (entry.kind == .file and
+                (std.mem.eql(u8, entry.name, expected_fallback) or std.mem.eql(u8, entry.name, legacy_fallback)))
+            {
                 break :fb std.fmt.bufPrint(&fallback_bin_buf, "{s}/{s}", .{ tmp_dir, entry.name }) catch {
                     std.process.exit(1);
                 };
             }
         }
-        stderr.print("nb: update failed: extracted binary not found\n", .{}) catch {};
+        stderr.print("nb: update failed: expected extracted binary not found\n", .{}) catch {};
         std.Io.Dir.deleteFileAbsolute(g_io, tmp_tar) catch {};
         std.Io.Dir.cwd().deleteTree(g_io, tmp_dir) catch {};
         std.process.exit(1);
     };
+    if (!isValidSelfUpdateBinary(final_extracted_bin)) {
+        stderr.print("nb: update failed: extracted binary failed validation\n", .{}) catch {};
+        std.Io.Dir.deleteFileAbsolute(g_io, tmp_tar) catch {};
+        std.Io.Dir.cwd().deleteTree(g_io, tmp_dir) catch {};
+        std.process.exit(1);
+    }
 
     // Stage: write to a temp location on the same filesystem as the executable
     var staged_buf: [512]u8 = undefined;
@@ -2896,19 +3025,6 @@ fn collectCaskDbEntries(
     }
 }
 
-/// True when nanobrew's Caskroom already has a payload directory for this
-/// token at this exact version (a prior nanobrew install placed it). Used to
-/// safely adopt an on-disk-but-untracked cask without claiming a foreign,
-/// manually-installed app — and without recording a version that was never
-/// installed: the API may have moved past the interrupted run's version, and
-/// adopting under the newer version would freeze `nb upgrade` on a stale
-/// payload (issue #302, review follow-up).
-fn caskAlreadyOnDisk(token: []const u8, version: []const u8) bool {
-    var buf: [512]u8 = undefined;
-    const dir = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ paths.CASKROOM_DIR, token, version }) catch return false;
-    std.Io.Dir.accessAbsolute(g_io, dir, .{}) catch return false;
-    return true;
-}
 fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
@@ -2961,23 +3077,30 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
             continue;
         };
         if (cask_conflict) |conflict| {
-            // If nanobrew already owns this cask on disk (its Caskroom dir
-            // exists) but the DB lost the record — e.g. an earlier multi-cask
-            // run was interrupted before it flushed — adopt the existing payload
-            // into the DB instead of refusing, so `nb list`/`upgrade` see it
-            // again. A foreign app (no Caskroom dir) is still refused so
-            // `nb remove` never deletes something nanobrew didn't install (#302).
-            if (caskAlreadyOnDisk(token, cask_meta.version)) {
+            // The destination already exists. If nanobrew owns this token's
+            // Caskroom payload but the DB lost the record (e.g. an earlier
+            // multi-cask run was interrupted before it flushed (#302), or only
+            // an older version's payload survived), adopt that payload into the
+            // DB under its REAL on-disk version instead of refusing. That keeps
+            // the cask installable/removable and lets `nb upgrade` bring it
+            // current. A foreign app (no Caskroom payload) is still refused so
+            // `nb remove` never deletes something nanobrew didn't install.
+            var disk_ver_buf: [256]u8 = undefined;
+            if (nb.cask_installer.ownedCaskVersionOnDisk(g_io, paths.CASKROOM_DIR, token, cask_meta.version, &disk_ver_buf)) |disk_ver| {
                 var apps: std.ArrayList([]const u8) = .empty;
                 defer apps.deinit(alloc);
                 var binaries: std.ArrayList([]const u8) = .empty;
                 defer binaries.deinit(alloc);
                 collectCaskDbEntries(alloc, cask_meta.artifacts, &apps, &binaries);
-                db.recordCaskInstall(token, cask_meta.version, apps.items, binaries.items) catch {
+                db.recordCaskInstall(token, disk_ver, apps.items, binaries.items) catch {
                     stderr.print("nb: warning: could not record existing cask install\n", .{}) catch {};
                 };
                 db.flush() catch {};
-                stdout.print("==> {s} {s} already present on disk; recorded existing install\n", .{ token, cask_meta.version }) catch {};
+                if (std.mem.eql(u8, disk_ver, cask_meta.version)) {
+                    stdout.print("==> {s} {s} already present on disk; recorded existing install\n", .{ token, disk_ver }) catch {};
+                } else {
+                    stdout.print("==> {s}: recovered existing install ({s}); run `nb upgrade {s}` to update to {s}\n", .{ token, disk_ver, token, cask_meta.version }) catch {};
+                }
                 continue;
             }
             stderr.print("nb: refusing to overwrite existing {s} at {s}\n", .{ conflict.kind, conflict.path }) catch {};
@@ -3092,13 +3215,15 @@ fn printUsage() void {
         \\  upgrade --deb            Upgrade all installed .deb packages
         \\  update                   Self-update nanobrew (also refreshes the upstream registry)
         \\  update-registry          Refresh only the verified-upstream version registry
-        \\  doctor                   Check installation health
+        \\  doctor [--probe [pkg]]   Check installation health / probe installed packages
         \\  cleanup [--dry-run]      Remove stale caches and orphaned files
         \\  outdated                 List packages with newer versions available
         \\  pin <package>            Pin a package (skip during upgrade)
         \\  unpin <package>          Unpin a package
         \\  rollback <package>       Rollback to previous version
         \\  switch <pkg>@<version>   Reactivate a previously-installed version
+        \\  link <package>           Link an installed keg's binaries into the prefix
+        \\  unlink <package>         Remove an installed keg's prefix links (keg stays)
         \\  bundle [dump|install]    Export/import package lists (Brewfile-compatible)
         \\  deps [--tree] <formula>  Show dependency tree
         \\  services [list|start|stop|restart] [name]
@@ -3143,9 +3268,47 @@ fn printUsage() void {
 
 // ── nb doctor ──
 
-fn runDoctor(alloc: std.mem.Allocator) void {
+fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
     const stdout = StdoutWriter{};
+    const stderr = StderrWriter{};
     var issues: usize = 0;
+
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--probe")) {
+        var db = nb.database.Database.open(alloc) catch {
+            stderr.print("nb: doctor --probe: could not open database\n", .{}) catch {};
+            std.process.exit(1);
+        };
+        defer db.close();
+        if (args.len > 1) {
+            for (args[1..]) |name| {
+                const keg = db.findKeg(name) orelse {
+                    stdout.print("  ✗ {s}: not installed\n", .{name}) catch {};
+                    issues += 1;
+                    continue;
+                };
+                const f = nb.api_client.fetchFormula(alloc, name) catch null;
+                defer if (f) |formula| formula.deinit(alloc);
+                const declared = if (f) |formula| formula.install_binaries else &.{};
+                if (!probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared)) issues += 1;
+            }
+        } else {
+            const kegs = db.listInstalled(alloc) catch &.{};
+            defer if (kegs.len > 0) alloc.free(kegs);
+            for (kegs) |keg| {
+                const f = nb.api_client.fetchFormula(alloc, keg.name) catch null;
+                defer if (f) |formula| formula.deinit(alloc);
+                const declared = if (f) |formula| formula.install_binaries else &.{};
+                if (!probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared)) issues += 1;
+            }
+        }
+        printDoctorSummary(stdout, issues);
+        if (issues > 0) std.process.exit(1);
+        return;
+    }
+    if (args.len > 0) {
+        stderr.print("Usage: nb doctor [--probe [package...]]\n", .{}) catch {};
+        std.process.exit(1);
+    }
 
     stdout.print("==> Checking nanobrew installation...\n", .{}) catch {};
 
@@ -3776,6 +3939,112 @@ fn runSwitch(alloc: std.mem.Allocator, args: []const []const u8) void {
     }
     if (had_error) std.process.exit(1);
 }
+// ── nb link / nb unlink ──
+//
+// Manually (re)link or unlink an installed keg's binaries into the prefix,
+// mirroring `brew link`/`brew unlink`. This lets a user swap which of two
+// packages that install the same binary (e.g. sdl2 vs sdl2-compat) is the
+// active one, without uninstall/reinstall churn (#335).
+//
+// `nb link <pkg>`    — relink the installed keg's binaries/symlinks into the
+//                      prefix. Idempotent: already-linked kegs are a no-op.
+// `nb unlink <pkg>`  — remove the keg's prefix links (opt/ symlink, bin/
+//                      shims, managed wrappers). The Cellar keg is untouched,
+//                      so a later `nb link <pkg>` (or `nb install`) restores it.
+
+fn runLink(alloc: std.mem.Allocator, args: []const []const u8) void {
+    const stdout = StdoutWriter{};
+    const stderr = StderrWriter{};
+
+    if (args.len == 0) {
+        stderr.print("nb: no package specified\nUsage: nb link <package>...\n", .{}) catch {};
+        std.process.exit(1);
+    }
+
+    var db = nb.database.Database.open(alloc) catch {
+        stderr.print("nb: could not open database\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer db.close();
+
+    var had_error = false;
+    for (args) |raw_name| {
+        const name = if (std.mem.lastIndexOfScalar(u8, raw_name, '/')) |pos| raw_name[pos + 1 ..] else raw_name;
+        const keg = db.findKeg(name) orelse {
+            stderr.print("nb: '{s}' is not installed\n", .{raw_name}) catch {};
+            had_error = true;
+            continue;
+        };
+
+        // Detect the real on-disk version (a keg dir may carry a rebuild suffix).
+        var ver_buf: [256]u8 = undefined;
+        const actual_ver = nb.cellar.detectKegVersion(name, keg.version, &ver_buf) orelse keg.version;
+
+        // Verify the keg actually exists in the Cellar before linking, so we
+        // don't claim success for a phantom DB entry.
+        var keg_dir_buf: [512]u8 = undefined;
+        const keg_dir = std.fmt.bufPrint(&keg_dir_buf, "{s}/Cellar/{s}/{s}", .{ PREFIX, name, actual_ver }) catch {
+            stderr.print("nb: '{s}': path too long\n", .{name}) catch {};
+            had_error = true;
+            continue;
+        };
+        if (std.Io.Dir.accessAbsolute(g_io, keg_dir, .{})) |_| {} else |_| {
+            stderr.print("nb: '{s}' {s} has no Cellar directory (run `nb cleanup --prune-kegs`)\n", .{ name, actual_ver }) catch {};
+            had_error = true;
+            continue;
+        }
+
+        // Unlink first (no-op if not linked) then link, so a keg that another
+        // package shadowed — or that was linked with a different mode — ends up
+        // cleanly linked. linkKeg is itself idempotent.
+        nb.linker.unlinkKeg(name, actual_ver) catch {};
+        nb.linker.linkKeg(name, actual_ver) catch |err| {
+            stderr.print("nb: '{s}': link failed: {}\n", .{ name, err }) catch {};
+            had_error = true;
+            continue;
+        };
+        stdout.print("==> Linked {s} {s}\n", .{ name, actual_ver }) catch {};
+    }
+    if (had_error) std.process.exit(1);
+}
+
+fn runUnlink(alloc: std.mem.Allocator, args: []const []const u8) void {
+    const stdout = StdoutWriter{};
+    const stderr = StderrWriter{};
+
+    if (args.len == 0) {
+        stderr.print("nb: no package specified\nUsage: nb unlink <package>...\n", .{}) catch {};
+        std.process.exit(1);
+    }
+
+    var db = nb.database.Database.open(alloc) catch {
+        stderr.print("nb: could not open database\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer db.close();
+
+    var had_error = false;
+    for (args) |raw_name| {
+        const name = if (std.mem.lastIndexOfScalar(u8, raw_name, '/')) |pos| raw_name[pos + 1 ..] else raw_name;
+        const keg = db.findKeg(name) orelse {
+            stderr.print("nb: '{s}' is not installed\n", .{raw_name}) catch {};
+            had_error = true;
+            continue;
+        };
+
+        var ver_buf: [256]u8 = undefined;
+        const actual_ver = nb.cellar.detectKegVersion(name, keg.version, &ver_buf) orelse keg.version;
+
+        nb.linker.unlinkKeg(name, actual_ver) catch |err| {
+            stderr.print("nb: '{s}': unlink failed: {}\n", .{ name, err }) catch {};
+            had_error = true;
+            continue;
+        };
+        stdout.print("==> Unlinked {s} {s}\n", .{ name, actual_ver }) catch {};
+    }
+    if (had_error) std.process.exit(1);
+}
+
 // ── nb bundle ──
 
 fn runBundle(alloc: std.mem.Allocator, args: []const []const u8) void {
@@ -4287,6 +4556,8 @@ fn runCompletions(args: []const []const u8) void {
             \\    'unpin:Unpin a package'
             \\    'rollback:Rollback to previous version'
             \\    'switch:Reactivate a previously-installed version'
+            \\    'link:Link an installed keg into the prefix'
+            \\    'unlink:Remove an installed keg prefix links'
             \\    'bundle:Export/import package lists'
             \\    'deps:Show dependency tree'
             \\    'services:Manage services'
@@ -4311,7 +4582,7 @@ fn runCompletions(args: []const []const u8) void {
             \\      _arguments '--cask[Upgrade casks]' '--deb[Upgrade debs]' '*:installed package:_nb_installed' ;;
             \\    info)
             \\      _arguments '--cask[Show cask info]' '*:formula:' ;;
-            \\    pin|unpin|rollback|rb)
+            \\    pin|unpin|rollback|rb|link|unlink)
             \\      _arguments '*:installed package:_nb_installed' ;;
             \\    deps)
             \\      _arguments '--tree[Show as tree]' '*:formula:' ;;
@@ -4347,7 +4618,7 @@ fn runCompletions(args: []const []const u8) void {
             \\    COMPREPLY=($(compgen -W "$commands" -- "${{COMP_WORDS[COMP_CWORD]}}"))
             \\  else
             \\    case "${{COMP_WORDS[1]}}" in
-            \\      remove|uninstall|upgrade|pin|unpin|rollback)
+            \\      remove|uninstall|upgrade|pin|unpin|rollback|link|unlink)
             \\        local installed="$(nb list 2>/dev/null | awk '{{print $1}}')"
             \\        COMPREPLY=($(compgen -W "$installed" -- "${{COMP_WORDS[COMP_CWORD]}}")) ;;
             \\      install)
@@ -4388,6 +4659,8 @@ fn runCompletions(args: []const []const u8) void {
             \\complete -c nb -n '__fish_use_subcommand' -a 'pin' -d 'Pin a package'
             \\complete -c nb -n '__fish_use_subcommand' -a 'unpin' -d 'Unpin a package'
             \\complete -c nb -n '__fish_use_subcommand' -a 'rollback' -d 'Rollback to previous version'
+            \\complete -c nb -n '__fish_use_subcommand' -a 'link' -d 'Link an installed keg into the prefix'
+            \\complete -c nb -n '__fish_use_subcommand' -a 'unlink' -d 'Remove an installed keg prefix links'
             \\complete -c nb -n '__fish_use_subcommand' -a 'bundle' -d 'Export/import package lists'
             \\complete -c nb -n '__fish_use_subcommand' -a 'deps' -d 'Show dependency tree'
             \\complete -c nb -n '__fish_use_subcommand' -a 'services' -d 'Manage services'
@@ -4396,7 +4669,7 @@ fn runCompletions(args: []const []const u8) void {
             \\complete -c nb -n '__fish_use_subcommand' -a 'nuke' -d 'Completely uninstall nanobrew'
             \\complete -c nb -n '__fish_use_subcommand' -a 'migrate' -d 'Import existing Homebrew packages'
             \\complete -c nb -n '__fish_use_subcommand' -a 'help' -d 'Show help'
-            \\complete -c nb -n '__fish_seen_subcommand_from remove uninstall upgrade pin unpin rollback' -a '(nb list 2>/dev/null | awk "{{print \\$1}}")'
+            \\complete -c nb -n '__fish_seen_subcommand_from remove uninstall upgrade pin unpin rollback link unlink' -a '(nb list 2>/dev/null | awk "{{print \\$1}}")'
             \\complete -c nb -n '__fish_seen_subcommand_from install info' -l cask -d 'Cask mode'
             \\complete -c nb -n '__fish_seen_subcommand_from install' -l deb -d 'Deb mode'
             \\complete -c nb -n '__fish_seen_subcommand_from install' -l shims -d 'Use private dependency executable shims'
