@@ -2,6 +2,20 @@
 
 All notable changes to nanobrew are documented here.
 
+## [0.1.199] - 2026-06-25
+
+### Security
+- **Bumped the pinned GitHub CLI (`gh`) registry entry to 2.93.0** with official upstream checksums, clearing the weekly bottle scan finding against 2.91.0. (#334)
+- **Bottle scans now fail with actionable evidence instead of empty issues**: per-record scan crashes are captured as gated `SCAN-ERROR` findings so the issue body tells maintainers what failed. (#334)
+
+### Fixed
+- **Finished the #314 update hardening follow-ups**: POST redirect handling no longer leaks synthetic form `Content-Type` after POST→GET redirects, 307/308 POST redirects get a distinct unsupported error, self-update accepts only expected release binary names, extracted update binaries are checked for Mach-O/ELF magic before replacement, and `update-registry` now reports cache write failures. (#314)
+- **Native Linux builds link libc explicitly**, matching the test and cross-build modules.
+- **Cask recovery and fonts**: font cask artifacts are parsed, and interrupted cask installs can be recovered from their real on-disk Caskroom payload version.
+
+### Added
+- **Local trust probe slice**: `nb doctor --probe [pkg...]` probes installed formula kegs, installs run a warning-only local probe after post-install, and `nb info` surfaces a local trust tier (`checksum-verified`, `source-verified`, or `install-verified`). (#317)
+
 ## [0.1.198] - 2026-06-12
 
 ### Security
