@@ -13,19 +13,21 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Main executable ──
+    const is_windows = target.result.os.tag == .windows;
     const exe = b.addExecutable(.{
         .name = "nb",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path(if (is_windows) "src/windows_main.zig" else "src/main.zig"),
             .target = target,
             .optimize = optimize,
             // Linux: src/main.zig and the extract/tar paths reach extern "c"
             // symbols (read, symlink, fchmod, getenv, clock_gettime), so a
             // native Linux `zig build` needs libc linked explicitly — same as
             // the test and linux cross-compile modules below. macOS always
-            // links libSystem, so null keeps the default there.
+            // links libSystem, so null keeps the default there. Windows uses
+            // the lightweight bridge entry point and does not need libc.
             .link_libc = if (target.result.os.tag == .linux) true else null,
-            .imports = &.{
+            .imports = if (is_windows) &.{} else &.{
                 .{ .name = "nanobrew", .module = nb_mod },
             },
         }),
@@ -111,6 +113,24 @@ pub fn build(b: *std.Build) void {
         const s = b.step(entry[0], entry[2]);
         s.dependOn(&run_t.step);
     }
+
+    // ── Windows bridge convenience target ──
+    const windows_x86 = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .windows,
+        .abi = .gnu,
+    });
+    const windows_exe = b.addExecutable(.{
+        .name = "nb",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/windows_main.zig"),
+            .target = windows_x86,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    windows_exe.root_module.strip = true;
+    const windows_step = b.step("windows", "Build Windows package-manager bridge");
+    windows_step.dependOn(&b.addInstallArtifact(windows_exe, .{}).step);
 
     // ── Linux cross-compilation convenience targets ──
     const linux_x86 = b.resolveTargetQuery(.{
