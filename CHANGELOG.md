@@ -2,6 +2,12 @@
 
 All notable changes to nanobrew are documented here.
 
+## [0.1.200] - 2026-06-25
+
+### Added
+- **Windows package-manager bridge** — the Windows build now provides a native `nb.exe` that maps nanobrew-shaped commands onto Windows package managers: WinGet by default, Scoop with `--scoop`, and Chocolatey with `--choco`. Supports `search`, `install`, `upgrade`, `remove`, `list`, `doctor`, and `version`. This is intentionally a Windows-native bridge rather than a Homebrew bottle/Cellar runtime; Homebrew itself remains best handled via WSL2. (#336)
+- **`zig build windows`** convenience target for producing the x86_64 Windows bridge executable. (#336)
+
 ## [0.1.199] - 2026-06-25
 
 ### Security

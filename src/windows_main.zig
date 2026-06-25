@@ -7,7 +7,7 @@
 
 const std = @import("std");
 
-const VERSION = "0.1.199";
+const VERSION = "0.1.200";
 
 const Backend = enum { winget, scoop, choco };
 
