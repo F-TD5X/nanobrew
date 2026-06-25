@@ -1874,6 +1874,92 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb info ──
 
+fn probeExecutableCommand(alloc: std.mem.Allocator, stdout: ?StdoutWriter, owner: []const u8, path: []const u8) bool {
+    const attempts = [_][]const u8{ "--version", "version", "--help" };
+    const timeout_script = "\"$1\" \"$2\" & pid=$!; (sleep 2; kill $pid 2>/dev/null) & watcher=$!; wait $pid; status=$?; kill $watcher 2>/dev/null; exit $status";
+    for (attempts) |arg| {
+        const res = std.process.run(alloc, g_io, .{ .argv = &.{ "sh", "-c", timeout_script, "nb-probe", path, arg } }) catch continue;
+        defer alloc.free(res.stdout);
+        defer alloc.free(res.stderr);
+        switch (res.term) {
+            .exited => |code| {
+                if (code == 0 or code == 1 or code == 2) return true;
+            },
+            else => {},
+        }
+    }
+    if (stdout) |out| out.print("  ✗ {s}: binary did not answer --version/version/--help within 2s: {s}\n", .{ owner, path }) catch {};
+    return false;
+}
+
+fn verifyCaskSignature(alloc: std.mem.Allocator, stdout: ?StdoutWriter, token: []const u8, app_path: []const u8) bool {
+    if (comptime builtin.os.tag != .macos) return true;
+    if (!std.mem.endsWith(u8, app_path, ".app")) return true;
+
+    const res = std.process.run(alloc, g_io, .{ .argv = &.{ "codesign", "--verify", "--deep", "--strict", app_path } }) catch {
+        if (stdout) |out| out.print("  ✗ {s}: codesign verification could not run for {s}\n", .{ token, app_path }) catch {};
+        return false;
+    };
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| {
+            if (code == 0) return true;
+        },
+        else => {},
+    }
+    if (stdout) |out| out.print("  ✗ {s}: codesign verification failed for {s}\n", .{ token, app_path }) catch {};
+    return false;
+}
+
+fn probeInstalledCask(
+    alloc: std.mem.Allocator,
+    stdout: ?StdoutWriter,
+    cask: nb.database.CaskRecord,
+) bool {
+    var ok = true;
+    var caskroom_buf: [512]u8 = undefined;
+    const caskroom_dir = std.fmt.bufPrint(&caskroom_buf, "{s}/{s}/{s}", .{ paths.CASKROOM_DIR, cask.token, cask.version }) catch return false;
+    std.Io.Dir.accessAbsolute(g_io, caskroom_dir, .{}) catch {
+        if (stdout) |out| out.print("  ✗ {s}: missing Caskroom payload {s}\n", .{ cask.token, caskroom_dir }) catch {};
+        return false;
+    };
+
+    for (cask.apps) |app| {
+        var app_buf: [1024]u8 = undefined;
+        const app_path = std.fmt.bufPrint(&app_buf, "/Applications/{s}", .{app}) catch {
+            ok = false;
+            continue;
+        };
+        std.Io.Dir.accessAbsolute(g_io, app_path, .{}) catch {
+            if (stdout) |out| out.print("  ✗ {s}: missing app artifact {s}\n", .{ cask.token, app_path }) catch {};
+            ok = false;
+            continue;
+        };
+        if (!verifyCaskSignature(alloc, stdout, cask.token, app_path)) ok = false;
+    }
+
+    for (cask.binaries) |bin| {
+        const base = std.fs.path.basename(bin);
+        var linked_buf: [512]u8 = undefined;
+        const linked = std.fmt.bufPrint(&linked_buf, "{s}/bin/{s}", .{ PREFIX, base }) catch {
+            ok = false;
+            continue;
+        };
+        std.Io.Dir.accessAbsolute(g_io, linked, .{ .execute = true }) catch {
+            if (stdout) |out| out.print("  ✗ {s}: linked binary not executable: {s}\n", .{ cask.token, linked }) catch {};
+            ok = false;
+            continue;
+        };
+        if (!probeExecutableCommand(alloc, stdout, cask.token, linked)) ok = false;
+    }
+
+    if (ok) {
+        if (stdout) |out| out.print("  ✓ {s} {s}: cask probe passed\n", .{ cask.token, cask.version }) catch {};
+    }
+    return ok;
+}
+
 fn probeInstalledFormula(
     alloc: std.mem.Allocator,
     stdout: ?StdoutWriter,
@@ -1909,7 +1995,9 @@ fn probeInstalledFormula(
             std.Io.Dir.accessAbsolute(g_io, linked, .{ .execute = true }) catch {
                 if (stdout) |out| out.print("  ✗ {s}: linked binary not executable: {s}\n", .{ name, linked }) catch {};
                 ok = false;
+                continue;
             };
+            if (!probeExecutableCommand(alloc, stdout, name, linked)) ok = false;
         }
     } else {
         // No declared binaries in metadata: discover executable files in keg/bin
@@ -1934,7 +2022,9 @@ fn probeInstalledFormula(
                 std.Io.Dir.accessAbsolute(g_io, linked, .{ .execute = true }) catch {
                     if (stdout) |out| out.print("  ✗ {s}: discovered binary not linked/executable: {s}\n", .{ name, linked }) catch {};
                     ok = false;
+                    continue;
                 };
+                if (!probeExecutableCommand(alloc, stdout, name, linked)) ok = false;
             }
         } else |_| {}
     }
@@ -1942,7 +2032,6 @@ fn probeInstalledFormula(
     if (ok) {
         if (stdout) |out| out.print("  ✓ {s} {s}: local probe passed\n", .{ name, version }) catch {};
     }
-    _ = alloc;
     return ok;
 }
 
@@ -3281,15 +3370,19 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
         defer db.close();
         if (args.len > 1) {
             for (args[1..]) |name| {
-                const keg = db.findKeg(name) orelse {
-                    stdout.print("  ✗ {s}: not installed\n", .{name}) catch {};
-                    issues += 1;
+                if (db.findKeg(name)) |keg| {
+                    const f = nb.api_client.fetchFormula(alloc, name) catch null;
+                    defer if (f) |formula| formula.deinit(alloc);
+                    const declared = if (f) |formula| formula.install_binaries else &.{};
+                    if (!probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared)) issues += 1;
                     continue;
-                };
-                const f = nb.api_client.fetchFormula(alloc, name) catch null;
-                defer if (f) |formula| formula.deinit(alloc);
-                const declared = if (f) |formula| formula.install_binaries else &.{};
-                if (!probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared)) issues += 1;
+                }
+                if (db.findCask(name)) |cask| {
+                    if (!probeInstalledCask(alloc, stdout, cask)) issues += 1;
+                    continue;
+                }
+                stdout.print("  ✗ {s}: not installed\n", .{name}) catch {};
+                issues += 1;
             }
         } else {
             const kegs = db.listInstalled(alloc) catch &.{};
@@ -3299,6 +3392,9 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
                 defer if (f) |formula| formula.deinit(alloc);
                 const declared = if (f) |formula| formula.install_binaries else &.{};
                 if (!probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared)) issues += 1;
+            }
+            for (db.casks.items) |cask| {
+                if (!probeInstalledCask(alloc, stdout, cask)) issues += 1;
             }
         }
         printDoctorSummary(stdout, issues);
