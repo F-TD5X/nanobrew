@@ -2160,6 +2160,17 @@ fn showCaskInfo(alloc: std.mem.Allocator, stdout: anytype, stderr: anytype, name
     // SHA256
     stdout.print("  sha256: {s}\n", .{cask.sha256}) catch {};
 
+    var trust_tier: []const u8 = if (cask.sha256.len >= 64) "checksum-verified" else "unverified";
+    if (cask.metadata_source == .verified_upstream) trust_tier = "source-verified";
+    if (nb.database.Database.open(alloc)) |db_handle| {
+        var db = db_handle;
+        defer db.close();
+        if (db.findCask(name)) |installed| {
+            if (probeInstalledCask(alloc, null, installed)) trust_tier = "install-verified";
+        }
+    } else |_| {}
+    stdout.print("  trust: {s} (evidence: local, {d})\n", .{ trust_tier, monoUnixSeconds() }) catch {};
+
     printCaskSecurityWarnings(stdout, "  ", &cask);
 
     // Artifacts
