@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
             // the test and linux cross-compile modules below. macOS always
             // links libSystem, so null keeps the default there. Windows uses
             // the lightweight bridge entry point and does not need libc.
-            .link_libc = if (target.result.os.tag == .linux) true else null,
+            .link_libc = if (target.result.os.tag == .linux or target.result.os.tag == .windows) true else null,
             .imports = if (is_windows) &.{} else &.{
                 .{ .name = "nanobrew", .module = nb_mod },
             },
@@ -126,6 +126,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/windows_main.zig"),
             .target = windows_x86,
             .optimize = .ReleaseFast,
+            .link_libc = true,
         }),
     });
     windows_exe.root_module.strip = true;
