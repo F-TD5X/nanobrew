@@ -129,7 +129,7 @@ fn installPackage(alloc: std.mem.Allocator, dirs: Dirs, p: Package) !void {
                 defer alloc.free(src);
                 const dst_cellar = try join(alloc, &.{ pkg_dir, bin });
                 defer alloc.free(dst_cellar);
-                try copyFile(src, dst_cellar);
+                if (!eql(src, dst_cellar)) try copyFile(src, dst_cellar);
             }
         },
         .exe => {
