@@ -97,7 +97,7 @@ jobs:
           version: 0.16.0
 
       - name: Build native Windows binary
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build windows
 
       - name: Smoke native Windows package manager
         shell: pwsh
