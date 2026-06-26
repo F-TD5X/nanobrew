@@ -31,6 +31,15 @@ const packages = [_]Package{
     .{ .name = "hyperfine", .version = "1.20.0", .desc = "Command-line benchmarking tool", .url = "https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-x86_64-pc-windows-msvc.zip", .sha256 = "2508c549b049b1d4342d08edc1cb42bfac169082b6e3069431b5bab9822dbb32", .kind = .zip, .bins = &.{"hyperfine.exe"} },
     .{ .name = "fzf", .version = "0.73.1", .desc = "Command-line fuzzy finder", .url = "https://github.com/junegunn/fzf/releases/download/v0.73.1/fzf-0.73.1-windows_amd64.zip", .sha256 = "521a974dc32e93404265e55bffaf71a59e05e80abdf8ca4afb21a6030dc76f5f", .kind = .zip, .bins = &.{"fzf.exe"} },
     .{ .name = "starship", .version = "1.25.1", .desc = "Fast cross-shell prompt", .url = "https://github.com/starship/starship/releases/download/v1.25.1/starship-x86_64-pc-windows-msvc.zip", .sha256 = "a07cf3e428afab09324e510fb786041ebcc491a68b1ca6fba044c5a461f9b017", .kind = .zip, .bins = &.{"starship.exe"} },
+    .{ .name = "eza", .version = "0.23.4", .desc = "Modern replacement for ls", .url = "https://github.com/eza-community/eza/releases/download/v0.23.4/eza.exe_x86_64-pc-windows-gnu.zip", .sha256 = "05677fd7c2d1b69ce71df53db74c29f6331ea0b2be5aa3a0fce6976200ee06fc", .kind = .zip, .bins = &.{"eza.exe"} },
+    .{ .name = "delta", .version = "0.19.2", .desc = "Syntax-highlighting pager for git, diff, and grep output", .url = "https://github.com/dandavison/delta/releases/download/0.19.2/delta-0.19.2-x86_64-pc-windows-msvc.zip", .sha256 = "ac8ebb4a9f1cbee8b9ea897ba119808a244181adae6f3bed1f3b6b923c50b557", .kind = .zip, .bins = &.{"delta.exe"} },
+    .{ .name = "dust", .version = "1.2.4", .desc = "More intuitive du", .url = "https://github.com/bootandy/dust/releases/download/v1.2.4/dust-v1.2.4-x86_64-pc-windows-msvc.zip", .sha256 = "eb08d642f016787bb9fc918a4dc5f34665463657fddf83a40f2441cbf020fb4c", .kind = .zip, .bins = &.{"dust.exe"} },
+    .{ .name = "bottom", .version = "0.14.1", .desc = "Graphical process and system monitor", .url = "https://github.com/ClementTsang/bottom/releases/download/0.14.1/bottom_x86_64-pc-windows-msvc.zip", .sha256 = "a67328662f2c7cfbceff19734efefa9d07db4ce146af9e1a03dfdda6f54271d3", .kind = .zip, .bins = &.{"btm.exe"} },
+    .{ .name = "zoxide", .version = "0.9.9", .desc = "Smarter cd command", .url = "https://github.com/ajeetdsouza/zoxide/releases/download/v0.9.9/zoxide-0.9.9-x86_64-pc-windows-msvc.zip", .sha256 = "5af00d0916f05631e3030537289eac56605e7c1733318c4d525c8e847f12496d", .kind = .zip, .bins = &.{"zoxide.exe"} },
+    .{ .name = "sd", .version = "1.1.0", .desc = "Intuitive find and replace CLI", .url = "https://github.com/chmln/sd/releases/download/v1.1.0/sd-v1.1.0-x86_64-pc-windows-msvc.zip", .sha256 = "59837c2e7c911099aca1cc46b663bcdc5a949fd3e9fbbaf34fc73e5d5d71007c", .kind = .zip, .bins = &.{"sd.exe"} },
+    .{ .name = "hexyl", .version = "0.17.0", .desc = "Command-line hex viewer", .url = "https://github.com/sharkdp/hexyl/releases/download/v0.17.0/hexyl-v0.17.0-x86_64-pc-windows-msvc.zip", .sha256 = "ab5c3442cff63f585553d4fce330eaa1ef1bd2584643f1a0e29ab7c13fc9566d", .kind = .zip, .bins = &.{"hexyl.exe"} },
+    .{ .name = "dua", .version = "2.37.0", .desc = "Disk usage analyzer", .url = "https://github.com/Byron/dua-cli/releases/download/v2.37.0/dua-v2.37.0-x86_64-pc-windows-msvc.zip", .sha256 = "e66a99e6139b076f8da4ef269ce5452ef6636dfba66d4495f08ae18ad2c369c3", .kind = .zip, .bins = &.{"dua.exe"} },
+    .{ .name = "procs", .version = "0.14.12", .desc = "Modern replacement for ps", .url = "https://github.com/dalance/procs/releases/download/v0.14.12/procs-v0.14.12-x86_64-windows.zip", .sha256 = "4928c399ae78ee82f99139a5629077b8d90a58599d834584dd4e613cb60c83d0", .kind = .zip, .bins = &.{"procs.exe"} },
 };
 
 const Dirs = struct { root: []u8, cellar: []u8, bin: []u8, cache: []u8, db: []u8, state: []u8 };
@@ -436,7 +445,8 @@ fn printUsage() void {
         \\  version                 Show version
         \\
         \\AVAILABLE NOW:
-        \\  ripgrep, fd, bat, jq
+        \\  ripgrep, fd, bat, jq, uv, yq, just, hyperfine, fzf, starship
+        \\  eza, delta, dust, bottom, zoxide, sd, hexyl, dua, procs
         \\
     , .{VERSION});
 }

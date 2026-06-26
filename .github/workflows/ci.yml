@@ -124,8 +124,9 @@ jobs:
           & $nb init
           & $nb search uv
           & $nb search yq
+          & $nb search zoxide
           $ErrorActionPreference = 'Stop'
-          & $nb install uv yq just hyperfine fzf starship
+          & $nb install uv yq just hyperfine fzf starship eza delta dust bottom zoxide sd hexyl dua procs
           & $env:LOCALAPPDATA\nanobrew\bin\uv.exe --version
           if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\uvx.exe")) { throw 'uvx.exe was not linked' }
           & $env:LOCALAPPDATA\nanobrew\bin\yq.exe --version
@@ -133,6 +134,15 @@ jobs:
           & $env:LOCALAPPDATA\nanobrew\bin\hyperfine.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\fzf.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\starship.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\eza.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\delta.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\dust.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\btm.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\zoxide.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\sd.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\hexyl.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\dua.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\procs.exe --version
           & $nb list
           & $nb doctor
 
