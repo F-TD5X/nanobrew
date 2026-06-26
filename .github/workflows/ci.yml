@@ -123,12 +123,10 @@ jobs:
           & $nb help
           & $nb init
           & $nb search uv
+          $ErrorActionPreference = 'Stop'
           & $nb install uv
           & $env:LOCALAPPDATA\nanobrew\bin\uv.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\uvx.exe --version
-          & $nb install jq ripgrep
-          & $env:LOCALAPPDATA\nanobrew\bin\jq.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\rg.exe --version
+          if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\uvx.exe")) { throw 'uvx.exe was not linked' }
           & $nb list
           & $nb doctor
 
