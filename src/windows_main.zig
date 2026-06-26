@@ -40,6 +40,14 @@ const packages = [_]Package{
     .{ .name = "hexyl", .version = "0.17.0", .desc = "Command-line hex viewer", .url = "https://github.com/sharkdp/hexyl/releases/download/v0.17.0/hexyl-v0.17.0-x86_64-pc-windows-msvc.zip", .sha256 = "ab5c3442cff63f585553d4fce330eaa1ef1bd2584643f1a0e29ab7c13fc9566d", .kind = .zip, .bins = &.{"hexyl.exe"} },
     .{ .name = "dua", .version = "2.37.0", .desc = "Disk usage analyzer", .url = "https://github.com/Byron/dua-cli/releases/download/v2.37.0/dua-v2.37.0-x86_64-pc-windows-msvc.zip", .sha256 = "e66a99e6139b076f8da4ef269ce5452ef6636dfba66d4495f08ae18ad2c369c3", .kind = .zip, .bins = &.{"dua.exe"} },
     .{ .name = "procs", .version = "0.14.12", .desc = "Modern replacement for ps", .url = "https://github.com/dalance/procs/releases/download/v0.14.12/procs-v0.14.12-x86_64-windows.zip", .sha256 = "4928c399ae78ee82f99139a5629077b8d90a58599d834584dd4e613cb60c83d0", .kind = .zip, .bins = &.{"procs.exe"} },
+    .{ .name = "bun", .version = "1.3.14", .desc = "Fast JavaScript runtime, bundler, test runner, and package manager", .url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-windows-x64.zip", .sha256 = "0a0620930b6675d7ba440e81f4e0e00d3cfbe096c4b140d3fff02205e9e18922", .kind = .zip, .bins = &.{"bun.exe"} },
+    .{ .name = "deno", .version = "2.9.0", .desc = "Secure JavaScript and TypeScript runtime", .url = "https://github.com/denoland/deno/releases/download/v2.9.0/deno-x86_64-pc-windows-msvc.zip", .sha256 = "37e3a8e5f4ee360d08bbeec9ee07fdcaa9dcd1a39d4aeaac5807354aec557451", .kind = .zip, .bins = &.{"deno.exe"} },
+    .{ .name = "gh", .version = "2.95.0", .desc = "GitHub command-line tool", .url = "https://github.com/cli/cli/releases/download/v2.95.0/gh_2.95.0_windows_amd64.zip", .sha256 = "19a7154161ada9cfaa9e57edb752ecc679b75c391a62e4f7b586eea1df30b5bb", .kind = .zip, .bins = &.{"gh.exe"} },
+    .{ .name = "watchexec", .version = "2.5.1", .desc = "Run commands when files change", .url = "https://github.com/watchexec/watchexec/releases/download/v2.5.1/watchexec-2.5.1-x86_64-pc-windows-msvc.zip", .sha256 = "aa448c2704ca1a37ce0f1fc75381d9a411946dd293cf6236293f549426a577f7", .kind = .zip, .bins = &.{"watchexec.exe"} },
+    .{ .name = "pastel", .version = "0.12.0", .desc = "Command-line color tool", .url = "https://github.com/sharkdp/pastel/releases/download/v0.12.0/pastel-v0.12.0-x86_64-pc-windows-msvc.zip", .sha256 = "51e914b0308b089f032c481e786d67a9f11d8857f4ffe99405f3452e77582393", .kind = .zip, .bins = &.{"pastel.exe"} },
+    .{ .name = "xsv", .version = "0.13.0", .desc = "Fast CSV command-line toolkit", .url = "https://github.com/BurntSushi/xsv/releases/download/0.13.0/xsv-0.13.0-x86_64-pc-windows-msvc.zip", .sha256 = "3e319c08456031a9683c19c998ac9f61756a2e456413db17c8e6819b17818a1a", .kind = .zip, .bins = &.{"xsv.exe"} },
+    .{ .name = "yazi", .version = "26.5.6", .desc = "Terminal file manager", .url = "https://github.com/sxyazi/yazi/releases/download/v26.5.6/yazi-x86_64-pc-windows-msvc.zip", .sha256 = "6c6c52a4b2648e179f917bdaa7c57e793d18561b380a8bfa025f10cd1b9b2ad1", .kind = .zip, .bins = &.{ "yazi.exe", "ya.exe" } },
+    .{ .name = "oh-my-posh", .version = "29.18.0", .desc = "Prompt theme engine for any shell", .url = "https://github.com/JanDeDobbeleer/oh-my-posh/releases/download/v29.18.0/posh-windows-amd64.exe", .sha256 = "9af6f042155a9763b851245a3425e529b2705f3319105eb24ced87bc1334583c", .kind = .exe, .bins = &.{"oh-my-posh.exe"} },
 };
 
 const Dirs = struct { root: []u8, cellar: []u8, bin: []u8, cache: []u8, db: []u8, state: []u8 };
@@ -447,6 +455,7 @@ fn printUsage() void {
         \\AVAILABLE NOW:
         \\  ripgrep, fd, bat, jq, uv, yq, just, hyperfine, fzf, starship
         \\  eza, delta, dust, bottom, zoxide, sd, hexyl, dua, procs
+        \\  bun, deno, gh, watchexec, pastel, xsv, yazi, oh-my-posh
         \\
     , .{VERSION});
 }
