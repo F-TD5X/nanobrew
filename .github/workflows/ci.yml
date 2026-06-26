@@ -85,6 +85,42 @@ jobs:
           name: nb-linux-x86_64
           path: zig-out/bin/nb
 
+
+  build-windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build native Windows binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Smoke native Windows package manager
+        shell: pwsh
+        run: |
+          $nb = Resolve-Path .\zig-out\bin\nb.exe
+          & $nb help
+          & $nb init
+          & $nb search uv
+          & $nb install uv
+          & $env:LOCALAPPDATA\nanobrew\bin\uv.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\uvx.exe --version
+          & $nb install jq ripgrep
+          & $env:LOCALAPPDATA\nanobrew\bin\jq.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\rg.exe --version
+          & $nb list
+          & $nb doctor
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nb-windows-x86_64
+          path: zig-out/bin/nb.exe
+
   cross-compile:
     runs-on: macos-26
     steps:
