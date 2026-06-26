@@ -48,6 +48,17 @@ const packages = [_]Package{
     .{ .name = "xsv", .version = "0.13.0", .desc = "Fast CSV command-line toolkit", .url = "https://github.com/BurntSushi/xsv/releases/download/0.13.0/xsv-0.13.0-x86_64-pc-windows-msvc.zip", .sha256 = "3e319c08456031a9683c19c998ac9f61756a2e456413db17c8e6819b17818a1a", .kind = .zip, .bins = &.{"xsv.exe"} },
     .{ .name = "yazi", .version = "26.5.6", .desc = "Terminal file manager", .url = "https://github.com/sxyazi/yazi/releases/download/v26.5.6/yazi-x86_64-pc-windows-msvc.zip", .sha256 = "6c6c52a4b2648e179f917bdaa7c57e793d18561b380a8bfa025f10cd1b9b2ad1", .kind = .zip, .bins = &.{ "yazi.exe", "ya.exe" } },
     .{ .name = "oh-my-posh", .version = "29.18.0", .desc = "Prompt theme engine for any shell", .url = "https://github.com/JanDeDobbeleer/oh-my-posh/releases/download/v29.18.0/posh-windows-amd64.exe", .sha256 = "9af6f042155a9763b851245a3425e529b2705f3319105eb24ced87bc1334583c", .kind = .exe, .bins = &.{"oh-my-posh.exe"} },
+    .{ .name = "kubectl", .version = "1.36.2", .desc = "Kubernetes command-line tool", .url = "https://dl.k8s.io/release/v1.36.2/bin/windows/amd64/kubectl.exe", .sha256 = "df04d82234b28ffbdcd36e79d596b85da6e9c736e1a7a55ff6910c648ff47af2", .kind = .exe, .bins = &.{"kubectl.exe"} },
+    .{ .name = "terraform", .version = "1.15.7", .desc = "Infrastructure as code CLI", .url = "https://releases.hashicorp.com/terraform/1.15.7/terraform_1.15.7_windows_amd64.zip", .sha256 = "1644891f1d02dea989daed9a39c564ebdc80e13c9a7e42e713fba84d7f53b8f6", .kind = .zip, .bins = &.{"terraform.exe"} },
+    .{ .name = "helm", .version = "4.2.2", .desc = "Kubernetes package manager", .url = "https://get.helm.sh/helm-v4.2.2-windows-amd64.zip", .sha256 = "5fad8562e98c34fa5af3ef904086a5874a6701050f9bf36e30238c975df94dcd", .kind = .zip, .bins = &.{"helm.exe"} },
+    .{ .name = "k9s", .version = "0.51.0", .desc = "Terminal UI for Kubernetes clusters", .url = "https://github.com/derailed/k9s/releases/download/v0.51.0/k9s_Windows_amd64.zip", .sha256 = "bba299f1877913979831543a008f2e104995d2ea4ac8f23d7f49c0444857d973", .kind = .zip, .bins = &.{"k9s.exe"} },
+    .{ .name = "lazygit", .version = "0.62.2", .desc = "Terminal UI for git", .url = "https://github.com/jesseduffield/lazygit/releases/download/v0.62.2/lazygit_0.62.2_windows_x86_64.zip", .sha256 = "805bfcb2445273b77a32b7758dfb5d2d8dbd7b80b7336ab868935584a2fad0ba", .kind = .zip, .bins = &.{"lazygit.exe"} },
+    .{ .name = "lazydocker", .version = "0.25.2", .desc = "Terminal UI for Docker", .url = "https://github.com/jesseduffield/lazydocker/releases/download/v0.25.2/lazydocker_0.25.2_Windows_x86_64.zip", .sha256 = "facae8869c1bf144468191c563002162273a2c2761f052659170530cae3fa8a9", .kind = .zip, .bins = &.{"lazydocker.exe"} },
+    .{ .name = "rclone", .version = "1.74.3", .desc = "Cloud storage sync tool", .url = "https://github.com/rclone/rclone/releases/download/v1.74.3/rclone-v1.74.3-windows-amd64.zip", .sha256 = "ecb0ed9006e0d1a693757007716a11dab6c2cde6dac3f2fd87da962eaa73d11d", .kind = .zip, .bins = &.{"rclone.exe"} },
+    .{ .name = "age", .version = "1.3.1", .desc = "Simple modern file encryption tool", .url = "https://github.com/FiloSottile/age/releases/download/v1.3.1/age-v1.3.1-windows-amd64.zip", .sha256 = "c56e8ce22f7e80cb85ad946cc82d198767b056366201d3e1a2b93d865be38154", .kind = .zip, .bins = &.{ "age.exe", "age-keygen.exe" } },
+    .{ .name = "sops", .version = "3.13.1", .desc = "Editor for encrypted files", .url = "https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.amd64.exe", .sha256 = "4654e53fff6d0a1842facd3a0ed5a66a8ab6164004b0ad4ca2d5e2b1c5473b65", .kind = .exe, .bins = &.{"sops.exe"} },
+    .{ .name = "hugo", .version = "0.163.3", .desc = "Fast static site generator", .url = "https://github.com/gohugoio/hugo/releases/download/v0.163.3/hugo_extended_0.163.3_windows-amd64.zip", .sha256 = "10ce84261773a52aa2dabb4f51b9fe86309592248dbeeef093c6b36b1dacf252", .kind = .zip, .bins = &.{"hugo.exe"} },
+    .{ .name = "neovim", .version = "0.12.3", .desc = "Hyperextensible Vim-based text editor", .url = "https://github.com/neovim/neovim/releases/download/v0.12.3/nvim-win64.zip", .sha256 = "63daa0a0374f2255d2fb4c0867fcacc64a09c8d7ec1c349f781aff1b8350a8ad", .kind = .zip, .bins = &.{"nvim.exe"} },
 };
 
 const Dirs = struct { root: []u8, cellar: []u8, bin: []u8, cache: []u8, db: []u8, state: []u8 };
@@ -456,6 +467,8 @@ fn printUsage() void {
         \\  ripgrep, fd, bat, jq, uv, yq, just, hyperfine, fzf, starship
         \\  eza, delta, dust, bottom, zoxide, sd, hexyl, dua, procs
         \\  bun, deno, gh, watchexec, pastel, xsv, yazi, oh-my-posh
+        \\  kubectl, terraform, helm, k9s, lazygit, lazydocker, rclone
+        \\  age, sops, hugo, neovim
         \\
     , .{VERSION});
 }

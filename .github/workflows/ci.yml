@@ -126,13 +126,17 @@ jobs:
           & $nb search yq
           & $nb search zoxide
           & $nb search bun
+          & $nb search kubectl
           $ErrorActionPreference = 'Stop'
           # Keep this smoke intentionally small; larger runtime archives (bun/deno/yazi)
           # are covered by checksum/archive validation and can be slow on hosted runners.
-          & $nb install watchexec pastel xsv
+          & $nb install watchexec pastel xsv age lazygit
           & $env:LOCALAPPDATA\nanobrew\bin\watchexec.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\pastel.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\xsv.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\age.exe --version
+          if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\age-keygen.exe")) { throw 'age-keygen.exe was not linked' }
+          & $env:LOCALAPPDATA\nanobrew\bin\lazygit.exe --version
           & $nb list
           & $nb doctor
 
