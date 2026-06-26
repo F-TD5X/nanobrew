@@ -86,8 +86,9 @@ jobs:
           path: zig-out/bin/nb
 
 
+
   build-windows-native:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -96,13 +97,29 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Build native Windows binary
+      - name: Cross-build Windows binary
         run: zig build windows
+
+      - name: Upload Windows binary for smoke
+        uses: actions/upload-artifact@v4
+        with:
+          name: nb-windows-smoke
+          path: zig-out/bin/nb.exe
+
+  smoke-windows-native:
+    runs-on: windows-latest
+    needs: build-windows-native
+    steps:
+      - name: Download Windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: nb-windows-smoke
+          path: .
 
       - name: Smoke native Windows package manager
         shell: pwsh
         run: |
-          $nb = Resolve-Path .\zig-out\bin\nb.exe
+          $nb = Resolve-Path .\nb.exe
           & $nb help
           & $nb init
           & $nb search uv
@@ -115,11 +132,11 @@ jobs:
           & $nb list
           & $nb doctor
 
-      - name: Upload Windows binary
+      - name: Upload smoked Windows binary
         uses: actions/upload-artifact@v4
         with:
           name: nb-windows-x86_64
-          path: zig-out/bin/nb.exe
+          path: nb.exe
 
   cross-compile:
     runs-on: macos-26
