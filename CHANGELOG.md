@@ -4,9 +4,16 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
+## [0.1.201] - 2026-06-26
+
+### Added
 - **Windows registry is now data-driven and has `nb info` metadata lookup** — the Windows build embeds and validates `registry/windows.json` at build/runtime instead of carrying a duplicated hardcoded package table in Zig source.
 - **Windows native package set now includes `uv`, `yq`, `just`, `hyperfine`, `fzf`, `starship`, `eza`, `delta`, `dust`, `bottom`, `zoxide`, `sd`, `hexyl`, `dua`, `procs`, `bun`, `deno`, `gh`, `watchexec`, `pastel`, `xsv`, `yazi`, `oh-my-posh`, `kubectl`, `terraform`, `helm`, `k9s`, `lazygit`, `lazydocker`, `rclone`, `age`, `sops`, `hugo`, and `neovim`** — each downloads verified upstream x86_64 Windows portable assets and links executables into `%LOCALAPPDATA%\nanobrew\bin`.
 - **Windows UX polish** — `nb search` reports no-match results clearly and `nb doctor` now tells users whether nanobrew's `bin` directory is on the current PATH.
+
+### Fixed
+- **macOS ImageMagick/libheif and Lima compatibility** — ImageMagick wrappers now export the correct module/config paths for HEIC support, and Mach-O relocation no longer re-signs untouched skip-relocation binaries so upstream entitlements are preserved.
+- **Local trust probes** — `nb doctor --probe` executes linked formula binaries, probes cask app/binary payloads, and surfaces cask local trust evidence in `nb info`.
 
 ## [0.1.200] - 2026-06-25
 
