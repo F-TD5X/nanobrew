@@ -25,6 +25,7 @@ const packages = [_]Package{
     .{ .name = "fd", .version = "10.4.2", .desc = "Simple, fast alternative to find", .url = "https://github.com/sharkdp/fd/releases/download/v10.4.2/fd-v10.4.2-x86_64-pc-windows-msvc.zip", .sha256 = "b2816e506390a89941c63c9187d58a3cc10e9a55f2ef0685f9ea0eccaf7c98c8", .kind = .zip, .bins = &.{"fd.exe"} },
     .{ .name = "bat", .version = "0.26.1", .desc = "cat clone with syntax highlighting", .url = "https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-x86_64-pc-windows-msvc.zip", .sha256 = "0f729b4b6f5f28d395c641eacc2e9ff68d0096b85aa0eec344aa62425144b69b", .kind = .zip, .bins = &.{"bat.exe"} },
     .{ .name = "jq", .version = "1.8.2", .desc = "Command-line JSON processor", .url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe", .sha256 = "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627", .kind = .exe, .bins = &.{"jq.exe"} },
+    .{ .name = "uv", .version = "0.11.24", .desc = "Fast Python package installer and resolver", .url = "https://github.com/astral-sh/uv/releases/download/0.11.24/uv-x86_64-pc-windows-msvc.zip", .sha256 = "af9573a2e36f7020b18ec5fdde20117aae74bbad3f4acb3dc3fc03319f1aa083", .kind = .zip, .bins = &.{ "uv.exe", "uvx.exe" } },
 };
 
 const Dirs = struct { root: []u8, cellar: []u8, bin: []u8, cache: []u8, db: []u8, state: []u8 };
@@ -52,12 +53,22 @@ pub fn main(init: std.process.Init) !void {
         out("PowerShell: [Environment]::SetEnvironmentVariable('Path', $env:Path + ';{s}', 'User')\n", .{dirs.bin});
     } else if (eql(cmd, "search")) {
         if (args.len < 3) die("nb: search query required\n", .{});
-        for (packages) |p| if (containsCaseless(p.name, args[2]) or containsCaseless(p.desc, args[2])) out("{s} {s} — {s}\n", .{ p.name, p.version, p.desc });
+        var matches: usize = 0;
+        for (packages) |p| {
+            if (containsCaseless(p.name, args[2]) or containsCaseless(p.desc, args[2])) {
+                out("{s} {s} — {s}\n", .{ p.name, p.version, p.desc });
+                matches += 1;
+            }
+        }
+        if (matches == 0) out("No packages found for '{s}'.\n", .{args[2]});
     } else if (eql(cmd, "install") or eql(cmd, "i")) {
         if (args.len < 3) die("nb: package required\n", .{});
         const dirs = try getDirs(alloc);
         try ensureDirs(dirs);
-        for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(name) orelse { err("nb: package not found: {s}\n", .{name}); std.process.exit(1); });
+        for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(name) orelse {
+            err("nb: package not found: {s}\n", .{name});
+            std.process.exit(1);
+        });
     } else if (eql(cmd, "remove") or eql(cmd, "rm") or eql(cmd, "uninstall")) {
         if (args.len < 3) die("nb: package required\n", .{});
         const dirs = try getDirs(alloc);
@@ -68,7 +79,10 @@ pub fn main(init: std.process.Init) !void {
     } else if (eql(cmd, "upgrade")) {
         const dirs = try getDirs(alloc);
         if (args.len > 2) {
-            for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(name) orelse { err("nb: package not found: {s}\n", .{name}); std.process.exit(1); });
+            for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(name) orelse {
+                err("nb: package not found: {s}\n", .{name});
+                std.process.exit(1);
+            });
         } else {
             var installed = try readState(alloc, dirs);
             defer installed.deinit(alloc);
@@ -79,6 +93,12 @@ pub fn main(init: std.process.Init) !void {
         out("root: {s}\n", .{dirs.root});
         out("bin:  {s}\n", .{dirs.bin});
         if (pathExists(dirs.bin)) out("  ✓ bin exists\n", .{}) else out("  ✗ bin missing (run nb init)\n", .{});
+        if (pathContains(alloc, dirs.bin)) {
+            out("  ✓ bin is on PATH\n", .{});
+        } else {
+            out("  ! bin is not on PATH for this shell\n", .{});
+            out("    add it with: [Environment]::SetEnvironmentVariable('Path', $env:Path + ';{s}', 'User')\n", .{dirs.bin});
+        }
     } else {
         die("nb: unknown command '{s}'\n", .{cmd});
     }
@@ -148,7 +168,13 @@ fn removePackage(alloc: std.mem.Allocator, dirs: Dirs, name: []const u8) !void {
 const Record = struct { name: []u8, version: []u8 };
 const State = struct {
     items: []Record,
-    pub fn deinit(self: State, alloc: std.mem.Allocator) void { for (self.items) |r| { alloc.free(r.name); alloc.free(r.version); } alloc.free(self.items); }
+    pub fn deinit(self: State, alloc: std.mem.Allocator) void {
+        for (self.items) |r| {
+            alloc.free(r.name);
+            alloc.free(r.version);
+        }
+        alloc.free(self.items);
+    }
 };
 
 fn readState(alloc: std.mem.Allocator, dirs: Dirs) !std.ArrayList(Record) {
@@ -168,16 +194,32 @@ fn readState(alloc: std.mem.Allocator, dirs: Dirs) !std.ArrayList(Record) {
 
 fn recordInstall(alloc: std.mem.Allocator, dirs: Dirs, p: Package) !void {
     var records = try readState(alloc, dirs);
-    defer { for (records.items) |r| { alloc.free(r.name); alloc.free(r.version); } records.deinit(alloc); }
+    defer {
+        for (records.items) |r| {
+            alloc.free(r.name);
+            alloc.free(r.version);
+        }
+        records.deinit(alloc);
+    }
     var found = false;
-    for (records.items) |*r| if (eql(r.name, p.name)) { alloc.free(r.version); r.version = try alloc.dupe(u8, p.version); found = true; };
+    for (records.items) |*r| if (eql(r.name, p.name)) {
+        alloc.free(r.version);
+        r.version = try alloc.dupe(u8, p.version);
+        found = true;
+    };
     if (!found) try records.append(alloc, .{ .name = try alloc.dupe(u8, p.name), .version = try alloc.dupe(u8, p.version) });
     try writeState(alloc, dirs, records.items);
 }
 
 fn removeState(alloc: std.mem.Allocator, dirs: Dirs, name: []const u8) !void {
     var records = try readState(alloc, dirs);
-    defer { for (records.items) |r| { alloc.free(r.name); alloc.free(r.version); } records.deinit(alloc); }
+    defer {
+        for (records.items) |r| {
+            alloc.free(r.name);
+            alloc.free(r.version);
+        }
+        records.deinit(alloc);
+    }
     var kept: std.ArrayList(Record) = .empty;
     defer kept.deinit(alloc);
     for (records.items) |r| if (!eql(r.name, name)) try kept.append(alloc, r);
@@ -195,7 +237,13 @@ fn writeState(alloc: std.mem.Allocator, dirs: Dirs, records: []const Record) !vo
 
 fn listInstalled(alloc: std.mem.Allocator, dirs: Dirs) !void {
     var records = try readState(alloc, dirs);
-    defer { for (records.items) |r| { alloc.free(r.name); alloc.free(r.version); } records.deinit(alloc); }
+    defer {
+        for (records.items) |r| {
+            alloc.free(r.name);
+            alloc.free(r.version);
+        }
+        records.deinit(alloc);
+    }
     for (records.items) |r| out("{s} {s}\n", .{ r.name, r.version });
 }
 
@@ -230,10 +278,21 @@ fn powershell(alloc: std.mem.Allocator, words: []const []const u8) !void {
     }
     const s = try script.toOwnedSlice();
     defer alloc.free(s);
-    const result = std.process.run(std.heap.smp_allocator, io(), .{ .argv = &.{ "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", s }, .stdout_limit = .unlimited, .stderr_limit = .unlimited }) catch |err_| { err("powershell launch failed: {}\n", .{err_}); return error.PowerShellFailed; };
-    defer std.heap.smp_allocator.free(result.stdout); defer std.heap.smp_allocator.free(result.stderr);
-    const ok = switch (result.term) { .exited => |code| code == 0, else => false };
-    if (!ok) { std.Io.File.stdout().writeStreamingAll(io(), result.stdout) catch {}; std.Io.File.stdout().writeStreamingAll(io(), result.stderr) catch {}; return error.PowerShellFailed; }
+    const result = std.process.run(std.heap.smp_allocator, io(), .{ .argv = &.{ "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", s }, .stdout_limit = .unlimited, .stderr_limit = .unlimited }) catch |err_| {
+        err("powershell launch failed: {}\n", .{err_});
+        return error.PowerShellFailed;
+    };
+    defer std.heap.smp_allocator.free(result.stdout);
+    defer std.heap.smp_allocator.free(result.stderr);
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        std.Io.File.stdout().writeStreamingAll(io(), result.stdout) catch {};
+        std.Io.File.stdout().writeStreamingAll(io(), result.stderr) catch {};
+        return error.PowerShellFailed;
+    }
 }
 
 fn findFileRecursive(alloc: std.mem.Allocator, root: []const u8, basename: []const u8) !?[]u8 {
@@ -243,7 +302,12 @@ fn findFileRecursive(alloc: std.mem.Allocator, root: []const u8, basename: []con
     while (try it.next(io())) |e| {
         const p = try join(alloc, &.{ root, e.name });
         if (e.kind == .file and eql(e.name, basename)) return p;
-        if (e.kind == .directory) { if (try findFileRecursive(alloc, p, basename)) |found| { alloc.free(p); return found; } }
+        if (e.kind == .directory) {
+            if (try findFileRecursive(alloc, p, basename)) |found| {
+                alloc.free(p);
+                return found;
+            }
+        }
         alloc.free(p);
     }
     return null;
@@ -262,7 +326,9 @@ fn getDirs(alloc: std.mem.Allocator) !Dirs {
     return .{ .root = root, .cellar = cellar, .bin = bin, .cache = cache, .db = db, .state = state };
 }
 
-fn io() std.Io { return g_io; }
+fn io() std.Io {
+    return g_io;
+}
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max: usize) ![]u8 {
     const file = try std.Io.Dir.openFileAbsolute(io(), path, .{});
@@ -289,17 +355,63 @@ fn getEnvValue(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     return alloc.dupe(u8, std.mem.span(raw));
 }
 
-fn ensureDirs(dirs: Dirs) !void { try std.Io.Dir.cwd().createDirPath(io(), dirs.cellar); try std.Io.Dir.cwd().createDirPath(io(), dirs.bin); try std.Io.Dir.cwd().createDirPath(io(), dirs.cache); try std.Io.Dir.cwd().createDirPath(io(), dirs.db); }
-fn copyFile(src: []const u8, dst: []const u8) !void { try powershell(std.heap.smp_allocator, &.{ "Copy-Item", "-LiteralPath", src, "-Destination", dst, "-Force" }); }
-fn pathExists(path: []const u8) bool { std.Io.Dir.cwd().access(io(), path, .{}) catch return false; return true; }
-fn join(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 { return std.fs.path.join(alloc, parts); }
-fn findPackage(name: []const u8) ?Package { for (packages) |p| if (eql(p.name, name)) return p; return null; }
-fn eql(a: []const u8, b: []const u8) bool { return std.ascii.eqlIgnoreCase(a, b); }
-fn containsCaseless(haystack: []const u8, needle: []const u8) bool { var hb: [256]u8 = undefined; var nb: [128]u8 = undefined; const h = lower(&hb, haystack); const n = lower(&nb, needle); return std.mem.indexOf(u8, h, n) != null; }
-fn lower(buf: []u8, s: []const u8) []const u8 { const n = @min(buf.len, s.len); for (s[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c); return buf[0..n]; }
-fn out(comptime fmt: []const u8, args: anytype) void { const msg = std.fmt.allocPrint(std.heap.smp_allocator, fmt, args) catch return; defer std.heap.smp_allocator.free(msg); std.Io.File.stdout().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), msg) catch {}; }
-fn err(comptime fmt: []const u8, args: anytype) void { const msg = std.fmt.allocPrint(std.heap.smp_allocator, fmt, args) catch return; defer std.heap.smp_allocator.free(msg); std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), msg) catch {}; }
-fn die(comptime fmt: []const u8, args: anytype) noreturn { err(fmt, args); std.process.exit(1); }
+fn ensureDirs(dirs: Dirs) !void {
+    try std.Io.Dir.cwd().createDirPath(io(), dirs.cellar);
+    try std.Io.Dir.cwd().createDirPath(io(), dirs.bin);
+    try std.Io.Dir.cwd().createDirPath(io(), dirs.cache);
+    try std.Io.Dir.cwd().createDirPath(io(), dirs.db);
+}
+fn copyFile(src: []const u8, dst: []const u8) !void {
+    try powershell(std.heap.smp_allocator, &.{ "Copy-Item", "-LiteralPath", src, "-Destination", dst, "-Force" });
+}
+fn pathExists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(io(), path, .{}) catch return false;
+    return true;
+}
+fn join(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    return std.fs.path.join(alloc, parts);
+}
+fn findPackage(name: []const u8) ?Package {
+    for (packages) |p| if (eql(p.name, name)) return p;
+    return null;
+}
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+fn containsCaseless(haystack: []const u8, needle: []const u8) bool {
+    var hb: [256]u8 = undefined;
+    var nb: [128]u8 = undefined;
+    const h = lower(&hb, haystack);
+    const n = lower(&nb, needle);
+    return std.mem.indexOf(u8, h, n) != null;
+}
+fn pathContains(alloc: std.mem.Allocator, bin: []const u8) bool {
+    const path = getEnvValue(alloc, "PATH") catch getEnvValue(alloc, "Path") catch return false;
+    defer alloc.free(path);
+    var it = std.mem.splitScalar(u8, path, ';');
+    while (it.next()) |entry| if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, entry, " \""), bin)) return true;
+    return false;
+}
+
+fn lower(buf: []u8, s: []const u8) []const u8 {
+    const n = @min(buf.len, s.len);
+    for (s[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf[0..n];
+}
+fn out(comptime fmt: []const u8, args: anytype) void {
+    const msg = std.fmt.allocPrint(std.heap.smp_allocator, fmt, args) catch return;
+    defer std.heap.smp_allocator.free(msg);
+    std.Io.File.stdout().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), msg) catch {};
+}
+fn err(comptime fmt: []const u8, args: anytype) void {
+    const msg = std.fmt.allocPrint(std.heap.smp_allocator, fmt, args) catch return;
+    defer std.heap.smp_allocator.free(msg);
+    std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), msg) catch {};
+}
+fn die(comptime fmt: []const u8, args: anytype) noreturn {
+    err(fmt, args);
+    std.process.exit(1);
+}
 
 fn printUsage() void {
     out(
