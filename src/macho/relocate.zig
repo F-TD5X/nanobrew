@@ -257,14 +257,12 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
         // Check for fat binary — use fallback scan
         const magic_be = std.mem.readInt(u32, data[0..4], .big);
         if (magic_be == FAT_MAGIC or magic_be == FAT_CIGAM) {
-            _ = relocateFat(alloc, io, path, data);
-            return true;
+            return relocateFat(alloc, io, path, data);
         }
         return false;
     }
 
-    _ = relocateMachO64(alloc, io, path, data);
-    return true;
+    return relocateMachO64(alloc, io, path, data);
 }
 
 fn relocateMachO64(alloc: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) bool {
