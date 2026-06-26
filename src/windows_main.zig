@@ -60,6 +60,13 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         if (matches == 0) out("No packages found for '{s}'.\n", .{args[2]});
+    } else if (eql(cmd, "info")) {
+        if (args.len < 3) die("nb: package required\n", .{});
+        const dirs = try getDirs(alloc);
+        for (args[2..]) |name| try printPackageInfo(alloc, dirs, findPackage(packages, name) orelse {
+            err("nb: package not found: {s}\n", .{name});
+            std.process.exit(1);
+        });
     } else if (eql(cmd, "install") or eql(cmd, "i")) {
         if (args.len < 3) die("nb: package required\n", .{});
         const dirs = try getDirs(alloc);
@@ -214,6 +221,36 @@ fn freePackages(alloc: std.mem.Allocator, packages: []const Package) void {
 fn freeStringSlice(alloc: std.mem.Allocator, items: []const []const u8) void {
     for (items) |item| alloc.free(item);
     alloc.free(items);
+}
+
+fn printPackageInfo(alloc: std.mem.Allocator, dirs: Dirs, p: Package) !void {
+    out("{s} {s}\n", .{ p.name, p.version });
+    out("  desc:   {s}\n", .{p.desc});
+    out("  kind:   {s}\n", .{@tagName(p.kind)});
+    out("  url:    {s}\n", .{p.url});
+    out("  sha256: {s}\n", .{p.sha256});
+    out("  bins:  ", .{});
+    for (p.bins, 0..) |bin, i| {
+        if (i > 0) out(", ", .{});
+        out("{s}", .{bin});
+    }
+    out("\n", .{});
+
+    var records = try readState(alloc, dirs);
+    defer {
+        for (records.items) |r| {
+            alloc.free(r.name);
+            alloc.free(r.version);
+        }
+        records.deinit(alloc);
+    }
+    for (records.items) |r| {
+        if (eql(r.name, p.name)) {
+            out("  installed: yes ({s})\n", .{r.version});
+            return;
+        }
+    }
+    out("  installed: no\n", .{});
 }
 
 fn installPackage(alloc: std.mem.Allocator, dirs: Dirs, p: Package) !void {
