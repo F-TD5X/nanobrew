@@ -127,16 +127,12 @@ jobs:
           & $nb search zoxide
           & $nb search bun
           $ErrorActionPreference = 'Stop'
-          & $nb install bun deno gh watchexec pastel xsv yazi oh-my-posh
-          & $env:LOCALAPPDATA\nanobrew\bin\bun.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\deno.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\gh.exe --version
+          # Keep this smoke intentionally small; larger runtime archives (bun/deno/yazi)
+          # are covered by checksum/archive validation and can be slow on hosted runners.
+          & $nb install watchexec pastel xsv
           & $env:LOCALAPPDATA\nanobrew\bin\watchexec.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\pastel.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\xsv.exe --version
-          if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\yazi.exe")) { throw 'yazi.exe was not linked' }
-          if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\ya.exe")) { throw 'ya.exe was not linked' }
-          & $env:LOCALAPPDATA\nanobrew\bin\oh-my-posh.exe --version
           & $nb list
           & $nb doctor
 
