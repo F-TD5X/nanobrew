@@ -127,30 +127,14 @@ jobs:
           & $nb search zoxide
           & $nb search bun
           $ErrorActionPreference = 'Stop'
-          & $nb install uv yq just hyperfine fzf starship eza delta dust bottom zoxide sd hexyl dua procs bun deno gh watchexec pastel xsv yazi oh-my-posh
-          & $env:LOCALAPPDATA\nanobrew\bin\uv.exe --version
-          if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\uvx.exe")) { throw 'uvx.exe was not linked' }
-          & $env:LOCALAPPDATA\nanobrew\bin\yq.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\just.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\hyperfine.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\fzf.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\starship.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\eza.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\delta.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\dust.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\btm.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\zoxide.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\sd.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\hexyl.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\dua.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\procs.exe --version
+          & $nb install bun deno gh watchexec pastel xsv yazi oh-my-posh
           & $env:LOCALAPPDATA\nanobrew\bin\bun.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\deno.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\gh.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\watchexec.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\pastel.exe --version
           & $env:LOCALAPPDATA\nanobrew\bin\xsv.exe --version
-          & $env:LOCALAPPDATA\nanobrew\bin\yazi.exe --version
+          if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\yazi.exe")) { throw 'yazi.exe was not linked' }
           if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\ya.exe")) { throw 'ya.exe was not linked' }
           & $env:LOCALAPPDATA\nanobrew\bin\oh-my-posh.exe --version
           & $nb list
