@@ -11,55 +11,18 @@ const VERSION = "0.1.200";
 var g_io: std.Io = undefined;
 
 const Package = struct {
+    const Kind = enum { zip, exe };
+
     name: []const u8,
     version: []const u8,
     desc: []const u8,
     url: []const u8,
     sha256: []const u8,
-    kind: enum { zip, exe },
+    kind: Kind,
     bins: []const []const u8,
 };
 
-const packages = [_]Package{
-    .{ .name = "ripgrep", .version = "15.1.0", .desc = "Fast recursive search tool", .url = "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-pc-windows-msvc.zip", .sha256 = "124510b94b6baa3380d051fdf4650eaa80a302c876d611e9dba0b2e18d87493a", .kind = .zip, .bins = &.{"rg.exe"} },
-    .{ .name = "fd", .version = "10.4.2", .desc = "Simple, fast alternative to find", .url = "https://github.com/sharkdp/fd/releases/download/v10.4.2/fd-v10.4.2-x86_64-pc-windows-msvc.zip", .sha256 = "b2816e506390a89941c63c9187d58a3cc10e9a55f2ef0685f9ea0eccaf7c98c8", .kind = .zip, .bins = &.{"fd.exe"} },
-    .{ .name = "bat", .version = "0.26.1", .desc = "cat clone with syntax highlighting", .url = "https://github.com/sharkdp/bat/releases/download/v0.26.1/bat-v0.26.1-x86_64-pc-windows-msvc.zip", .sha256 = "0f729b4b6f5f28d395c641eacc2e9ff68d0096b85aa0eec344aa62425144b69b", .kind = .zip, .bins = &.{"bat.exe"} },
-    .{ .name = "jq", .version = "1.8.2", .desc = "Command-line JSON processor", .url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe", .sha256 = "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627", .kind = .exe, .bins = &.{"jq.exe"} },
-    .{ .name = "uv", .version = "0.11.24", .desc = "Fast Python package installer and resolver", .url = "https://github.com/astral-sh/uv/releases/download/0.11.24/uv-x86_64-pc-windows-msvc.zip", .sha256 = "af9573a2e36f7020b18ec5fdde20117aae74bbad3f4acb3dc3fc03319f1aa083", .kind = .zip, .bins = &.{ "uv.exe", "uvx.exe" } },
-    .{ .name = "yq", .version = "4.53.3", .desc = "Portable YAML, JSON, XML, CSV and TOML processor", .url = "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_windows_amd64.exe", .sha256 = "e279bc506a452eeafcdf364f91a025455e402a8001169083caf01f4b64a544e2", .kind = .exe, .bins = &.{"yq.exe"} },
-    .{ .name = "just", .version = "1.54.0", .desc = "Command runner", .url = "https://github.com/casey/just/releases/download/1.54.0/just-1.54.0-x86_64-pc-windows-msvc.zip", .sha256 = "860e21474e956eaa9879d62f68cc24530254eefe14ac108eaf707c0daf56a6d0", .kind = .zip, .bins = &.{"just.exe"} },
-    .{ .name = "hyperfine", .version = "1.20.0", .desc = "Command-line benchmarking tool", .url = "https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-x86_64-pc-windows-msvc.zip", .sha256 = "2508c549b049b1d4342d08edc1cb42bfac169082b6e3069431b5bab9822dbb32", .kind = .zip, .bins = &.{"hyperfine.exe"} },
-    .{ .name = "fzf", .version = "0.73.1", .desc = "Command-line fuzzy finder", .url = "https://github.com/junegunn/fzf/releases/download/v0.73.1/fzf-0.73.1-windows_amd64.zip", .sha256 = "521a974dc32e93404265e55bffaf71a59e05e80abdf8ca4afb21a6030dc76f5f", .kind = .zip, .bins = &.{"fzf.exe"} },
-    .{ .name = "starship", .version = "1.25.1", .desc = "Fast cross-shell prompt", .url = "https://github.com/starship/starship/releases/download/v1.25.1/starship-x86_64-pc-windows-msvc.zip", .sha256 = "a07cf3e428afab09324e510fb786041ebcc491a68b1ca6fba044c5a461f9b017", .kind = .zip, .bins = &.{"starship.exe"} },
-    .{ .name = "eza", .version = "0.23.4", .desc = "Modern replacement for ls", .url = "https://github.com/eza-community/eza/releases/download/v0.23.4/eza.exe_x86_64-pc-windows-gnu.zip", .sha256 = "05677fd7c2d1b69ce71df53db74c29f6331ea0b2be5aa3a0fce6976200ee06fc", .kind = .zip, .bins = &.{"eza.exe"} },
-    .{ .name = "delta", .version = "0.19.2", .desc = "Syntax-highlighting pager for git, diff, and grep output", .url = "https://github.com/dandavison/delta/releases/download/0.19.2/delta-0.19.2-x86_64-pc-windows-msvc.zip", .sha256 = "ac8ebb4a9f1cbee8b9ea897ba119808a244181adae6f3bed1f3b6b923c50b557", .kind = .zip, .bins = &.{"delta.exe"} },
-    .{ .name = "dust", .version = "1.2.4", .desc = "More intuitive du", .url = "https://github.com/bootandy/dust/releases/download/v1.2.4/dust-v1.2.4-x86_64-pc-windows-msvc.zip", .sha256 = "eb08d642f016787bb9fc918a4dc5f34665463657fddf83a40f2441cbf020fb4c", .kind = .zip, .bins = &.{"dust.exe"} },
-    .{ .name = "bottom", .version = "0.14.1", .desc = "Graphical process and system monitor", .url = "https://github.com/ClementTsang/bottom/releases/download/0.14.1/bottom_x86_64-pc-windows-msvc.zip", .sha256 = "a67328662f2c7cfbceff19734efefa9d07db4ce146af9e1a03dfdda6f54271d3", .kind = .zip, .bins = &.{"btm.exe"} },
-    .{ .name = "zoxide", .version = "0.9.9", .desc = "Smarter cd command", .url = "https://github.com/ajeetdsouza/zoxide/releases/download/v0.9.9/zoxide-0.9.9-x86_64-pc-windows-msvc.zip", .sha256 = "5af00d0916f05631e3030537289eac56605e7c1733318c4d525c8e847f12496d", .kind = .zip, .bins = &.{"zoxide.exe"} },
-    .{ .name = "sd", .version = "1.1.0", .desc = "Intuitive find and replace CLI", .url = "https://github.com/chmln/sd/releases/download/v1.1.0/sd-v1.1.0-x86_64-pc-windows-msvc.zip", .sha256 = "59837c2e7c911099aca1cc46b663bcdc5a949fd3e9fbbaf34fc73e5d5d71007c", .kind = .zip, .bins = &.{"sd.exe"} },
-    .{ .name = "hexyl", .version = "0.17.0", .desc = "Command-line hex viewer", .url = "https://github.com/sharkdp/hexyl/releases/download/v0.17.0/hexyl-v0.17.0-x86_64-pc-windows-msvc.zip", .sha256 = "ab5c3442cff63f585553d4fce330eaa1ef1bd2584643f1a0e29ab7c13fc9566d", .kind = .zip, .bins = &.{"hexyl.exe"} },
-    .{ .name = "dua", .version = "2.37.0", .desc = "Disk usage analyzer", .url = "https://github.com/Byron/dua-cli/releases/download/v2.37.0/dua-v2.37.0-x86_64-pc-windows-msvc.zip", .sha256 = "e66a99e6139b076f8da4ef269ce5452ef6636dfba66d4495f08ae18ad2c369c3", .kind = .zip, .bins = &.{"dua.exe"} },
-    .{ .name = "procs", .version = "0.14.12", .desc = "Modern replacement for ps", .url = "https://github.com/dalance/procs/releases/download/v0.14.12/procs-v0.14.12-x86_64-windows.zip", .sha256 = "4928c399ae78ee82f99139a5629077b8d90a58599d834584dd4e613cb60c83d0", .kind = .zip, .bins = &.{"procs.exe"} },
-    .{ .name = "bun", .version = "1.3.14", .desc = "Fast JavaScript runtime, bundler, test runner, and package manager", .url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-windows-x64.zip", .sha256 = "0a0620930b6675d7ba440e81f4e0e00d3cfbe096c4b140d3fff02205e9e18922", .kind = .zip, .bins = &.{"bun.exe"} },
-    .{ .name = "deno", .version = "2.9.0", .desc = "Secure JavaScript and TypeScript runtime", .url = "https://github.com/denoland/deno/releases/download/v2.9.0/deno-x86_64-pc-windows-msvc.zip", .sha256 = "37e3a8e5f4ee360d08bbeec9ee07fdcaa9dcd1a39d4aeaac5807354aec557451", .kind = .zip, .bins = &.{"deno.exe"} },
-    .{ .name = "gh", .version = "2.95.0", .desc = "GitHub command-line tool", .url = "https://github.com/cli/cli/releases/download/v2.95.0/gh_2.95.0_windows_amd64.zip", .sha256 = "19a7154161ada9cfaa9e57edb752ecc679b75c391a62e4f7b586eea1df30b5bb", .kind = .zip, .bins = &.{"gh.exe"} },
-    .{ .name = "watchexec", .version = "2.5.1", .desc = "Run commands when files change", .url = "https://github.com/watchexec/watchexec/releases/download/v2.5.1/watchexec-2.5.1-x86_64-pc-windows-msvc.zip", .sha256 = "aa448c2704ca1a37ce0f1fc75381d9a411946dd293cf6236293f549426a577f7", .kind = .zip, .bins = &.{"watchexec.exe"} },
-    .{ .name = "pastel", .version = "0.12.0", .desc = "Command-line color tool", .url = "https://github.com/sharkdp/pastel/releases/download/v0.12.0/pastel-v0.12.0-x86_64-pc-windows-msvc.zip", .sha256 = "51e914b0308b089f032c481e786d67a9f11d8857f4ffe99405f3452e77582393", .kind = .zip, .bins = &.{"pastel.exe"} },
-    .{ .name = "xsv", .version = "0.13.0", .desc = "Fast CSV command-line toolkit", .url = "https://github.com/BurntSushi/xsv/releases/download/0.13.0/xsv-0.13.0-x86_64-pc-windows-msvc.zip", .sha256 = "3e319c08456031a9683c19c998ac9f61756a2e456413db17c8e6819b17818a1a", .kind = .zip, .bins = &.{"xsv.exe"} },
-    .{ .name = "yazi", .version = "26.5.6", .desc = "Terminal file manager", .url = "https://github.com/sxyazi/yazi/releases/download/v26.5.6/yazi-x86_64-pc-windows-msvc.zip", .sha256 = "6c6c52a4b2648e179f917bdaa7c57e793d18561b380a8bfa025f10cd1b9b2ad1", .kind = .zip, .bins = &.{ "yazi.exe", "ya.exe" } },
-    .{ .name = "oh-my-posh", .version = "29.18.0", .desc = "Prompt theme engine for any shell", .url = "https://github.com/JanDeDobbeleer/oh-my-posh/releases/download/v29.18.0/posh-windows-amd64.exe", .sha256 = "9af6f042155a9763b851245a3425e529b2705f3319105eb24ced87bc1334583c", .kind = .exe, .bins = &.{"oh-my-posh.exe"} },
-    .{ .name = "kubectl", .version = "1.36.2", .desc = "Kubernetes command-line tool", .url = "https://dl.k8s.io/release/v1.36.2/bin/windows/amd64/kubectl.exe", .sha256 = "df04d82234b28ffbdcd36e79d596b85da6e9c736e1a7a55ff6910c648ff47af2", .kind = .exe, .bins = &.{"kubectl.exe"} },
-    .{ .name = "terraform", .version = "1.15.7", .desc = "Infrastructure as code CLI", .url = "https://releases.hashicorp.com/terraform/1.15.7/terraform_1.15.7_windows_amd64.zip", .sha256 = "1644891f1d02dea989daed9a39c564ebdc80e13c9a7e42e713fba84d7f53b8f6", .kind = .zip, .bins = &.{"terraform.exe"} },
-    .{ .name = "helm", .version = "4.2.2", .desc = "Kubernetes package manager", .url = "https://get.helm.sh/helm-v4.2.2-windows-amd64.zip", .sha256 = "5fad8562e98c34fa5af3ef904086a5874a6701050f9bf36e30238c975df94dcd", .kind = .zip, .bins = &.{"helm.exe"} },
-    .{ .name = "k9s", .version = "0.51.0", .desc = "Terminal UI for Kubernetes clusters", .url = "https://github.com/derailed/k9s/releases/download/v0.51.0/k9s_Windows_amd64.zip", .sha256 = "bba299f1877913979831543a008f2e104995d2ea4ac8f23d7f49c0444857d973", .kind = .zip, .bins = &.{"k9s.exe"} },
-    .{ .name = "lazygit", .version = "0.62.2", .desc = "Terminal UI for git", .url = "https://github.com/jesseduffield/lazygit/releases/download/v0.62.2/lazygit_0.62.2_windows_x86_64.zip", .sha256 = "805bfcb2445273b77a32b7758dfb5d2d8dbd7b80b7336ab868935584a2fad0ba", .kind = .zip, .bins = &.{"lazygit.exe"} },
-    .{ .name = "lazydocker", .version = "0.25.2", .desc = "Terminal UI for Docker", .url = "https://github.com/jesseduffield/lazydocker/releases/download/v0.25.2/lazydocker_0.25.2_Windows_x86_64.zip", .sha256 = "facae8869c1bf144468191c563002162273a2c2761f052659170530cae3fa8a9", .kind = .zip, .bins = &.{"lazydocker.exe"} },
-    .{ .name = "rclone", .version = "1.74.3", .desc = "Cloud storage sync tool", .url = "https://github.com/rclone/rclone/releases/download/v1.74.3/rclone-v1.74.3-windows-amd64.zip", .sha256 = "ecb0ed9006e0d1a693757007716a11dab6c2cde6dac3f2fd87da962eaa73d11d", .kind = .zip, .bins = &.{"rclone.exe"} },
-    .{ .name = "age", .version = "1.3.1", .desc = "Simple modern file encryption tool", .url = "https://github.com/FiloSottile/age/releases/download/v1.3.1/age-v1.3.1-windows-amd64.zip", .sha256 = "c56e8ce22f7e80cb85ad946cc82d198767b056366201d3e1a2b93d865be38154", .kind = .zip, .bins = &.{ "age.exe", "age-keygen.exe" } },
-    .{ .name = "sops", .version = "3.13.1", .desc = "Editor for encrypted files", .url = "https://github.com/getsops/sops/releases/download/v3.13.1/sops-v3.13.1.amd64.exe", .sha256 = "4654e53fff6d0a1842facd3a0ed5a66a8ab6164004b0ad4ca2d5e2b1c5473b65", .kind = .exe, .bins = &.{"sops.exe"} },
-    .{ .name = "hugo", .version = "0.163.3", .desc = "Fast static site generator", .url = "https://github.com/gohugoio/hugo/releases/download/v0.163.3/hugo_extended_0.163.3_windows-amd64.zip", .sha256 = "10ce84261773a52aa2dabb4f51b9fe86309592248dbeeef093c6b36b1dacf252", .kind = .zip, .bins = &.{"hugo.exe"} },
-    .{ .name = "neovim", .version = "0.12.3", .desc = "Hyperextensible Vim-based text editor", .url = "https://github.com/neovim/neovim/releases/download/v0.12.3/nvim-win64.zip", .sha256 = "63daa0a0374f2255d2fb4c0867fcacc64a09c8d7ec1c349f781aff1b8350a8ad", .kind = .zip, .bins = &.{"nvim.exe"} },
-};
+const embedded_windows_registry = @import("windows_registry").json;
 
 const Dirs = struct { root: []u8, cellar: []u8, bin: []u8, cache: []u8, db: []u8, state: []u8 };
 
@@ -74,6 +37,9 @@ pub fn main(init: std.process.Init) !void {
         printUsage();
         std.process.exit(if (args.len < 2) 1 else 0);
     }
+
+    const registry = try loadRegistry(alloc);
+    const packages = registry.packages;
 
     const cmd = args[1];
     if (eql(cmd, "version")) {
@@ -98,28 +64,28 @@ pub fn main(init: std.process.Init) !void {
         if (args.len < 3) die("nb: package required\n", .{});
         const dirs = try getDirs(alloc);
         try ensureDirs(dirs);
-        for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(name) orelse {
+        for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(packages, name) orelse {
             err("nb: package not found: {s}\n", .{name});
             std.process.exit(1);
         });
     } else if (eql(cmd, "remove") or eql(cmd, "rm") or eql(cmd, "uninstall")) {
         if (args.len < 3) die("nb: package required\n", .{});
         const dirs = try getDirs(alloc);
-        for (args[2..]) |name| try removePackage(alloc, dirs, name);
+        for (args[2..]) |name| try removePackage(alloc, dirs, packages, name);
     } else if (eql(cmd, "list") or eql(cmd, "ls")) {
         const dirs = try getDirs(alloc);
         try listInstalled(alloc, dirs);
     } else if (eql(cmd, "upgrade")) {
         const dirs = try getDirs(alloc);
         if (args.len > 2) {
-            for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(name) orelse {
+            for (args[2..]) |name| try installPackage(alloc, dirs, findPackage(packages, name) orelse {
                 err("nb: package not found: {s}\n", .{name});
                 std.process.exit(1);
             });
         } else {
             var installed = try readState(alloc, dirs);
             defer installed.deinit(alloc);
-            for (installed.items) |rec| if (findPackage(rec.name)) |p| try installPackage(alloc, dirs, p);
+            for (installed.items) |rec| if (findPackage(packages, rec.name)) |p| try installPackage(alloc, dirs, p);
         }
     } else if (eql(cmd, "doctor")) {
         const dirs = try getDirs(alloc);
@@ -135,6 +101,119 @@ pub fn main(init: std.process.Init) !void {
     } else {
         die("nb: unknown command '{s}'\n", .{cmd});
     }
+}
+
+const Registry = struct { packages: []Package };
+
+fn loadRegistry(alloc: std.mem.Allocator) !Registry {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, embedded_windows_registry, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRegistry;
+
+    const root = parsed.value.object;
+    const schema = root.get("schema_version") orelse return error.InvalidRegistry;
+    if (schema != .integer or schema.integer != 1) return error.InvalidRegistry;
+    const pkg_value = root.get("packages") orelse return error.InvalidRegistry;
+    if (pkg_value != .array) return error.InvalidRegistry;
+
+    var out_list: std.ArrayList(Package) = .empty;
+    errdefer freePackages(alloc, out_list.items);
+
+    for (pkg_value.array.items) |item| {
+        const p = try parseRegistryPackage(alloc, item);
+        for (out_list.items) |existing| {
+            if (eql(existing.name, p.name)) return error.DuplicatePackage;
+        }
+        try out_list.append(alloc, p);
+    }
+    if (out_list.items.len == 0) return error.InvalidRegistry;
+    return .{ .packages = try out_list.toOwnedSlice(alloc) };
+}
+
+fn parseRegistryPackage(alloc: std.mem.Allocator, value: std.json.Value) !Package {
+    if (value != .object) return error.InvalidRegistry;
+    const obj = value.object;
+    const name = try dupRegistryString(alloc, obj, "name");
+    errdefer alloc.free(name);
+    const version = try dupRegistryString(alloc, obj, "version");
+    errdefer alloc.free(version);
+    const desc = try dupRegistryString(alloc, obj, "desc");
+    errdefer alloc.free(desc);
+    const url = try dupRegistryString(alloc, obj, "url");
+    errdefer alloc.free(url);
+    const sha256 = try dupRegistryString(alloc, obj, "sha256");
+    errdefer alloc.free(sha256);
+    const kind_raw = try dupRegistryString(alloc, obj, "kind");
+    defer alloc.free(kind_raw);
+    const bins = try parseRegistryBins(alloc, obj);
+    errdefer freeStringSlice(alloc, bins);
+
+    try validatePackageName(name);
+    try validateHttpsUrl(url);
+    try validateSha256(sha256);
+    for (bins) |bin| try validateBinName(bin);
+
+    const kind: Package.Kind = if (std.mem.eql(u8, kind_raw, "zip")) .zip else if (std.mem.eql(u8, kind_raw, "exe")) .exe else return error.InvalidRegistry;
+    if (kind == .exe and bins.len != 1) return error.InvalidRegistry;
+
+    return .{ .name = name, .version = version, .desc = desc, .url = url, .sha256 = sha256, .kind = kind, .bins = bins };
+}
+
+fn parseRegistryBins(alloc: std.mem.Allocator, obj: std.json.ObjectMap) ![]const []const u8 {
+    const value = obj.get("bins") orelse return error.InvalidRegistry;
+    if (value != .array or value.array.items.len == 0) return error.InvalidRegistry;
+    var out_list: std.ArrayList([]const u8) = .empty;
+    errdefer freeStringSlice(alloc, out_list.items);
+    for (value.array.items) |item| {
+        if (item != .string) return error.InvalidRegistry;
+        try out_list.append(alloc, try alloc.dupe(u8, item.string));
+    }
+    return out_list.toOwnedSlice(alloc);
+}
+
+fn dupRegistryString(alloc: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    const value = obj.get(key) orelse return error.InvalidRegistry;
+    if (value != .string or value.string.len == 0) return error.InvalidRegistry;
+    return alloc.dupe(u8, value.string);
+}
+
+fn validatePackageName(name: []const u8) !void {
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.')) return error.InvalidRegistry;
+    }
+}
+
+fn validateHttpsUrl(url: []const u8) !void {
+    if (!std.mem.startsWith(u8, url, "https://")) return error.InvalidRegistry;
+}
+
+fn validateSha256(hex: []const u8) !void {
+    if (hex.len != 64) return error.InvalidRegistry;
+    for (hex) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return error.InvalidRegistry;
+    }
+}
+
+fn validateBinName(bin: []const u8) !void {
+    if (!std.mem.endsWith(u8, bin, ".exe")) return error.InvalidRegistry;
+    if (std.mem.indexOfAny(u8, bin, "\\/") != null) return error.InvalidRegistry;
+    if (std.mem.indexOf(u8, bin, "..") != null) return error.InvalidRegistry;
+}
+
+fn freePackages(alloc: std.mem.Allocator, packages: []const Package) void {
+    for (packages) |p| {
+        alloc.free(p.name);
+        alloc.free(p.version);
+        alloc.free(p.desc);
+        alloc.free(p.url);
+        alloc.free(p.sha256);
+        freeStringSlice(alloc, p.bins);
+    }
+}
+
+fn freeStringSlice(alloc: std.mem.Allocator, items: []const []const u8) void {
+    for (items) |item| alloc.free(item);
+    alloc.free(items);
 }
 
 fn installPackage(alloc: std.mem.Allocator, dirs: Dirs, p: Package) !void {
@@ -184,8 +263,8 @@ fn installPackage(alloc: std.mem.Allocator, dirs: Dirs, p: Package) !void {
     out("==> Installed {s} {s}\n", .{ p.name, p.version });
 }
 
-fn removePackage(alloc: std.mem.Allocator, dirs: Dirs, name: []const u8) !void {
-    const p = findPackage(name);
+fn removePackage(alloc: std.mem.Allocator, dirs: Dirs, packages: []const Package, name: []const u8) !void {
+    const p = findPackage(packages, name);
     if (p) |pkg| for (pkg.bins) |bin| {
         const dst = try join(alloc, &.{ dirs.bin, bin });
         defer alloc.free(dst);
@@ -404,7 +483,7 @@ fn pathExists(path: []const u8) bool {
 fn join(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
     return std.fs.path.join(alloc, parts);
 }
-fn findPackage(name: []const u8) ?Package {
+fn findPackage(packages: []const Package, name: []const u8) ?Package {
     for (packages) |p| if (eql(p.name, name)) return p;
     return null;
 }
