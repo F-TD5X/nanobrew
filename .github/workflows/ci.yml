@@ -123,10 +123,16 @@ jobs:
           & $nb help
           & $nb init
           & $nb search uv
+          & $nb search yq
           $ErrorActionPreference = 'Stop'
-          & $nb install uv
+          & $nb install uv yq just hyperfine fzf starship
           & $env:LOCALAPPDATA\nanobrew\bin\uv.exe --version
           if (!(Test-Path "$env:LOCALAPPDATA\nanobrew\bin\uvx.exe")) { throw 'uvx.exe was not linked' }
+          & $env:LOCALAPPDATA\nanobrew\bin\yq.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\just.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\hyperfine.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\fzf.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\starship.exe --version
           & $nb list
           & $nb doctor
 

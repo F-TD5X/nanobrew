@@ -4,7 +4,7 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
-- **Windows native package set now includes `uv`** — `nb install uv` downloads Astral's verified x86_64 Windows portable archive and links both `uv.exe` and `uvx.exe` into `%LOCALAPPDATA%\nanobrew\bin`.
+- **Windows native package set now includes `uv`, `yq`, `just`, `hyperfine`, `fzf`, and `starship`** — each downloads verified upstream x86_64 Windows portable assets and links executables into `%LOCALAPPDATA%\nanobrew\bin`.
 - **Windows UX polish** — `nb search` reports no-match results clearly and `nb doctor` now tells users whether nanobrew's `bin` directory is on the current PATH.
 
 ## [0.1.200] - 2026-06-25
