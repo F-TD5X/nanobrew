@@ -4,6 +4,21 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
+## [0.1.202] - 2026-07-11
+
+### Performance
+- Read-only inventory commands no longer wait on unrelated update checks, multi-root dependency resolution is batched, dependency frontier membership is O(1), and Linux relocation probes ELF magic before reading full files.
+- Zig 0.17.0-dev builds improve measured `nb list` latency by about 7% on macOS and 10% on Linux while retaining Zig 0.16 test compatibility.
+
+### Fixed
+- Formula upgrades verify and persist the installed version; cask upgrades preserve the working installation until atomic replacement is available. (#348, #349)
+- `nb leaves`, `nb list`, and `nb outdated` exit without a trailing remote update wait. (#350)
+- Homebrew migration ignores `.metadata`, Intel cask update checks use architecture-aware metadata, failed source builds remove empty staged kegs, autotools configure launchers regain executable mode, and pkg-backed casks report actionable elevation and installer errors. (#341, #342, #343, #344, #345, #346)
+- Empty ZSH installed-package completion sets no longer raise an error.
+
+### Build
+- Migrated source and build tooling to Zig 0.17.0-dev.813 while retaining the Zig 0.16 validation path and macOS/Linux/Windows cross-target builds.
+
 ## [0.1.201] - 2026-06-26
 
 ### Added
