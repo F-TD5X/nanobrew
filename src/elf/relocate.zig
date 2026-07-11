@@ -281,6 +281,10 @@ fn relocateLaFiles(io: std.Io, dir_path: []const u8) !void {
     }
 }
 
+fn hasElfMagic(data: []const u8) bool {
+    return data.len >= ELF_MAGIC.len and std.mem.eql(u8, data[0..ELF_MAGIC.len], &ELF_MAGIC);
+}
+
 fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return;
     var file_open = true;
@@ -288,14 +292,20 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
 
     const stat = file.stat(io) catch return;
     if (stat.size < 16 or stat.size > 256 * 1024 * 1024) return;
-    const size: usize = @intCast(stat.size);
 
+    // Most regular files below lib/ are not ELF binaries. Probe the magic
+    // first so they do not incur a full-file allocation and read.
+    var header: [ELF_MAGIC.len]u8 = undefined;
+    const header_n = file.readPositional(io, &.{header[0..]}, 0) catch return;
+    if (!hasElfMagic(header[0..header_n])) return;
+
+    const size: usize = @intCast(stat.size);
     const heap = std.heap.smp_allocator;
     const buf = heap.alloc(u8, size) catch return;
     defer heap.free(buf);
     const read_n = file.readPositionalAll(io, buf, 0) catch return;
     const data = buf[0..read_n];
-    if (data.len < 16 or !std.mem.eql(u8, data[0..4], &ELF_MAGIC)) return;
+    if (data.len < 16 or !hasElfMagic(data)) return;
 
     const has_placeholder = std.mem.indexOf(u8, data, "@@HOMEBREW") != null;
     const has_linuxbrew = std.mem.indexOf(u8, data, LINUXBREW_LITERAL) != null;
@@ -525,6 +535,12 @@ fn detectInterpreter(io: std.Io, path: []const u8) ?[]const u8 {
 }
 
 const testing = std.testing;
+
+test "hasElfMagic identifies only complete ELF headers" {
+    try testing.expect(hasElfMagic(&ELF_MAGIC));
+    try testing.expect(!hasElfMagic("\x7fEL"));
+    try testing.expect(!hasElfMagic("not an ELF file"));
+}
 
 test "rewriteAllInPlace - single occurrence pads with slashes, offsets and length preserved" {
     var buf = "xx@@HOMEBREW_PREFIX@@/lib\x00yy".*;

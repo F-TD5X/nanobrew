@@ -45,6 +45,11 @@ const Command = enum {
     migrate,
 };
 
+fn shouldCheckForUpdate(cmd: Command) bool {
+    // Read-only inventory commands must never acquire unrelated network latency.
+    return cmd != .update and cmd != .list and cmd != .leaves and cmd != .outdated;
+}
+
 const Phase = enum(u8) {
     waiting = 0,
     downloading,
@@ -170,9 +175,9 @@ pub fn main(init: std.process.Init) !void {
         .migrate => runMigrate(alloc),
     }
 
-    // Check for updates (once per day, non-blocking); skip after self-update
-    // to avoid a spurious banner from the stale in-memory VERSION constant.
-    if (cmd != .update) checkForUpdate(alloc);
+    // The best-effort update request must not delay output-only commands.
+    // Self-update also skips it to avoid a stale VERSION banner.
+    if (shouldCheckForUpdate(cmd)) checkForUpdate(alloc);
 
     // Terminate immediately on success. Returning from main lets the Zig
     // runtime tear down the global `std.Io.Threaded` instance, and its
@@ -181,6 +186,14 @@ pub fn main(init: std.process.Init) !void {
     // output is written unbuffered straight to the underlying file, so there
     // is nothing to flush before exit.
     std.process.exit(0);
+}
+
+test "shouldCheckForUpdate skips commands that must exit promptly" {
+    try std.testing.expect(!shouldCheckForUpdate(.update));
+    try std.testing.expect(!shouldCheckForUpdate(.leaves));
+    try std.testing.expect(!shouldCheckForUpdate(.outdated));
+    try std.testing.expect(!shouldCheckForUpdate(.list));
+    try std.testing.expect(shouldCheckForUpdate(.install));
 }
 fn parseCommand(arg: []const u8) ?Command {
     const cmds = .{
@@ -733,17 +746,23 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     var pinned_names: std.ArrayList([]const u8) = .empty;
     defer pinned_names.deinit(alloc);
 
+    var roots: std.ArrayList([]const u8) = .empty;
+    defer roots.deinit(alloc);
     for (formulae.items, 0..) |name, i| {
         if (resolveVersionPin(alloc, &resolver, name)) |base| {
             formulae.items[i] = base;
             pinned_names.append(alloc, base) catch {};
             continue;
         }
-        resolver.resolve(name) catch |err| {
-            stderr.print("nb: failed to resolve '{s}': {}\n", .{ name, err }) catch {};
+        roots.append(alloc, name) catch {
+            stderr.print("nb: failed to queue '{s}' for resolution\n", .{name}) catch {};
             std.process.exit(1);
         };
     }
+    resolver.resolveMany(roots.items) catch |err| {
+        stderr.print("nb: dependency resolution failed: {}\n", .{err}) catch {};
+        std.process.exit(1);
+    };
 
     // Verify all requested formulas were actually found (#68)
     {
@@ -2403,15 +2422,12 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
     // Execute upgrades
     for (upgradeable.items) |pkg| {
         if (pkg.is_cask_pkg) {
-            if (db.findCask(pkg.name)) |record| {
-                nb.cask_installer.removeCask(alloc, g_io, pkg.name, record.version, record.apps, record.binaries) catch |err| {
-                    stderr.print("nb: {s}: remove failed: {}\n", .{ pkg.name, err }) catch {};
-                    continue;
-                };
-                db.recordCaskRemoval(pkg.name, alloc) catch {};
-            }
-            const names_slice: []const []const u8 = &.{pkg.name};
-            runCaskInstall(alloc, names_slice);
+            // A cask cannot currently be staged while its app/binary destinations
+            // are occupied. Never remove the working version first: a metadata or
+            // install failure would leave the user with nothing (#348). Preserve
+            // it until cask installation supports atomic replacement/rollback.
+            stderr.print("nb: {s}: safe cask upgrade is not available yet; keeping {s}\n", .{ pkg.name, pkg.old_ver }) catch {};
+            continue;
         } else {
             // Install new keg first; remove old tree only after upgrade succeeds (#153).
             const old_keg = db.findKeg(pkg.name);
@@ -2428,10 +2444,26 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
                     }
                     break :blk false;
                 };
-                if (upgraded) {
-                    nb.linker.unlinkKeg(pkg.name, keg.version) catch {};
-                    nb.cellar.remove(pkg.name, keg.version) catch {};
+                if (!upgraded) {
+                    stderr.print("nb: {s}: upgrade did not install {s}; keeping {s}\n", .{ pkg.name, pkg.new_ver, keg.version }) catch {};
+                    continue;
                 }
+
+                // runInstall uses its own Database instance. Keep this outer
+                // instance in sync too, otherwise its stale version remains in
+                // memory for the rest of a multi-package upgrade (#349).
+                const actual_new = installed_new.?;
+                const old_sha = alloc.dupe(u8, keg.sha256) catch {
+                    stderr.print("nb: {s}: could not update installed state\n", .{pkg.name}) catch {};
+                    continue;
+                };
+                defer alloc.free(old_sha);
+                nb.linker.unlinkKeg(pkg.name, keg.version) catch {};
+                nb.cellar.remove(pkg.name, keg.version) catch {};
+                db.recordInstall(pkg.name, actual_new, old_sha) catch |err| {
+                    stderr.print("nb: {s}: failed to record upgraded version: {}\n", .{ pkg.name, err }) catch {};
+                    continue;
+                };
             }
         }
         stdout.print("==> Upgraded {s} ({s} -> {s})\n", .{ pkg.name, pkg.old_ver, pkg.new_ver }) catch {};
