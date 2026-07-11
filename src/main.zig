@@ -1316,6 +1316,12 @@ fn fullInstallOne(
         // Source build path: download + compile from source
         phase.store(@intFromEnum(Phase.downloading), .release);
         nb.source_builder.buildFromSource(alloc, g_io, f) catch |err| {
+            // Source builds create the keg directory before invoking the build.
+            // Remove that staging directory on failure so DB healing cannot
+            // mistake an empty payload for a completed install (#345).
+            var failed_ver_buf: [256]u8 = undefined;
+            const failed_ver = f.effectiveVersion(&failed_ver_buf);
+            nb.cellar.remove(f.name, failed_ver) catch {};
             stderr.print("nb: {s}: source build failed: {}\n", .{ f.name, err }) catch {};
             fail_reason.* = "source build failed";
             had_error.store(true, .release);
@@ -2194,7 +2200,10 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
             if (item.is_cask) want_cask = true else want_formula = true;
         }
         if (want_formula) formula_index = nb.bulk_versions.loadFormulaIndex(alloc) catch null;
-        if (want_cask) cask_index = nb.bulk_versions.loadCaskIndex(alloc) catch null;
+        // The bulk cask list exposes a single top-level version that can be
+        // the arm64 variant. Intel must use per-cask parsing so architecture
+        // conditionals select an actually installable version (#342).
+        if (want_cask and builtin.cpu.arch != .x86_64) cask_index = nb.bulk_versions.loadCaskIndex(alloc) catch null;
     }
 
     // Parallel version check — each thread gets its own HTTP client
@@ -4500,7 +4509,7 @@ fn runCompletions(args: []const []const u8) void {
             \\_nb_installed() {{
             \\  local -a pkgs
             \\  pkgs=(${{(f)"$(nb list 2>/dev/null | awk '{{print $1}}')" }})
-            \\  _describe 'installed package' pkgs
+            \\  (( ${{#pkgs}} )) && _describe 'installed package' pkgs
             \\}}
             \\
             \\compdef _nb nb
@@ -5521,7 +5530,7 @@ fn runMigrate(alloc: std.mem.Allocator) void {
 
             var ver_iter = formula_dir.iterate();
             while (ver_iter.next(g_io) catch null) |ver_entry| {
-                if (ver_entry.kind != .directory) continue;
+                if (ver_entry.kind != .directory or ver_entry.name.len == 0 or ver_entry.name[0] == '.') continue;
                 const version = ver_entry.name;
 
                 db.recordInstall(name, version, "") catch {
@@ -5550,7 +5559,7 @@ fn runMigrate(alloc: std.mem.Allocator) void {
 
             var ver_iter = cask_dir.iterate();
             while (ver_iter.next(g_io) catch null) |ver_entry| {
-                if (ver_entry.kind != .directory) continue;
+                if (ver_entry.kind != .directory or ver_entry.name.len == 0 or ver_entry.name[0] == '.') continue;
                 const version = ver_entry.name;
 
                 const empty_apps: []const []const u8 = &.{};
