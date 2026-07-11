@@ -274,7 +274,7 @@ test "findFirst - basic" {
 
 test "findFirst - long string" {
     const S = ByteScanner(16);
-    const hay = "a" ** 100 ++ "X" ++ "b" ** 100;
+    const hay = @as([100]u8, @splat('a')) ++ "X" ++ @as([100]u8, @splat('b'));
     try std.testing.expectEqual(@as(?usize, 100), S.findFirst(hay, 'X'));
 }
 
