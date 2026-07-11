@@ -47,6 +47,11 @@ const Command = enum {
     migrate,
 };
 
+fn shouldCheckForUpdate(cmd: Command) bool {
+    // Read-only inventory commands must never acquire unrelated network latency.
+    return cmd != .update and cmd != .list and cmd != .leaves and cmd != .outdated;
+}
+
 const Phase = enum(u8) {
     waiting = 0,
     downloading,
@@ -174,9 +179,9 @@ pub fn main(init: std.process.Init) !void {
         .migrate => runMigrate(alloc),
     }
 
-    // Check for updates (once per day, non-blocking); skip after self-update
-    // to avoid a spurious banner from the stale in-memory VERSION constant.
-    if (cmd != .update) checkForUpdate(alloc);
+    // The best-effort update request must not delay output-only commands.
+    // Self-update also skips it to avoid a stale VERSION banner.
+    if (shouldCheckForUpdate(cmd)) checkForUpdate(alloc);
 
     // Terminate immediately on success. Returning from main lets the Zig
     // runtime tear down the global `std.Io.Threaded` instance, and its
@@ -185,6 +190,14 @@ pub fn main(init: std.process.Init) !void {
     // output is written unbuffered straight to the underlying file, so there
     // is nothing to flush before exit.
     std.process.exit(0);
+}
+
+test "shouldCheckForUpdate skips commands that must exit promptly" {
+    try std.testing.expect(!shouldCheckForUpdate(.update));
+    try std.testing.expect(!shouldCheckForUpdate(.leaves));
+    try std.testing.expect(!shouldCheckForUpdate(.outdated));
+    try std.testing.expect(!shouldCheckForUpdate(.list));
+    try std.testing.expect(shouldCheckForUpdate(.install));
 }
 fn parseCommand(arg: []const u8) ?Command {
     const cmds = .{
@@ -739,17 +752,23 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     var pinned_names: std.ArrayList([]const u8) = .empty;
     defer pinned_names.deinit(alloc);
 
+    var roots: std.ArrayList([]const u8) = .empty;
+    defer roots.deinit(alloc);
     for (formulae.items, 0..) |name, i| {
         if (resolveVersionPin(alloc, &resolver, name)) |base| {
             formulae.items[i] = base;
             pinned_names.append(alloc, base) catch {};
             continue;
         }
-        resolver.resolve(name) catch |err| {
-            stderr.print("nb: failed to resolve '{s}': {}\n", .{ name, err }) catch {};
+        roots.append(alloc, name) catch {
+            stderr.print("nb: failed to queue '{s}' for resolution\n", .{name}) catch {};
             std.process.exit(1);
         };
     }
+    resolver.resolveMany(roots.items) catch |err| {
+        stderr.print("nb: dependency resolution failed: {}\n", .{err}) catch {};
+        std.process.exit(1);
+    };
 
     // Verify all requested formulas were actually found (#68)
     {
@@ -1303,6 +1322,12 @@ fn fullInstallOne(
         // Source build path: download + compile from source
         phase.store(@intFromEnum(Phase.downloading), .release);
         nb.source_builder.buildFromSource(alloc, g_io, f) catch |err| {
+            // Source builds create the keg directory before invoking the build.
+            // Remove that staging directory on failure so DB healing cannot
+            // mistake an empty payload for a completed install (#345).
+            var failed_ver_buf: [256]u8 = undefined;
+            const failed_ver = f.effectiveVersion(&failed_ver_buf);
+            nb.cellar.remove(f.name, failed_ver) catch {};
             stderr.print("nb: {s}: source build failed: {}\n", .{ f.name, err }) catch {};
             fail_reason.* = "source build failed";
             had_error.store(true, .release);
@@ -2373,7 +2398,10 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
             if (item.is_cask) want_cask = true else want_formula = true;
         }
         if (want_formula) formula_index = nb.bulk_versions.loadFormulaIndex(alloc) catch null;
-        if (want_cask) cask_index = nb.bulk_versions.loadCaskIndex(alloc) catch null;
+        // The bulk cask list exposes a single top-level version that can be
+        // the arm64 variant. Intel must use per-cask parsing so architecture
+        // conditionals select an actually installable version (#342).
+        if (want_cask and builtin.cpu.arch != .x86_64) cask_index = nb.bulk_versions.loadCaskIndex(alloc) catch null;
     }
 
     // Parallel version check — each thread gets its own HTTP client
@@ -2601,15 +2629,12 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
     // Execute upgrades
     for (upgradeable.items) |pkg| {
         if (pkg.is_cask_pkg) {
-            if (db.findCask(pkg.name)) |record| {
-                nb.cask_installer.removeCask(alloc, g_io, pkg.name, record.version, record.apps, record.binaries) catch |err| {
-                    stderr.print("nb: {s}: remove failed: {}\n", .{ pkg.name, err }) catch {};
-                    continue;
-                };
-                db.recordCaskRemoval(pkg.name, alloc) catch {};
-            }
-            const names_slice: []const []const u8 = &.{pkg.name};
-            runCaskInstall(alloc, names_slice);
+            // A cask cannot currently be staged while its app/binary destinations
+            // are occupied. Never remove the working version first: a metadata or
+            // install failure would leave the user with nothing (#348). Preserve
+            // it until cask installation supports atomic replacement/rollback.
+            stderr.print("nb: {s}: safe cask upgrade is not available yet; keeping {s}\n", .{ pkg.name, pkg.old_ver }) catch {};
+            continue;
         } else {
             // Install new keg first; remove old tree only after upgrade succeeds (#153).
             const old_keg = db.findKeg(pkg.name);
@@ -2626,10 +2651,26 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
                     }
                     break :blk false;
                 };
-                if (upgraded) {
-                    nb.linker.unlinkKeg(pkg.name, keg.version) catch {};
-                    nb.cellar.remove(pkg.name, keg.version) catch {};
+                if (!upgraded) {
+                    stderr.print("nb: {s}: upgrade did not install {s}; keeping {s}\n", .{ pkg.name, pkg.new_ver, keg.version }) catch {};
+                    continue;
                 }
+
+                // runInstall uses its own Database instance. Keep this outer
+                // instance in sync too, otherwise its stale version remains in
+                // memory for the rest of a multi-package upgrade (#349).
+                const actual_new = installed_new.?;
+                const old_sha = alloc.dupe(u8, keg.sha256) catch {
+                    stderr.print("nb: {s}: could not update installed state\n", .{pkg.name}) catch {};
+                    continue;
+                };
+                defer alloc.free(old_sha);
+                nb.linker.unlinkKeg(pkg.name, keg.version) catch {};
+                nb.cellar.remove(pkg.name, keg.version) catch {};
+                db.recordInstall(pkg.name, actual_new, old_sha) catch |err| {
+                    stderr.print("nb: {s}: failed to record upgraded version: {}\n", .{ pkg.name, err }) catch {};
+                    continue;
+                };
             }
         }
         stdout.print("==> Upgraded {s} ({s} -> {s})\n", .{ pkg.name, pkg.old_ver, pkg.new_ver }) catch {};
@@ -3367,6 +3408,123 @@ fn printUsage() void {
 // ── nb doctor ──
 
 // ── nb doctor ──
+
+// ── Legacy post-install probe (#317) ───────────────────────────────────────────────
+// "Does it actually work?" — run each of a keg's binaries and assert it loads
+// and executes. This catches the #324-class failure where a bottle is placed
+// but its interpreter or shared libraries are missing, so the binary exists yet
+// can't run. Cheap and uniform; no per-package scripting.
+
+/// Run `<bin> <flag>` with stdio discarded and a 2s hard timeout. Returns the
+/// exit code, or null on spawn failure / timeout / death by signal.
+fn probeRunFlag(alloc: std.mem.Allocator, bin_path: []const u8, flag: []const u8) ?u8 {
+    const result = std.process.run(alloc, g_io, .{
+        .argv = &.{ bin_path, flag },
+        // Hard timeout: std.process.run kills the child and errors if it hasn't
+        // exited, so a binary that hangs on `--version` can't wedge the probe.
+        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(2), .clock = .awake } },
+    }) catch return null;
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code,
+        else => null,
+    };
+}
+
+/// "Loads and runs": run the binary with `--version`, then `version`, then
+/// `--help` (cheap ways to make it execute and exit quickly). The probe asserts
+/// the binary *executes*, not its CLI semantics — so any clean exit counts as a
+/// pass, EXCEPT the exec/loader-failure codes 126/127 (e.g. a missing perl
+/// interpreter or `libcrypt.so.2`, the #324 class), death by signal, a spawn
+/// failure, or a timeout (all surface as null / a load-failure code). This
+/// avoids false-flagging working tools that require args and exit with a usage
+/// code like 22/64 on `--version`.
+fn probeBinaryRuns(alloc: std.mem.Allocator, bin_path: []const u8) bool {
+    const flags = [_][]const u8{ "--version", "version", "--help" };
+    for (flags) |flag| {
+        if (probeRunFlag(alloc, bin_path, flag)) |code| {
+            if (code != 126 and code != 127) return true;
+        }
+    }
+    return false;
+}
+
+/// Probe one installed keg: its Cellar dir exists and every binary in the keg's
+/// `bin/` runs. Returns true on pass; prints a one-line verdict.
+fn probeKeg(alloc: std.mem.Allocator, stdout: StdoutWriter, name: []const u8, version: []const u8) bool {
+    if (!kegHasBackingCellar(name, version)) {
+        stdout.print("  ✗ {s} {s}: no Cellar directory (phantom DB entry)\n", .{ name, version }) catch {};
+        return false;
+    }
+    var bin_buf: [768]u8 = undefined;
+    const bin_dir = std.fmt.bufPrint(&bin_buf, "{s}/Cellar/{s}/{s}/bin", .{ PREFIX, name, version }) catch return false;
+    var dir = std.Io.Dir.openDirAbsolute(g_io, bin_dir, .{ .iterate = true }) catch {
+        // No bin/ — a library-only keg. DB + Cellar present, nothing to run.
+        stdout.print("  ✓ {s} {s}: installed (no binaries)\n", .{ name, version }) catch {};
+        return true;
+    };
+    defer dir.close(g_io);
+    var iter = dir.iterate();
+    var checked: usize = 0;
+    var bad_buf: [256]u8 = undefined;
+    var bad: ?[]const u8 = null;
+    while (iter.next(g_io) catch null) |entry| {
+        if (entry.kind == .directory) continue;
+        var path_buf: [1024]u8 = undefined;
+        const bin_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ bin_dir, entry.name }) catch continue;
+        checked += 1;
+        if (!probeBinaryRuns(alloc, bin_path)) {
+            bad = std.fmt.bufPrint(&bad_buf, "{s}", .{entry.name}) catch entry.name;
+            break;
+        }
+    }
+    if (bad) |b| {
+        stdout.print("  ✗ {s} {s}: '{s}' did not run (missing interpreter or libraries?)\n", .{ name, version, b }) catch {};
+        return false;
+    }
+    stdout.print("  ✓ {s} {s}: {d} binar{s} run\n", .{ name, version, checked, if (checked == 1) @as([]const u8, "y") else "ies" }) catch {};
+    return true;
+}
+
+/// `nb doctor --probe [pkg]` — run the post-install probe over every installed
+/// keg (or just `pkg`). A later phase runs this automatically on install (#317);
+/// for now it's an on-demand "is it actually working?" diagnostic.
+fn runProbe(alloc: std.mem.Allocator, only: ?[]const u8) void {
+    const stdout = StdoutWriter{};
+    const stderr = StderrWriter{};
+    stdout.print("==> Probing installed packages (does each binary run?)...\n", .{}) catch {};
+
+    var db = nb.database.Database.open(alloc) catch {
+        stderr.print("nb: could not open database\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer db.close();
+
+    const kegs = db.listInstalled(alloc) catch &.{};
+    defer if (kegs.len > 0) alloc.free(kegs);
+
+    var probed: usize = 0;
+    var failed: usize = 0;
+    for (kegs) |keg| {
+        if (only) |o| {
+            if (!std.mem.eql(u8, keg.name, o)) continue;
+        }
+        probed += 1;
+        if (!probeKeg(alloc, stdout, keg.name, keg.version)) failed += 1;
+    }
+
+    if (only != null and probed == 0) {
+        stderr.print("nb: '{s}' is not installed\n", .{only.?}) catch {};
+        std.process.exit(1);
+    }
+    if (failed > 0) {
+        stdout.print("==> Probe: {d}/{d} package(s) failed\n", .{ failed, probed }) catch {};
+        std.process.exit(1);
+    } else {
+        stdout.print("==> Probe: all {d} package(s) OK\n", .{probed}) catch {};
+    }
+}
 
 fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
     const stdout = StdoutWriter{};
@@ -4711,7 +4869,7 @@ fn runCompletions(args: []const []const u8) void {
             \\_nb_installed() {{
             \\  local -a pkgs
             \\  pkgs=(${{(f)"$(nb list 2>/dev/null | awk '{{print $1}}')" }})
-            \\  _describe 'installed package' pkgs
+            \\  (( ${{#pkgs}} )) && _describe 'installed package' pkgs
             \\}}
             \\
             \\compdef _nb nb
@@ -5734,7 +5892,7 @@ fn runMigrate(alloc: std.mem.Allocator) void {
 
             var ver_iter = formula_dir.iterate();
             while (ver_iter.next(g_io) catch null) |ver_entry| {
-                if (ver_entry.kind != .directory) continue;
+                if (ver_entry.kind != .directory or ver_entry.name.len == 0 or ver_entry.name[0] == '.') continue;
                 const version = ver_entry.name;
 
                 db.recordInstall(name, version, "") catch {
@@ -5763,7 +5921,7 @@ fn runMigrate(alloc: std.mem.Allocator) void {
 
             var ver_iter = cask_dir.iterate();
             while (ver_iter.next(g_io) catch null) |ver_entry| {
-                if (ver_entry.kind != .directory) continue;
+                if (ver_entry.kind != .directory or ver_entry.name.len == 0 or ver_entry.name[0] == '.') continue;
                 const version = ver_entry.name;
 
                 const empty_apps: []const []const u8 = &.{};

@@ -281,6 +281,10 @@ fn relocateLaFiles(io: std.Io, dir_path: []const u8) !void {
     }
 }
 
+fn hasElfMagic(data: []const u8) bool {
+    return data.len >= ELF_MAGIC.len and std.mem.eql(u8, data[0..ELF_MAGIC.len], &ELF_MAGIC);
+}
+
 fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return;
     var file_open = true;
@@ -288,14 +292,20 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
 
     const stat = file.stat(io) catch return;
     if (stat.size < 16 or stat.size > 256 * 1024 * 1024) return;
-    const size: usize = @intCast(stat.size);
 
+    // Most regular files below lib/ are not ELF binaries. Probe the magic
+    // first so they do not incur a full-file allocation and read.
+    var header: [ELF_MAGIC.len]u8 = undefined;
+    const header_n = file.readPositional(io, &.{header[0..]}, 0) catch return;
+    if (!hasElfMagic(header[0..header_n])) return;
+
+    const size: usize = @intCast(stat.size);
     const heap = std.heap.smp_allocator;
     const buf = heap.alloc(u8, size) catch return;
     defer heap.free(buf);
     const read_n = file.readPositionalAll(io, buf, 0) catch return;
     const data = buf[0..read_n];
-    if (data.len < 16 or !std.mem.eql(u8, data[0..4], &ELF_MAGIC)) return;
+    if (data.len < 16 or !hasElfMagic(data)) return;
 
     const has_placeholder = std.mem.indexOf(u8, data, "@@HOMEBREW") != null;
     const has_linuxbrew = std.mem.indexOf(u8, data, LINUXBREW_LITERAL) != null;
@@ -526,12 +536,18 @@ fn detectInterpreter(io: std.Io, path: []const u8) ?[]const u8 {
 
 const testing = std.testing;
 
+test "hasElfMagic identifies only complete ELF headers" {
+    try testing.expect(hasElfMagic(&ELF_MAGIC));
+    try testing.expect(!hasElfMagic("\x7fEL"));
+    try testing.expect(!hasElfMagic("not an ELF file"));
+}
+
 test "rewriteAllInPlace - single occurrence pads with slashes, offsets and length preserved" {
     var buf = "xx@@HOMEBREW_PREFIX@@/lib\x00yy".*;
     rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
     // Replacement + '/'-padding + untouched tail: same strlen as the original,
     // NUL in its original position, trailing bytes untouched.
-    const expected = "/opt/nb" ++ "/" ** 12 ++ "/lib";
+    const expected = "/opt/nb" ++ @as([12]u8, @splat('/')) ++ "/lib";
     try testing.expectEqualStrings(expected, std.mem.sliceTo(buf[2..], 0));
     try testing.expectEqual(@as(u8, 0), buf[2 + expected.len]);
     try testing.expectEqual(@as(u8, 'y'), buf[buf.len - 2]);
@@ -542,7 +558,7 @@ test "rewriteAllInPlace - two placeholders inside one colon-separated rpath stri
     var buf = "@@HOMEBREW_CELLAR@@/x265/4.0/lib:@@HOMEBREW_PREFIX@@/lib\x00tail".*;
     rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
     rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
-    const expected = "/opt/nb/Cellar" ++ "/" ** 5 ++ "/x265/4.0/lib:/opt/nb" ++ "/" ** 12 ++ "/lib";
+    const expected = "/opt/nb/Cellar" ++ @as([5]u8, @splat('/')) ++ "/x265/4.0/lib:/opt/nb" ++ @as([12]u8, @splat('/')) ++ "/lib";
     try testing.expectEqualStrings(expected, std.mem.sliceTo(&buf, 0));
     // bytes after the original string's NUL are untouched
     try testing.expectEqualStrings("tail", buf[buf.len - 4 ..]);
@@ -551,7 +567,7 @@ test "rewriteAllInPlace - two placeholders inside one colon-separated rpath stri
 test "rewriteAllInPlace - linuxbrew literal pads at the path boundary" {
     var buf = "a/home/linuxbrew/.linuxbrew/lib\x00".*;
     rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
-    try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ "/" ** 7 ++ "lib", std.mem.sliceTo(buf[1..], 0));
+    try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ @as([7]u8, @splat('/')) ++ "lib", std.mem.sliceTo(buf[1..], 0));
 }
 
 test "rewriteAllInPlace - no NULs inside the rewritten string (perl @INC regression)" {
@@ -562,7 +578,7 @@ test "rewriteAllInPlace - no NULs inside the rewritten string (perl @INC regress
     rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
     const extent = buf[0 .. buf.len - 1]; // original string, original length
     try testing.expect(std.mem.indexOfScalar(u8, extent, 0) == null);
-    try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ "/" ** 7 ++ "lib/perl5/site_perl/5.42.2", extent);
+    try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ @as([7]u8, @splat('/')) ++ "lib/perl5/site_perl/5.42.2", extent);
 }
 
 test "fixInterpreterInPlace - swaps missing /opt/nb interpreter for system loader" {
@@ -573,7 +589,7 @@ test "fixInterpreterInPlace - swaps missing /opt/nb interpreter for system loade
     const phdr_size = 56;
     const interp_off = ehdr_size + phdr_size;
     const interp_sz = interp.len + 8; // room for NUL + padding
-    var img = [_]u8{0} ** (ehdr_size + phdr_size + interp_sz);
+    var img: [ehdr_size + phdr_size + interp_sz]u8 = @splat(0);
 
     @memcpy(img[0..4], &ELF_MAGIC);
     img[4] = 2; // ELFCLASS64
@@ -600,7 +616,7 @@ test "fixInterpreterInPlace - leaves existing system interpreter alone" {
     const phdr_size = 56;
     const interp_off = ehdr_size + phdr_size;
     const interp_sz = interp.len + 1;
-    var img = [_]u8{0} ** (ehdr_size + phdr_size + interp_sz);
+    var img: [ehdr_size + phdr_size + interp_sz]u8 = @splat(0);
 
     @memcpy(img[0..4], &ELF_MAGIC);
     img[4] = 2;

@@ -432,23 +432,41 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
                     clearQuarantineIfPresent(alloc, lib_io, pkg_path, false);
                 }
 
-                const result = std.process.run(alloc, lib_io, .{
-                    .argv = &.{ "sudo", "installer", "-pkg", pkg_path, "-target", "/" },
-                }) catch {
-                    var _b: [512]u8 = undefined;
-                    const _m = std.fmt.bufPrint(&_b, "nb: pkg install failed for {s}\n", .{pkg_name}) catch "nb: pkg install failed\n";
+                if (std.c.geteuid() != 0) {
+                    var _b: [768]u8 = undefined;
+                    const _m = std.fmt.bufPrint(&_b, "nb: {s} requires elevated privileges; rerun with: sudo nb install --cask {s}\n", .{ pkg_name, cask.token }) catch "nb: this pkg cask requires elevated privileges; rerun with sudo\n";
                     std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    any_artifact_failed = true;
+                    continue;
+                }
+
+                const result = std.process.run(alloc, lib_io, .{
+                    .argv = &.{ "/usr/sbin/installer", "-pkg", pkg_path, "-target", "/" },
+                    .stdout_limit = .limited(64 * 1024),
+                    .stderr_limit = .limited(64 * 1024),
+                }) catch |err| {
+                    var _b: [512]u8 = undefined;
+                    const _m = std.fmt.bufPrint(&_b, "nb: could not launch installer for {s}: {}\n", .{ pkg_name, err }) catch "nb: could not launch pkg installer\n";
+                    std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    any_artifact_failed = true;
                     continue;
                 };
-                alloc.free(result.stdout);
-                alloc.free(result.stderr);
+                defer alloc.free(result.stdout);
+                defer alloc.free(result.stderr);
                 if (switch (result.term) {
                     .exited => |c| c != 0,
                     else => true,
                 }) {
                     var _b: [512]u8 = undefined;
-                    const _m = std.fmt.bufPrint(&_b, "nb: installer failed for {s}\n", .{pkg_name}) catch "nb: installer failed\n";
+                    const _m = std.fmt.bufPrint(&_b, "nb: installer failed for {s} ({})\n", .{ pkg_name, result.term }) catch "nb: installer failed\n";
                     std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    if (result.stderr.len > 0) {
+                        std.Io.File.stderr().writeStreamingAll(lib_io, result.stderr) catch {};
+                        std.Io.File.stderr().writeStreamingAll(lib_io, "\n") catch {};
+                    } else if (result.stdout.len > 0) {
+                        std.Io.File.stderr().writeStreamingAll(lib_io, result.stdout) catch {};
+                        std.Io.File.stderr().writeStreamingAll(lib_io, "\n") catch {};
+                    }
                     any_artifact_failed = true;
                 }
             },

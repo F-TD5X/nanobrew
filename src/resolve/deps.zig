@@ -39,12 +39,23 @@ pub const DepResolver = struct {
     /// Each BFS level fetches all unknown deps in parallel.
     /// Shares one HTTP client across all fetches for TLS connection reuse.
     pub fn resolve(self: *DepResolver, name: []const u8) !void {
-        if (self.formulae.contains(name) or self.formulae.contains(tapShortName(name))) return;
+        return self.resolveMany(&.{name});
+    }
 
-        // Seed the frontier with the requested name
+    /// Resolve multiple independent roots in one BFS. This exposes root metadata
+    /// fetches to the existing worker pool instead of resolving CLI arguments
+    /// serially, and deduplicates shared roots/dependencies before any I/O.
+    pub fn resolveMany(self: *DepResolver, names: []const []const u8) !void {
         var frontier: std.ArrayList([]const u8) = .empty;
         defer frontier.deinit(self.alloc);
-        try frontier.append(self.alloc, name);
+        // Membership set makes root and next-level deduplication O(1).
+        var queued_names = std.StringHashMap(void).init(self.alloc);
+        defer queued_names.deinit();
+        for (names) |name| {
+            if (self.formulae.contains(name) or self.formulae.contains(tapShortName(name))) continue;
+            const gop = try queued_names.getOrPut(name);
+            if (!gop.found_existing) try frontier.append(self.alloc, name);
+        }
 
         const client_ptr: ?*std.http.Client = if (self.client != null) &self.client.? else null;
         // BFS: each iteration fetches all frontier names in parallel
@@ -112,8 +123,9 @@ pub const DepResolver = struct {
                 }
             }
 
-            // Collect results, discover next frontier
+            // Collect results, discover next frontier.
             frontier.clearRetainingCapacity();
+            queued_names.clearRetainingCapacity();
             for (results) |maybe_f| {
                 const f = maybe_f orelse continue;
                 if (self.formulae.contains(f.name)) {
@@ -127,16 +139,12 @@ pub const DepResolver = struct {
                 // Queue any unseen deps for next BFS level
                 for (f.dependencies) |dep| {
                     if (!self.formulae.contains(dep)) {
-                        // Avoid duplicates in frontier
-                        var already_queued = false;
-                        for (frontier.items) |queued| {
-                            if (std.mem.eql(u8, queued, dep)) {
-                                already_queued = true;
-                                break;
-                            }
-                        }
-                        if (!already_queued) {
-                            frontier.append(self.alloc, dep) catch continue;
+                        const gop = queued_names.getOrPut(dep) catch continue;
+                        if (!gop.found_existing) {
+                            frontier.append(self.alloc, dep) catch {
+                                _ = queued_names.remove(dep);
+                                continue;
+                            };
                         }
                     }
                 }

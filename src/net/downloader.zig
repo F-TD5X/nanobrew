@@ -359,12 +359,21 @@ fn fetchGhcrTokenUncached(alloc: std.mem.Allocator, client: *std.http.Client, re
 fn readCachedToken(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
     const _lio = paths.safe_io;
     const file = std.Io.Dir.openFileAbsolute(_lio, path, .{}) catch return null;
-    const stat = file.stat(_lio) catch { file.close(_lio); return null; };
+    const stat = file.stat(_lio) catch {
+        file.close(_lio);
+        return null;
+    };
     const now_ns = std.Io.Timestamp.now(_lio, .real).nanoseconds;
     const age_ns = now_ns - stat.mtime.nanoseconds;
-    if (age_ns > 240 * std.time.ns_per_s) { file.close(_lio); return null; }
+    if (age_ns > 240 * std.time.ns_per_s) {
+        file.close(_lio);
+        return null;
+    }
     var tmp_buf: [4096]u8 = undefined;
-    const n = file.readPositionalAll(_lio, &tmp_buf, 0) catch { file.close(_lio); return null; };
+    const n = file.readPositionalAll(_lio, &tmp_buf, 0) catch {
+        file.close(_lio);
+        return null;
+    };
     file.close(_lio);
     if (n == 0) return null;
     const result = alloc.dupe(u8, tmp_buf[0..n]) catch return null;
@@ -631,7 +640,7 @@ test "scopeToCacheName - single segment unchanged" {
 
 test "scopeToCacheName - repo too long returns null" {
     var buf: [256]u8 = undefined;
-    const long = "a" ** 257;
+    const long: [257]u8 = @splat('a');
     try testing.expectEqual(@as(?[]const u8, null), scopeToCacheName(long, &buf));
 }
 

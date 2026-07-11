@@ -188,7 +188,7 @@ pub fn listFiles(alloc: std.mem.Allocator, tar_data: []const u8) !TarListResult 
             const name_blocks = alignToBlock(file_size);
             if (pos + name_blocks > tar_data.len) return error.TruncatedArchive;
             // The long name is NUL-terminated in the data blocks
-            const raw_name = tar_data[pos..pos + file_size];
+            const raw_name = tar_data[pos .. pos + file_size];
             const name_end = std.mem.indexOfScalar(u8, raw_name, 0) orelse file_size;
             if (gnu_long_name) |old| alloc.free(old);
             gnu_long_name = try alloc.dupe(u8, raw_name[0..name_end]);
@@ -280,7 +280,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, io: std.Io, tar_data: []const u8, 
             pos += BLOCK_SIZE;
             const name_blocks = alignToBlock(file_size);
             if (pos + name_blocks > tar_data.len) return error.TruncatedArchive;
-            const raw_name = tar_data[pos..pos + file_size];
+            const raw_name = tar_data[pos .. pos + file_size];
             const name_end = std.mem.indexOfScalar(u8, raw_name, 0) orelse file_size;
             if (gnu_long_name) |old| alloc.free(old);
             gnu_long_name = try alloc.dupe(u8, raw_name[0..name_end]);
@@ -293,7 +293,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, io: std.Io, tar_data: []const u8, 
             pos += BLOCK_SIZE;
             const name_blocks = alignToBlock(file_size);
             if (pos + name_blocks > tar_data.len) return error.TruncatedArchive;
-            const raw_link = tar_data[pos..pos + file_size];
+            const raw_link = tar_data[pos .. pos + file_size];
             const link_end = std.mem.indexOfScalar(u8, raw_link, 0) orelse file_size;
             if (gnu_long_link) |old| alloc.free(old);
             gnu_long_link = try alloc.dupe(u8, raw_link[0..link_end]);
@@ -527,7 +527,7 @@ test "alignToBlock rounds up correctly" {
 
 test "listFiles parses minimal tar" {
     // Build a minimal tar with one regular file entry
-    var tar_data: [BLOCK_SIZE * 4]u8 = .{0} ** (BLOCK_SIZE * 4);
+    var tar_data: [BLOCK_SIZE * 4]u8 = @splat(0);
 
     // Header block for "hello.txt", 5 bytes, regular file
     const name = "hello.txt";
@@ -553,7 +553,7 @@ test "listFiles parses minimal tar" {
     @memcpy(tar_data[148..156], &cksum_buf);
 
     // Data block: "hello"
-    @memcpy(tar_data[BLOCK_SIZE..BLOCK_SIZE + 5], "hello");
+    @memcpy(tar_data[BLOCK_SIZE .. BLOCK_SIZE + 5], "hello");
 
     // Two zero blocks for end-of-archive
     // (already zeroed)
@@ -575,10 +575,10 @@ test "listFiles parses minimal tar" {
 fn writeHeader(buf: *[BLOCK_SIZE]u8, name: []const u8, mode: []const u8, size: u64, typeflag: u8, linkname: []const u8) void {
     @memset(buf, 0);
     @memcpy(buf[0..name.len], name);
-    @memcpy(buf[100..100 + mode.len], mode);
+    @memcpy(buf[100 .. 100 + mode.len], mode);
     _ = std.fmt.bufPrint(buf[124..136], "{o:0>11}", .{size}) catch unreachable;
     buf[156] = typeflag;
-    @memcpy(buf[157..157 + linkname.len], linkname);
+    @memcpy(buf[157 .. 157 + linkname.len], linkname);
 
     // USTAR magic + version
     @memcpy(buf[257..263], "ustar\x00");
@@ -603,11 +603,11 @@ test "extractToDir - hardlink entry creates a link to an earlier regular file (i
 
     // Build a tar with: directory "bin/", regular file "bin/a" (5 bytes),
     // hardlink "bin/b" -> "bin/a", and two zero-terminator blocks.
-    var tar_data: [BLOCK_SIZE * 6]u8 = .{0} ** (BLOCK_SIZE * 6);
+    var tar_data: [BLOCK_SIZE * 6]u8 = @splat(0);
     writeHeader(tar_data[0..BLOCK_SIZE], "bin/", "0000755", 0, TypeFlag.directory, "");
-    writeHeader(tar_data[BLOCK_SIZE..BLOCK_SIZE * 2], "bin/a", "0000755", 5, TypeFlag.regular, "");
-    @memcpy(tar_data[BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 5], "AAAAA");
-    writeHeader(tar_data[BLOCK_SIZE * 3..BLOCK_SIZE * 4], "bin/b", "0000755", 0, TypeFlag.hardlink, "bin/a");
+    writeHeader(tar_data[BLOCK_SIZE .. BLOCK_SIZE * 2], "bin/a", "0000755", 5, TypeFlag.regular, "");
+    @memcpy(tar_data[BLOCK_SIZE * 2 .. BLOCK_SIZE * 2 + 5], "AAAAA");
+    writeHeader(tar_data[BLOCK_SIZE * 3 .. BLOCK_SIZE * 4], "bin/b", "0000755", 0, TypeFlag.hardlink, "bin/a");
     // tar_data[BLOCK_SIZE * 4 ..] already zeroed — end-of-archive marker
 
     // Extract into a unique temp dir

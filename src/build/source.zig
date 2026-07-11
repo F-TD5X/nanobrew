@@ -135,6 +135,13 @@ pub fn buildFromSource(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !
 
     // 5. Detect build system
     const build_sys = detectBuildSystem(lib_io, src_root);
+    if (build_sys == .autotools) {
+        // Some source extraction paths lose executable mode bits. Repair only
+        // the selected top-level autotools launcher, not the whole tree (#344).
+        var configure_buf: [1024]u8 = undefined;
+        const configure_path = std.fmt.bufPrint(&configure_buf, "{s}/configure", .{src_root}) catch return error.PathTooLong;
+        runCommand(lib_io, .inherit, &.{ "chmod", "+x", configure_path }) catch return error.ConfigureNotExecutable;
+    }
     printOut(lib_io, "==> Building {s} (detected: {s})...\n", .{ formula.name, @tagName(build_sys) });
 
     // 6. Build with prefix set to keg path
@@ -217,7 +224,10 @@ pub fn buildFromSource(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !
                         }) catch continue;
                         defer alloc.free(cp_result.stdout);
                         defer alloc.free(cp_result.stderr);
-                        if (switch (cp_result.term) { .exited => |c| c == 0, else => false }) found_anything = true;
+                        if (switch (cp_result.term) {
+                            .exited => |c| c == 0,
+                            else => false,
+                        }) found_anything = true;
                     } else if (entry.kind == .file) {
                         std.Io.Dir.copyFileAbsolute(src_path, dst_path, lib_io, .{}) catch continue;
                         found_anything = true;
@@ -373,5 +383,8 @@ fn runCommand(lib_io: std.Io, cwd: std.process.Child.Cwd, argv: []const []const 
         .stderr = .inherit,
     });
     const term = try child.wait(lib_io);
-    if (switch (term) { .exited => |code| code != 0, else => true }) return error.CommandFailed;
+    if (switch (term) {
+        .exited => |code| code != 0,
+        else => true,
+    }) return error.CommandFailed;
 }

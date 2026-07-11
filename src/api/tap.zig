@@ -651,7 +651,7 @@ fn extractBinInstallNames(line: []const u8) BinInstallParse {
     var rest = std.mem.trimStart(u8, line[install_idx + ".install".len ..], " \t");
     if (rest.len > 0 and rest[0] == '(') rest = std.mem.trimStart(u8, rest[1..], " \t");
 
-    var result: [8]?[]const u8 = .{null} ** 8;
+    var result: [8]?[]const u8 = @splat(null);
     var count: usize = 0;
 
     while (rest.len > 0) {
