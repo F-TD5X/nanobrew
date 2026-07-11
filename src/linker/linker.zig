@@ -256,8 +256,10 @@ fn installShimLink(
     var wrapper_path_buf: [1024]u8 = undefined;
     const wrapper_path = std.fmt.bufPrint(&wrapper_path_buf, "{s}/{s}", .{ wrapper_dir, entry_name }) catch return;
 
-    // Detect per-package env vars (e.g. GIT_EXEC_PATH for git)
-    var extra_env_buf: [2][2][]const u8 = undefined;
+    // Detect per-package env vars (e.g. GIT_EXEC_PATH for git,
+    // ImageMagick config/module paths for bottles whose libMagickCore embeds
+    // /opt/homebrew Cellar paths that cannot be length-rewritten in-place).
+    var extra_env_buf: [4][2][]const u8 = undefined;
     var extra_env_count: usize = 0;
     var git_core_buf: [512]u8 = undefined;
     const git_core_path = std.fmt.bufPrint(&git_core_buf, "{s}/libexec/git-core", .{keg_dir}) catch "";
@@ -268,6 +270,27 @@ fn installShimLink(
             extra_env_buf[extra_env_count] = .{ "GIT_EXEC_PATH", git_core_path };
             extra_env_count += 1;
         } else |_| {}
+    }
+
+    var magick_config_buf: [1024]u8 = undefined;
+    var magick_coder_buf: [512]u8 = undefined;
+    var magick_filter_buf: [512]u8 = undefined;
+    if (imageMagickNeedsEnv(keg_dir)) {
+        const magick_config = std.fmt.bufPrint(&magick_config_buf, "{s}/etc/ImageMagick-7:{s}/share/ImageMagick-7:{s}/lib/ImageMagick/config-Q16HDRI", .{ keg_dir, keg_dir, keg_dir }) catch "";
+        const magick_coder = std.fmt.bufPrint(&magick_coder_buf, "{s}/lib/ImageMagick/modules-Q16HDRI/coders", .{keg_dir}) catch "";
+        const magick_filter = std.fmt.bufPrint(&magick_filter_buf, "{s}/lib/ImageMagick/modules-Q16HDRI/filters", .{keg_dir}) catch "";
+        if (magick_config.len > 0) {
+            extra_env_buf[extra_env_count] = .{ "MAGICK_CONFIGURE_PATH", magick_config };
+            extra_env_count += 1;
+        }
+        if (magick_coder.len > 0) {
+            extra_env_buf[extra_env_count] = .{ "MAGICK_CODER_MODULE_PATH", magick_coder };
+            extra_env_count += 1;
+        }
+        if (magick_filter.len > 0) {
+            extra_env_buf[extra_env_count] = .{ "MAGICK_FILTER_MODULE_PATH", magick_filter };
+            extra_env_count += 1;
+        }
     }
 
     const alloc = std.heap.smp_allocator;
@@ -389,6 +412,24 @@ fn unlinkShimLinks(keg_dir: []const u8) void {
     }
 }
 
+fn imageMagickNeedsEnv(keg_dir: []const u8) bool {
+    const lib_io = paths.safe_io;
+    var config_buf: [512]u8 = undefined;
+    const config_dir = std.fmt.bufPrint(&config_buf, "{s}/etc/ImageMagick-7", .{keg_dir}) catch return false;
+    if (std.Io.Dir.openDirAbsolute(lib_io, config_dir, .{})) |d| {
+        var dir = d;
+        dir.close(lib_io);
+    } else |_| return false;
+
+    var coders_buf: [512]u8 = undefined;
+    const coders_dir = std.fmt.bufPrint(&coders_buf, "{s}/lib/ImageMagick/modules-Q16HDRI/coders", .{keg_dir}) catch return false;
+    if (std.Io.Dir.openDirAbsolute(lib_io, coders_dir, .{})) |d| {
+        var dir = d;
+        dir.close(lib_io);
+        return true;
+    } else |_| return false;
+}
+
 fn needsManagedWrapper(pkg_name: []const u8, subdir: []const u8, entry_name: []const u8) bool {
     return std.mem.eql(u8, pkg_name, FORTUNE_NAME) and
         std.mem.eql(u8, subdir, "bin") and
@@ -396,8 +437,7 @@ fn needsManagedWrapper(pkg_name: []const u8, subdir: []const u8, entry_name: []c
 }
 
 fn renderFortuneWrapper(buf: []u8, actual_bin: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(
-        buf,
+    return std.fmt.bufPrint(buf,
         \\#!/bin/sh
         \\set -eu
         \\
@@ -530,6 +570,7 @@ pub fn linkKegWithOptions(name: []const u8, version: []const u8, options: LinkOp
                 needs_env_shim = true;
             } else |_| {}
         }
+        if (imageMagickNeedsEnv(keg_dir)) needs_env_shim = true;
     }
 
     for (subdir_mappings) |mapping| {
@@ -707,4 +748,17 @@ test "renderShimWrapper includes extra env vars" {
     try std.testing.expect(std.mem.indexOf(u8, script, "GIT_EXEC_PATH=\"/opt/nanobrew/prefix/Cellar/git/2.47.0/libexec/git-core\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "export GIT_EXEC_PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "exec \"/opt/nanobrew/prefix/Cellar/git/2.47.0/bin/git\" \"$@\"") != null);
+}
+
+test "renderShimWrapper includes ImageMagick env vars" {
+    const env = [_][2][]const u8{
+        .{ "MAGICK_CONFIGURE_PATH", "/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-26/etc/ImageMagick-7" },
+        .{ "MAGICK_CODER_MODULE_PATH", "/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-26/lib/ImageMagick/modules-Q16HDRI/coders" },
+    };
+    const script = try renderShimWrapper(std.testing.allocator, "/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-26/bin/magick", &.{}, &env);
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "MAGICK_CONFIGURE_PATH=\"/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-26/etc/ImageMagick-7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "export MAGICK_CODER_MODULE_PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "exec \"/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-26/bin/magick\" \"$@\"") != null);
 }

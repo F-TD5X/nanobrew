@@ -85,6 +85,64 @@ jobs:
           name: nb-linux-x86_64
           path: zig-out/bin/nb
 
+
+
+  build-windows-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cross-build Windows binary
+        run: zig build windows
+
+      - name: Upload Windows binary for smoke
+        uses: actions/upload-artifact@v4
+        with:
+          name: nb-windows-smoke
+          path: zig-out/bin/nb.exe
+
+  smoke-windows-native:
+    runs-on: windows-latest
+    needs: build-windows-native
+    steps:
+      - name: Download Windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: nb-windows-smoke
+          path: .
+
+      - name: Smoke native Windows package manager
+        shell: pwsh
+        run: |
+          $nb = Resolve-Path .\nb.exe
+          & $nb help
+          & $nb init
+          & $nb search uv
+          & $nb search yq
+          & $nb search zoxide
+          & $nb search bun
+          & $nb search kubectl
+          $ErrorActionPreference = 'Stop'
+          # Keep this smoke intentionally small; larger runtime archives (bun/deno/yazi)
+          # are covered by checksum/archive validation and can be slow on hosted runners.
+          & $nb install watchexec pastel xsv
+          & $env:LOCALAPPDATA\nanobrew\bin\watchexec.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\pastel.exe --version
+          & $env:LOCALAPPDATA\nanobrew\bin\xsv.exe --version
+          & $nb list
+          & $nb doctor
+
+      - name: Upload smoked Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nb-windows-x86_64
+          path: nb.exe
+
   cross-compile:
     runs-on: macos-26
     steps:

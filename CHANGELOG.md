@@ -2,10 +2,38 @@
 
 All notable changes to nanobrew are documented here.
 
-## Unreleased
+## [Unreleased]
+
+## [0.1.201] - 2026-06-26
 
 ### Added
-- **`nb doctor --probe [pkg]` — post-install "does it actually work?" probe (#317)** — runs each installed keg's binaries (`--version`, then `version`, then `--help`, with a 2s hard timeout) and reports any that fail to load and run, plus DB entries with no backing Cellar (phantom kegs). Catches the #324 class where a bottle is placed but its interpreter or shared libraries are missing, so the binary exists yet can't execute (a missing interpreter/library surfaces as exit 126/127, death by signal, or a timeout; a working tool that merely requires args and exits 22/64 on `--version` is not flagged). Exits non-zero when any probed package fails. First local-only slice of the trust-tiers design (`docs/design/trust-tiers.md`); `nb list --versions` / `nb switch` shipped earlier in #316.
+- **Windows registry is now data-driven and has `nb info` metadata lookup** — the Windows build embeds and validates `registry/windows.json` at build/runtime instead of carrying a duplicated hardcoded package table in Zig source.
+- **Windows native package set now includes `uv`, `yq`, `just`, `hyperfine`, `fzf`, `starship`, `eza`, `delta`, `dust`, `bottom`, `zoxide`, `sd`, `hexyl`, `dua`, `procs`, `bun`, `deno`, `gh`, `watchexec`, `pastel`, `xsv`, `yazi`, `oh-my-posh`, `kubectl`, `terraform`, `helm`, `k9s`, `lazygit`, `lazydocker`, `rclone`, `age`, `sops`, `hugo`, and `neovim`** — each downloads verified upstream x86_64 Windows portable assets and links executables into `%LOCALAPPDATA%\nanobrew\bin`.
+- **Windows UX polish** — `nb search` reports no-match results clearly and `nb doctor` now tells users whether nanobrew's `bin` directory is on the current PATH.
+
+### Fixed
+- **macOS ImageMagick/libheif and Lima compatibility** — ImageMagick wrappers now export the correct module/config paths for HEIC support, and Mach-O relocation no longer re-signs untouched skip-relocation binaries so upstream entitlements are preserved.
+- **Local trust probes** — `nb doctor --probe` executes linked formula binaries, probes cask app/binary payloads, and surfaces cask local trust evidence in `nb info`.
+
+## [0.1.200] - 2026-06-25
+
+### Added
+- **Native Windows portable package manager** — the Windows build now owns `%LOCALAPPDATA%\nanobrew` with a Cellar, cache, db, and bin directory. It downloads verified upstream portable assets directly, extracts/copies them into Cellar, and links executables into `bin` without WinGet/Scoop/Chocolatey. Initial registry: `ripgrep`, `fd`, `bat`, and `jq`. Supports `init`, `search`, `install`, `upgrade`, `remove`, `list`, `doctor`, and `version`. (#336)
+- **`zig build windows`** convenience target for producing the x86_64 Windows executable. (#336)
+
+## [0.1.199] - 2026-06-25
+
+### Security
+- **Bumped the pinned GitHub CLI (`gh`) registry entry to 2.93.0** with official upstream checksums, clearing the weekly bottle scan finding against 2.91.0. (#334)
+- **Bottle scans now fail with actionable evidence instead of empty issues**: per-record scan crashes are captured as gated `SCAN-ERROR` findings so the issue body tells maintainers what failed. (#334)
+
+### Fixed
+- **Finished the #314 update hardening follow-ups**: POST redirect handling no longer leaks synthetic form `Content-Type` after POST→GET redirects, 307/308 POST redirects get a distinct unsupported error, self-update accepts only expected release binary names, extracted update binaries are checked for Mach-O/ELF magic before replacement, and `update-registry` now reports cache write failures. (#314)
+- **Native Linux builds link libc explicitly**, matching the test and cross-build modules.
+- **Cask recovery and fonts**: font cask artifacts are parsed, and interrupted cask installs can be recovered from their real on-disk Caskroom payload version.
+
+### Added
+- **Local trust probe slice**: `nb doctor --probe [pkg...]` probes installed formula kegs, installs run a warning-only local probe after post-install, and `nb info` surfaces a local trust tier (`checksum-verified`, `source-verified`, or `install-verified`). (#317)
 
 ## [0.1.198] - 2026-06-12
 

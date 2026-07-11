@@ -4,6 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const checks = b.option(bool, "checks", "Run repository maintenance checks") orelse false;
+    const windows_registry_opts = b.addOptions();
+    windows_registry_opts.addOption([]const u8, "json", @embedFile("registry/windows.json"));
 
     // ── nanobrew library module ──
     const nb_mod = b.createModule(.{
@@ -13,16 +15,26 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Main executable ──
+    const is_windows = target.result.os.tag == .windows;
+    const main_mod = b.createModule(.{
+        .root_source_file = b.path(if (is_windows) "src/windows_main.zig" else "src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        // Linux: src/main.zig and the extract/tar paths reach extern "c"
+        // symbols (read, symlink, fchmod, getenv, clock_gettime), so a
+        // native Linux `zig build` needs libc linked explicitly — same as
+        // the test and linux cross-compile modules below. macOS always
+        // links libSystem, so null keeps the default there. Windows uses
+        // the lightweight bridge entry point and does not need libc.
+        .link_libc = if (target.result.os.tag == .linux or target.result.os.tag == .windows) true else null,
+        .imports = if (is_windows) &.{} else &.{
+            .{ .name = "nanobrew", .module = nb_mod },
+        },
+    });
+    if (is_windows) main_mod.addOptions("windows_registry", windows_registry_opts);
     const exe = b.addExecutable(.{
         .name = "nb",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "nanobrew", .module = nb_mod },
-            },
-        }),
+        .root_module = main_mod,
     });
     if (target.result.os.tag == .macos) {
         exe.headerpad_size = 0x1000;
@@ -91,6 +103,27 @@ pub fn build(b: *std.Build) void {
         const s = b.step(entry[0], entry[2]);
         s.dependOn(&run_t.step);
     }
+
+    // ── Windows bridge convenience target ──
+    const windows_x86 = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .windows,
+        .abi = .gnu,
+    });
+    const windows_mod = b.createModule(.{
+        .root_source_file = b.path("src/windows_main.zig"),
+        .target = windows_x86,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    windows_mod.addOptions("windows_registry", windows_registry_opts);
+    const windows_exe = b.addExecutable(.{
+        .name = "nb",
+        .root_module = windows_mod,
+    });
+    windows_exe.root_module.strip = true;
+    const windows_step = b.step("windows", "Build Windows package-manager bridge");
+    windows_step.dependOn(&b.addInstallArtifact(windows_exe, .{}).step);
 
     // ── Linux cross-compilation convenience targets ──
     const linux_x86 = b.resolveTargetQuery(.{

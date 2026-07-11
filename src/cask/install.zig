@@ -39,6 +39,59 @@ pub fn firstInstallConflict(io: std.Io, cask: Cask, conflict_buf: []u8) !?Destin
     return firstInstallConflictIn(io, APPLICATIONS_DIR, home, &cask, conflict_buf);
 }
 
+/// The version of this cask's payload physically present under `caskroom_dir`
+/// (a `<caskroom_dir>/<token>/<version>` directory), written into `result_buf`.
+/// Prefers an exact match for `want_version`; otherwise returns the first
+/// version directory found. Returns null when nanobrew owns no payload for the
+/// token (i.e. a foreign, manually-installed app it must not adopt).
+///
+/// Used to recover an interrupted install (issue #302): when the destination
+/// already exists and the DB lost the record, the caller adopts the payload
+/// under its REAL on-disk version, never the freshly-fetched API version
+/// (which may be newer and would freeze `nb upgrade` on a stale payload).
+/// `caskroom_dir` may be absolute (production) or relative (tests); access
+/// goes through the cwd handle, which accepts both.
+pub fn ownedCaskVersionOnDisk(
+    io: std.Io,
+    caskroom_dir: []const u8,
+    token: []const u8,
+    want_version: []const u8,
+    result_buf: *[256]u8,
+) ?[]const u8 {
+    // Third-party tap tokens may contain slashes ("indaco/tap/sley"); the
+    // Caskroom dir uses only the basename, matching installCask above.
+    const safe_token = if (std.mem.lastIndexOfScalar(u8, token, '/')) |idx|
+        token[idx + 1 ..]
+    else
+        token;
+
+    // Exact version match first (the common adopt case).
+    var exact_buf: [1024]u8 = undefined;
+    if (std.fmt.bufPrint(&exact_buf, "{s}/{s}/{s}", .{ caskroom_dir, safe_token, want_version })) |exact| {
+        if (std.Io.Dir.cwd().access(io, exact, .{})) |_| {
+            if (want_version.len <= result_buf.len) {
+                @memcpy(result_buf[0..want_version.len], want_version);
+                return result_buf[0..want_version.len];
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // Otherwise adopt whatever version directory is physically present.
+    var token_buf: [1024]u8 = undefined;
+    const token_dir = std.fmt.bufPrint(&token_buf, "{s}/{s}", .{ caskroom_dir, safe_token }) catch return null;
+    var dir = std.Io.Dir.cwd().openDir(io, token_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (entry.name.len > result_buf.len) continue;
+        @memcpy(result_buf[0..entry.name.len], entry.name);
+        return result_buf[0..entry.name.len];
+    }
+    return null;
+}
+
 pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
     const lib_io = io;
 
@@ -1800,4 +1853,63 @@ test "artifactInstallsToApplications only true for /Applications targets" {
     try std.testing.expect(!artifactInstallsToApplications(PREFIX ++ "/share/foo"));
     try std.testing.expect(!artifactInstallsToApplications("/Library/Foo"));
     try std.testing.expect(!artifactInstallsToApplications("/Applications/../etc/evil"));
+}
+
+test "ownedCaskVersionOnDisk adopts the exact on-disk version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "firefox/120.0");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "firefox", "120.0", &ver_buf);
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("120.0", v.?);
+}
+
+test "ownedCaskVersionOnDisk recovers an older payload when the API moved on" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // An interrupted run left 119.0 on disk; the API has since advanced to 120.0.
+    try tmp.dir.createDirPath(std.testing.io, "firefox/119.0");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    // Must report the REAL on-disk version so `nb upgrade` brings it current,
+    // not the freshly-fetched 120.0 that was never installed.
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "firefox", "120.0", &ver_buf);
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("119.0", v.?);
+}
+
+test "ownedCaskVersionOnDisk returns null for a foreign app (no Caskroom payload)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // No token directory created: nanobrew owns nothing here, so a pre-existing
+    // /Applications app must stay refused rather than adopted.
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "firefox", "120.0", &ver_buf);
+    try std.testing.expect(v == null);
+}
+
+test "ownedCaskVersionOnDisk uses the basename for third-party tap tokens" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sley/1.2.3");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "indaco/tap/sley", "1.2.3", &ver_buf);
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("1.2.3", v.?);
 }

@@ -820,7 +820,24 @@ def cmd_scan(args):
     outdir.mkdir(parents=True, exist_ok=True)
     summary, gated = {}, []
     for rec in records:
-        for platform, findings in _scan_one(rec, platforms, outdir):
+        try:
+            scan_results = _scan_one(rec, platforms, outdir)
+        except Exception as exc:
+            ver = rec.get("resolved", {}).get("version", "unknown")
+            requested = platforms or sorted((rec.get("resolved") or {}).get("assets", {}).keys()) or ["unknown"]
+            log(f"  {rec['token']} {ver}: scan failed ({type(exc).__name__}: {exc}) — continuing")
+            for platform in requested:
+                finding = {
+                    "id": "SCAN-ERROR",
+                    "severity": args.gate,
+                    "package": rec["token"],
+                    "version": ver,
+                    "fixed_in": "",
+                }
+                summary[f"{rec['token']}.{platform}"] = [finding]
+                gated.append((rec["token"], ver, platform, finding))
+            continue
+        for platform, findings in scan_results:
             summary[f"{rec['token']}.{platform}"] = findings
             for f in findings:
                 if f["severity"] in SEVERITIES and SEVERITIES.index(f["severity"]) >= gate_rank:
