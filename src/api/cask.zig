@@ -128,7 +128,17 @@ pub const Cask = struct {
     }
 
     pub fn caskroomPath(self: *const Cask, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, @import("../platform/paths.zig").CASKROOM_DIR ++ "/{s}/{s}", .{ self.token, self.version }) catch "";
+        const filesystem_token = if (std.mem.lastIndexOfScalar(u8, self.token, '/')) |idx|
+            self.token[idx + 1 ..]
+        else
+            self.token;
+        if (filesystem_token.len == 0 or
+            std.mem.eql(u8, filesystem_token, ".") or
+            std.mem.eql(u8, filesystem_token, "..")) return "";
+        for (filesystem_token) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '@' and c != '+' and c != '_' and c != '.' and c != '-') return "";
+        }
+        return std.fmt.bufPrint(buf, @import("../platform/paths.zig").CASKROOM_DIR ++ "/{s}/{s}", .{ filesystem_token, self.version }) catch "";
     }
 
     pub fn deinit(self: Cask, alloc: std.mem.Allocator) void {
@@ -324,4 +334,21 @@ test "caskroomPath - formats token and version" {
     var buf: [512]u8 = undefined;
     const p = c.caskroomPath(&buf);
     try testing.expectEqualStrings("/opt/nanobrew/prefix/Caskroom/firefox/147.0.3", p);
+}
+
+test "caskroomPath uses basename for third-party tap tokens" {
+    const c = Cask{
+        .token = "indaco/tap/sley",
+        .name = "Sley",
+        .version = "1.2.3",
+        .url = "",
+        .sha256 = "",
+        .homepage = "",
+        .desc = "",
+        .auto_updates = false,
+        .artifacts = &.{},
+        .min_macos = null,
+    };
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings("/opt/nanobrew/prefix/Caskroom/sley/1.2.3", c.caskroomPath(&buf));
 }

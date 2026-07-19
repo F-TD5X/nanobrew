@@ -27,11 +27,12 @@ pub const Formula = struct {
     /// live-API freshness checks must not override a security revocation.
     revoked_fallback: bool = false,
 
-    /// Effective version string including rebuild suffix for bottle paths.
-    /// e.g. "3.1.0" or "3.1.0_1" if rebuild > 0
+    /// Effective Cellar version including the formula revision suffix.
+    /// Bottle rebuilds identify bottle artifacts but do not change the Cellar path.
+    /// e.g. "3.1.0" or "3.1.0_1" if revision > 0
     pub fn effectiveVersion(self: *const Formula, buf: []u8) []const u8 {
-        if (self.rebuild > 0) {
-            return std.fmt.bufPrint(buf, "{s}_{d}", .{ self.version, self.rebuild }) catch self.version;
+        if (self.revision > 0) {
+            return std.fmt.bufPrint(buf, "{s}_{d}", .{ self.version, self.revision }) catch self.version;
         }
         return self.version;
     }
@@ -53,7 +54,6 @@ pub const Formula = struct {
         if (self.install_binaries.len > 0) alloc.free(self.install_binaries);
         alloc.free(self.caveats);
     }
-
 
     /// Build the bottle URL for this formula.
     /// Respects NANOBREW_BOTTLE_DOMAIN / HOMEBREW_BOTTLE_DOMAIN env vars (#74)
@@ -115,18 +115,25 @@ pub const BOTTLE_FALLBACKS = switch (@import("builtin").os.tag) {
 
 const testing = std.testing;
 
-test "effectiveVersion - no rebuild returns base version" {
-    const f = Formula{ .name = "ffmpeg", .version = "7.1", .rebuild = 0 };
+test "effectiveVersion - no revision returns base version" {
+    const f = Formula{ .name = "ffmpeg", .version = "7.1", .revision = 0 };
     var buf: [128]u8 = undefined;
     const v = f.effectiveVersion(&buf);
     try testing.expectEqualStrings("7.1", v);
 }
 
-test "effectiveVersion - rebuild appends suffix" {
-    const f = Formula{ .name = "ffmpeg", .version = "7.1", .rebuild = 2 };
+test "effectiveVersion - revision appends suffix" {
+    const f = Formula{ .name = "aalib", .version = "1.4rc5", .revision = 2 };
     var buf: [128]u8 = undefined;
     const v = f.effectiveVersion(&buf);
-    try testing.expectEqualStrings("7.1_2", v);
+    try testing.expectEqualStrings("1.4rc5_2", v);
+}
+
+test "effectiveVersion - bottle rebuild does not change Cellar version" {
+    const f = Formula{ .name = "aamath", .version = "0.3", .rebuild = 1 };
+    var buf: [128]u8 = undefined;
+    const v = f.effectiveVersion(&buf);
+    try testing.expectEqualStrings("0.3", v);
 }
 
 test "cellarPath - formats name and version" {
@@ -136,11 +143,11 @@ test "cellarPath - formats name and version" {
     try testing.expectEqualStrings("/opt/nanobrew/prefix/Cellar/lame/3.100", p);
 }
 
-test "cellarPath - includes rebuild suffix" {
-    const f = Formula{ .name = "x265", .version = "4.0", .rebuild = 1 };
+test "cellarPath - includes formula revision suffix" {
+    const f = Formula{ .name = "aalib", .version = "1.4rc5", .revision = 2 };
     var buf: [512]u8 = undefined;
     const p = f.cellarPath(&buf);
-    try testing.expectEqualStrings("/opt/nanobrew/prefix/Cellar/x265/4.0_1", p);
+    try testing.expectEqualStrings("/opt/nanobrew/prefix/Cellar/aalib/1.4rc5_2", p);
 }
 
 test "BOTTLE_FALLBACKS - x86_64 macOS never falls back to arm64 tags (regression #226/#227)" {

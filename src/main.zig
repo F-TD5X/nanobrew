@@ -48,8 +48,13 @@ const Command = enum {
 };
 
 fn shouldCheckForUpdate(cmd: Command) bool {
-    // Read-only inventory commands must never acquire unrelated network latency.
-    return cmd != .update and cmd != .list and cmd != .leaves and cmd != .outdated;
+    // Keep the advisory on package-changing entry points, where its occasional
+    // network refresh is negligible. Output-only and local maintenance commands
+    // must never gain unrelated DNS/TLS tail latency after their work is done.
+    return switch (cmd) {
+        .init, .install, .reinstall, .upgrade => true,
+        else => false,
+    };
 }
 
 const Phase = enum(u8) {
@@ -61,6 +66,39 @@ const Phase = enum(u8) {
     linking,
     done,
     failed,
+};
+
+const ProbeMode = enum { structural, active };
+
+const ProbeResult = enum(u8) {
+    not_run,
+    failed,
+    passed,
+
+    fn value(self: ProbeResult) ?bool {
+        return switch (self) {
+            .not_run => null,
+            .failed => false,
+            .passed => true,
+        };
+    }
+};
+
+// Persisted probe evidence is valid only for the platform and semantics that
+// produced it. Bump the schema whenever probe acceptance rules materially change.
+const LOCAL_PROBE_SCHEMA: u32 = 3;
+const LOCAL_PROBE_PLATFORM: u32 = switch (builtin.os.tag) {
+    .macos => switch (builtin.cpu.arch) {
+        .aarch64 => 1,
+        .x86_64 => 2,
+        else => 0,
+    },
+    .linux => switch (builtin.cpu.arch) {
+        .x86_64 => 3,
+        .aarch64 => 4,
+        else => 0,
+    },
+    else => 0,
 };
 
 var g_io: std.Io = undefined;
@@ -116,7 +154,7 @@ fn milliTimestamp() i64 {
 
 const ROOT = paths.ROOT;
 const PREFIX = paths.PREFIX;
-const VERSION = "0.1.202";
+const VERSION = "0.1.203";
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
@@ -192,13 +230,29 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(0);
 }
 
-test "shouldCheckForUpdate skips commands that must exit promptly" {
-    try std.testing.expect(!shouldCheckForUpdate(.update));
-    try std.testing.expect(!shouldCheckForUpdate(.leaves));
-    try std.testing.expect(!shouldCheckForUpdate(.outdated));
-    try std.testing.expect(!shouldCheckForUpdate(.list));
+test "shouldCheckForUpdate only runs on package-changing entry points" {
+    try std.testing.expect(shouldCheckForUpdate(.init));
     try std.testing.expect(shouldCheckForUpdate(.install));
+    try std.testing.expect(shouldCheckForUpdate(.reinstall));
+    try std.testing.expect(shouldCheckForUpdate(.upgrade));
+
+    inline for (.{
+        Command.update,
+        Command.list,
+        Command.leaves,
+        Command.outdated,
+        Command.help,
+        Command.info,
+        Command.search,
+        Command.where,
+        Command.doctor,
+        Command.deps,
+        Command.completions,
+    }) |cmd| {
+        try std.testing.expect(!shouldCheckForUpdate(cmd));
+    }
 }
+
 fn parseCommand(arg: []const u8) ?Command {
     const cmds = .{
         .{ "init", Command.init },
@@ -390,6 +444,20 @@ fn isPackageNameSafe(name: []const u8) bool {
     return slash_count == 0 or slash_count == 2;
 }
 
+fn formulaArtifactSha(f: nb.formula.Formula) []const u8 {
+    if (nb.store.isValidSha256(f.bottle_sha256)) return f.bottle_sha256;
+    if (nb.store.isValidSha256(f.source_sha256)) return f.source_sha256;
+    return "";
+}
+
+fn installedFormulaDeclarations(formula: ?nb.formula.Formula, keg: nb.database.Keg) []const []const u8 {
+    const f = formula orelse return &.{};
+    var version_buf: [256]u8 = undefined;
+    if (!std.mem.eql(u8, f.effectiveVersion(&version_buf), keg.version)) return &.{};
+    if (!std.mem.eql(u8, formulaArtifactSha(f), keg.sha256)) return &.{};
+    return f.install_binaries;
+}
+
 // ── nb install <path>.rb ──
 //
 // Local Ruby formula install (#225). Reuses the tap parser for the Ruby DSL
@@ -463,16 +531,19 @@ fn runLocalRbInstall(alloc: std.mem.Allocator, path: []const u8) void {
         std.process.exit(1);
     }
 
-    stdout.print("==> Installing {s} {s} from {s}...\n", .{ f.name, f.version, path }) catch {};
+    var version_buf: [256]u8 = undefined;
+    const effective_version = f.effectiveVersion(&version_buf);
+    stdout.print("==> Installing {s} {s} from {s}...\n", .{ f.name, effective_version, path }) catch {};
 
     var had_error = std.atomic.Value(bool).init(false);
     var phase = std.atomic.Value(u8).init(@intFromEnum(Phase.waiting));
     var fail_reason: ?[]const u8 = null;
+    var probe_result: ProbeResult = .not_run;
     const local_formulae = [_]nb.formula.Formula{f};
     const local_requested = [_][]const u8{f.name};
     // Single-formula path: no batch sharing benefit — pass nulls so the
     // worker creates its own one-shot client (existing behavior).
-    fullInstallOne(alloc, f, &had_error, &phase, &fail_reason, false, &local_requested, &local_formulae, null, null);
+    fullInstallOne(alloc, f, &had_error, &phase, &fail_reason, &probe_result, false, &local_requested, &local_formulae, null, null);
 
     if (had_error.load(.acquire)) {
         if (fail_reason) |why| {
@@ -490,9 +561,17 @@ fn runLocalRbInstall(alloc: std.mem.Allocator, path: []const u8) void {
         return;
     };
     defer db.close();
-    db.recordInstall(f.name, f.version, f.bottle_sha256) catch |err| {
+    const artifact_sha = formulaArtifactSha(f);
+    var recorded = true;
+    db.recordInstall(f.name, effective_version, artifact_sha) catch |err| {
+        recorded = false;
         stderr.print("nb: warning: failed to record {s} in database: {}\n", .{ f.name, err }) catch {};
     };
+    if (recorded) {
+        if (probe_result.value()) |passed| {
+            db.recordKegProbe(f.name, effective_version, artifact_sha, passed, LOCAL_PROBE_SCHEMA, LOCAL_PROBE_PLATFORM) catch {};
+        }
+    }
     stdout.print("==> Done\n", .{}) catch {};
 }
 
@@ -580,7 +659,8 @@ fn offerLatest(
 
     if (nb.api_client.fetchFormula(alloc, base)) |f| {
         defer f.deinit(alloc);
-        stderr.print("    latest is {s}; install it with:  nb install {s}\n", .{ f.version, base }) catch {};
+        var version_buf: [256]u8 = undefined;
+        stderr.print("    latest is {s}; install it with:  nb install {s}\n", .{ f.effectiveVersion(&version_buf), base }) catch {};
     } else |_| {}
 }
 
@@ -796,12 +876,19 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     };
     defer alloc.free(all_formulae);
 
+    // The Cellar path identifies a formula revision, while the recorded digest
+    // distinguishes source changes and bottle rebuilds at that same path.
+    var filter_db: ?nb.database.Database = nb.database.Database.open(alloc) catch null;
+    defer if (filter_db) |*db| db.close();
+
     // Filter out already-installed packages (keg exists in Cellar)
     var to_install: std.ArrayList(nb.formula.Formula) = .empty;
     defer to_install.deinit(alloc);
     for (all_formulae) |f| {
+        var expected_buf: [256]u8 = undefined;
+        const expected_ver = f.effectiveVersion(&expected_buf);
         var ver_buf: [256]u8 = undefined;
-        const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf) orelse f.version;
+        const actual_ver = nb.cellar.detectKegVersion(f.name, expected_ver, &ver_buf) orelse expected_ver;
         var keg_buf: [512]u8 = undefined;
         const keg_path = std.fmt.bufPrint(&keg_buf, "/opt/nanobrew/prefix/Cellar/{s}/{s}/bin", .{ f.name, actual_ver }) catch {
             to_install.append(alloc, f) catch {};
@@ -817,6 +904,18 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         if (std.Io.Dir.openDirAbsolute(g_io, ver_dir, .{})) |d| {
             var dir = d;
             dir.close(g_io);
+            const expected_sha = formulaArtifactSha(f);
+            const artifact_changed = if (filter_db) |*db| blk: {
+                const installed = db.findKeg(f.name) orelse break :blk false;
+                break :blk expected_sha.len > 0 and
+                    std.mem.eql(u8, installed.version, actual_ver) and
+                    installed.sha256.len > 0 and
+                    !std.mem.eql(u8, installed.sha256, expected_sha);
+            } else false;
+            if (artifact_changed) {
+                to_install.append(alloc, f) catch {};
+                continue;
+            }
             if (formulaLinkNeedsRepair(f.name, actual_ver, use_shims, formulae.items)) {
                 linkFormulaKeg(alloc, f.name, actual_ver, use_shims, formulae.items, all_formulae) catch {};
             }
@@ -833,13 +932,16 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         };
         defer db.close();
         for (all_formulae) |f| {
+            var expected_buf: [256]u8 = undefined;
+            const expected_ver = f.effectiveVersion(&expected_buf);
             var ver_buf6: [256]u8 = undefined;
-            const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf6) orelse f.version;
+            const actual_ver = nb.cellar.detectKegVersion(f.name, expected_ver, &ver_buf6) orelse expected_ver;
             const existing = db.findKeg(f.name);
             if (existing) |keg| {
                 if (std.mem.eql(u8, keg.version, actual_ver)) continue;
             }
-            db.recordInstall(f.name, actual_ver, f.bottle_sha256) catch |err| {
+            // A pre-existing untracked keg has unknown artifact provenance.
+            db.recordInstall(f.name, actual_ver, "") catch |err| {
                 stderr.print("nb: warning: failed to record {s} in database: {}\n", .{ f.name, err }) catch {};
             };
         }
@@ -864,11 +966,24 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
 
     stdout.print("==> Installing {d} package(s) ({d} already up to date):\n", .{ install_order.len, all_formulae.len - install_order.len }) catch {};
     for (install_order) |f| {
-        stdout.print("    {s} {s}\n", .{ f.name, f.version }) catch {};
+        var version_buf: [256]u8 = undefined;
+        stdout.print("    {s} {s}\n", .{ f.name, f.effectiveVersion(&version_buf) }) catch {};
     }
     // Single merged phase: Download → Extract → Materialize → Relocate → Link (all parallel)
     phase_timer = MonoTimer.start();
     const pkg_count = install_order.len;
+    const install_succeeded = alloc.alloc(bool, pkg_count) catch {
+        stderr.print("nb: out of memory\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer alloc.free(install_succeeded);
+    @memset(install_succeeded, false);
+    const probe_results = alloc.alloc(ProbeResult, pkg_count) catch {
+        stderr.print("nb: out of memory\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer alloc.free(probe_results);
+    @memset(probe_results, .not_run);
     stdout.print("==> Downloading + installing {d} packages...\n", .{pkg_count}) catch {};
     {
         // Allocate per-package phase tracking
@@ -954,7 +1069,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
                 slots.items[idx].handle.join();
                 _ = slots.orderedRemove(idx);
             }
-            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], &reasons[pi], use_shims, formulae.items, all_formulae, &shared_client, shared_ghcr_token }) catch {
+            const t = std.Thread.spawn(.{}, fullInstallOne, .{ alloc, f, &had_error, &phases[pi], &reasons[pi], &probe_results[pi], use_shims, formulae.items, all_formulae, &shared_client, shared_ghcr_token }) catch {
                 reasons[pi] = "could not spawn worker thread";
                 had_error.store(true, .release);
                 phases[pi].store(@intFromEnum(Phase.failed), .release);
@@ -1012,6 +1127,9 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
             }
             stderr.print("nb: hint: check permissions with `nb doctor`\n", .{}) catch {};
         }
+        for (phases, 0..) |*phase, i| {
+            install_succeeded[i] = @as(Phase, @enumFromInt(phase.load(.acquire))) == .done;
+        }
     }
     const pipeline_ms = @as(f64, @floatFromInt(phase_timer.read())) / 1_000_000.0;
     stdout.print("    [{d:.0}ms]\n", .{pipeline_ms}) catch {};
@@ -1025,21 +1143,56 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     };
     defer db.close();
     for (all_formulae) |f| {
+        var expected_buf: [256]u8 = undefined;
+        const expected_ver = f.effectiveVersion(&expected_buf);
         var ver_buf6: [256]u8 = undefined;
         // Only record packages that actually landed in the Cellar. If there is no
         // keg directory the install failed (download/extract/materialize), so
         // skipping here avoids writing phantom DB entries that later trip up
         // `nb doctor` / `nb cleanup --prune-kegs` (#311).
-        const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf6) orelse continue;
+        const actual_ver = nb.cellar.detectKegVersion(f.name, expected_ver, &ver_buf6) orelse continue;
 
+        var queued = false;
+        var installed_successfully = false;
+        var install_probe: ProbeResult = .not_run;
+        for (install_order, 0..) |candidate, i| {
+            if (std.mem.eql(u8, candidate.name, f.name)) {
+                queued = true;
+                installed_successfully = install_succeeded[i];
+                install_probe = probe_results[i];
+                break;
+            }
+        }
+        // A failed reinstall can leave the previous same-version keg intact.
+        // Never attach the new digest (or adopt a partial new keg) on failure.
+        if (queued and !installed_successfully) continue;
+        const record_sha = if (installed_successfully) formulaArtifactSha(f) else "";
+        const probe_value = if (installed_successfully) install_probe.value() else null;
         const existing = db.findKeg(f.name);
         if (existing) |keg| {
-            if (std.mem.eql(u8, keg.version, actual_ver)) continue;
+            if (std.mem.eql(u8, keg.version, actual_ver) and !installed_successfully) continue;
+            if (std.mem.eql(u8, keg.version, actual_ver) and
+                std.mem.eql(u8, keg.sha256, record_sha))
+            {
+                // Same immutable artifact: retain the install record and only
+                // attach newly collected probe evidence, avoiding fake history.
+                if (probe_value) |passed| {
+                    db.recordKegProbe(f.name, actual_ver, record_sha, passed, LOCAL_PROBE_SCHEMA, LOCAL_PROBE_PLATFORM) catch {};
+                }
+                continue;
+            }
         }
 
-        db.recordInstall(f.name, actual_ver, f.bottle_sha256) catch |err| {
+        var recorded = true;
+        db.recordInstall(f.name, actual_ver, record_sha) catch |err| {
+            recorded = false;
             stderr.print("nb: warning: failed to record {s} in database: {}\n", .{ f.name, err }) catch {};
         };
+        if (recorded) {
+            if (probe_value) |passed| {
+                db.recordKegProbe(f.name, actual_ver, record_sha, passed, LOCAL_PROBE_SCHEMA, LOCAL_PROBE_PLATFORM) catch {};
+            }
+        }
     }
 
     // Auto-pin version-pinned installs so a later `nb upgrade` won't silently
@@ -1283,6 +1436,7 @@ fn fullInstallOne(
     // Set to a short, static reason string on failure so the final summary can
     // explain *why* a package failed instead of printing a bare ✗ (#311).
     fail_reason: *?[]const u8,
+    probe_result: *ProbeResult,
     use_shims: bool,
     requested: []const []const u8,
     all_formulae: []const nb.formula.Formula,
@@ -1294,18 +1448,18 @@ fn fullInstallOne(
     var bench_t: i64 = 0;
 
     const is_source_build = f.bottle_url.len == 0 and f.source_url.len > 0;
+    var expected_ver_buf: [256]u8 = undefined;
+    const expected_ver = f.effectiveVersion(&expected_ver_buf);
 
     if (is_source_build) {
         const source_cache_key = if (f.install_binaries.len > 0 and nb.store.isValidSha256(f.source_sha256)) f.source_sha256 else "";
         fast: {
             if (source_cache_key.len == 0) break :fast;
             if (!nb.store.hasRelocatedEntry(g_io, source_cache_key)) break :fast;
-            var fv_buf: [256]u8 = undefined;
-            const fv = f.effectiveVersion(&fv_buf);
             phase.store(@intFromEnum(Phase.installing), .release);
-            nb.store.materializeFromRelocated(g_io, source_cache_key, f.name, fv) catch break :fast;
+            nb.store.materializeFromRelocated(g_io, source_cache_key, f.name, expected_ver) catch break :fast;
             phase.store(@intFromEnum(Phase.linking), .release);
-            linkFormulaKeg(alloc, f.name, fv, use_shims, requested, all_formulae) catch |err| {
+            linkFormulaKeg(alloc, f.name, expected_ver, use_shims, requested, all_formulae) catch |err| {
                 stderr.print("nb: {s}: link failed: {}\n", .{ f.name, err }) catch {};
                 fail_reason.* = "link failed";
                 had_error.store(true, .release);
@@ -1325,9 +1479,7 @@ fn fullInstallOne(
             // Source builds create the keg directory before invoking the build.
             // Remove that staging directory on failure so DB healing cannot
             // mistake an empty payload for a completed install (#345).
-            var failed_ver_buf: [256]u8 = undefined;
-            const failed_ver = f.effectiveVersion(&failed_ver_buf);
-            nb.cellar.remove(f.name, failed_ver) catch {};
+            nb.cellar.remove(f.name, expected_ver) catch {};
             stderr.print("nb: {s}: source build failed: {}\n", .{ f.name, err }) catch {};
             fail_reason.* = "source build failed";
             had_error.store(true, .release);
@@ -1389,11 +1541,16 @@ fn fullInstallOne(
         phase.store(@intFromEnum(Phase.installing), .release);
         fast: {
             if (!nb.store.hasRelocatedEntry(g_io, f.bottle_sha256)) break :fast;
-            var fv_buf: [256]u8 = undefined;
-            const fv = nb.store.detectEntryVersion(g_io, f.bottle_sha256, f.name, f.version, &fv_buf) orelse
-                nb.cellar.detectKegVersion(f.name, f.version, &fv_buf) orelse
-                f.version;
+            var detected_ver_buf: [256]u8 = undefined;
+            const fv = nb.store.detectEntryVersion(g_io, f.bottle_sha256, f.name, expected_ver, &detected_ver_buf) orelse
+                nb.cellar.detectKegVersion(f.name, expected_ver, &detected_ver_buf) orelse
+                expected_ver;
+            if (bench) bench_t = milliTimestamp();
             nb.store.materializeFromRelocated(g_io, f.bottle_sha256, f.name, fv) catch break :fast;
+            if (bench) {
+                std.debug.print("[nb-bench] {s} materialize: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
+                bench_t = milliTimestamp();
+            }
             // Relocated snapshot found — skip steps 4/4b, go straight to link+post-install
             phase.store(@intFromEnum(Phase.linking), .release);
             linkFormulaKeg(alloc, f.name, fv, use_shims, requested, all_formulae) catch |err| {
@@ -1403,14 +1560,19 @@ fn fullInstallOne(
                 phase.store(@intFromEnum(Phase.failed), .release);
                 return;
             };
+            if (bench) {
+                std.debug.print("[nb-bench] {s} link: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
+                bench_t = milliTimestamp();
+            }
             nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
                 stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
             };
+            if (bench) std.debug.print("[nb-bench] {s} postinstall: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
             phase.store(@intFromEnum(Phase.done), .release);
             return;
         }
         if (bench) bench_t = milliTimestamp();
-        nb.cellar.materialize(g_io, f.bottle_sha256, f.name, f.version) catch |err| {
+        nb.cellar.materialize(g_io, f.bottle_sha256, f.name, expected_ver) catch |err| {
             stderr.print("nb: {s}: materialize failed: {}\n", .{ f.name, err }) catch {};
             fail_reason.* = "materialize failed";
             had_error.store(true, .release);
@@ -1423,7 +1585,7 @@ fn fullInstallOne(
     // 4. Relocate (fix Homebrew placeholders in Mach-O binaries)
     phase.store(@intFromEnum(Phase.relocating), .release);
     var ver_buf: [256]u8 = undefined;
-    const actual_ver = nb.cellar.detectKegVersion(f.name, f.version, &ver_buf) orelse f.version;
+    const actual_ver = nb.cellar.detectKegVersion(f.name, expected_ver, &ver_buf) orelse expected_ver;
     if (bench) bench_t = milliTimestamp();
     platform.relocate.relocateKeg(alloc, g_io, f.name, actual_ver) catch |err| {
         stderr.print("nb: {s}: relocate failed: {}\n", .{ f.name, err }) catch {};
@@ -1474,7 +1636,9 @@ fn fullInstallOne(
     nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
         stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
     };
-    if (!probeInstalledFormula(alloc, null, f.name, actual_ver, f.install_binaries)) {
+    const probe_passed = probeInstalledFormula(alloc, null, f.name, actual_ver, f.install_binaries, .active);
+    probe_result.* = if (probe_passed) .passed else .failed;
+    if (!probe_passed) {
         stderr.print("nb: {s}: post-install probe warning: declared binaries or linked executables missing\n", .{f.name}) catch {};
     }
     if (bench) std.debug.print("[nb-bench] {s} postinstall: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
@@ -1543,64 +1707,196 @@ fn runRemove(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb list ──
 
+/// One readdir of the content-addressed store into a sha256 set, replacing
+/// one access(2) syscall per `nb list --versions` history row.
+fn loadStoreBlobSet(alloc: std.mem.Allocator) ?std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(alloc);
+    var dir = std.Io.Dir.openDirAbsolute(g_io, paths.STORE_DIR, .{ .iterate = true }) catch return null;
+    defer dir.close(g_io);
+    var iter = dir.iterate();
+    while (iter.next(g_io) catch null) |entry| {
+        if (entry.name.len != 64) continue; // sha256 hex blob dirs only
+        const name = alloc.dupe(u8, entry.name) catch continue;
+        set.put(name, {}) catch continue;
+    }
+    return set;
+}
+
+/// One readdir of a keg's Cellar dir into a version list, replacing one
+/// readdir per history row for that keg.
+fn loadKegVersionDirs(alloc: std.mem.Allocator, name: []const u8) ?[][]const u8 {
+    var buf: [512]u8 = undefined;
+    const dir_path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ paths.CELLAR_DIR, name }) catch return null;
+    var versions: std.ArrayList([]const u8) = .empty;
+    var dir = std.Io.Dir.openDirAbsolute(g_io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(g_io);
+    var iter = dir.iterate();
+    while (iter.next(g_io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const v = alloc.dupe(u8, entry.name) catch continue;
+        versions.append(alloc, v) catch continue;
+    }
+    return versions.toOwnedSlice(alloc) catch null;
+}
+
 fn runList(alloc: std.mem.Allocator, args: []const []const u8) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
 
     var show_versions = false;
+    var names_only = false;
     for (args) |a| {
-        if (std.mem.eql(u8, a, "--versions")) show_versions = true;
+        if (std.mem.eql(u8, a, "--versions")) {
+            show_versions = true;
+        } else if (std.mem.eql(u8, a, "--names")) {
+            names_only = true;
+        } else {
+            stderr.print("nb: unknown list option '{s}'\nUsage: nb list [--versions|--names]\n", .{a}) catch {};
+            std.process.exit(1);
+        }
+    }
+    if (show_versions and names_only) {
+        stderr.print("nb: --versions and --names cannot be combined\nUsage: nb list [--versions|--names]\n", .{}) catch {};
+        std.process.exit(1);
     }
 
     var db = nb.database.Database.open(alloc) catch {
         stderr.print("nb: could not open database\n", .{}) catch {};
-        return;
+        std.process.exit(1);
     };
     defer db.close();
 
     const kegs = db.listInstalled(alloc) catch {
-        stderr.print("nb: failed to list packages\n", .{}) catch {};
-        return;
+        stderr.print("nb: failed to list formulae\n", .{}) catch {};
+        std.process.exit(1);
     };
     defer alloc.free(kegs);
 
-    const casks_result = db.listInstalledCasks(alloc);
-    const casks: []const nb.database.CaskRecord = if (casks_result) |c| c else |_| &.{};
-    defer if (casks_result) |c| alloc.free(c) else |_| {};
+    const casks = db.listInstalledCasks(alloc) catch {
+        stderr.print("nb: failed to list casks\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer alloc.free(casks);
 
-    const debs_result = db.listInstalledDebs(alloc);
-    const debs: []const nb.database.DebRecord = if (debs_result) |d| d else |_| &.{};
-    defer if (debs_result) |d| alloc.free(d) else |_| {};
+    const debs = db.listInstalledDebs(alloc) catch {
+        stderr.print("nb: failed to list deb packages\n", .{}) catch {};
+        std.process.exit(1);
+    };
+    defer alloc.free(debs);
+
+    // --versions: per-row switchable flags, computed up front by a small
+    // worker pool. A row is switchable when its blob is in the store (one
+    // shared readdir, answered from a set) or its keg dir still exists (one
+    // readdir per keg, not per row). On real inventories with long upgrade
+    // histories that is ~900 existence checks down to ~200 dir scans.
+    const VersionRow = struct { version: []const u8, sha256: []const u8, switchable: bool };
+    var version_rows: ?[]?[]VersionRow = null;
+    if (show_versions and kegs.len > 0) {
+        if (alloc.alloc(?[]VersionRow, kegs.len) catch null) |rows| {
+            version_rows = rows;
+            @memset(rows, null);
+            var any = false;
+            for (kegs, 0..) |keg, ki| {
+                const hist = db.getHistory(keg.name);
+                if (hist.len == 0) continue;
+                const r = alloc.alloc(VersionRow, hist.len) catch continue;
+                for (hist, 0..) |h, hi| r[hi] = .{ .version = h.version, .sha256 = h.sha256, .switchable = false };
+                rows[ki] = r;
+                any = true;
+            }
+            if (any) {
+                var store_set = loadStoreBlobSet(alloc);
+                defer if (store_set) |*s| s.deinit();
+                const VCtx = struct {
+                    rows: []?[]VersionRow,
+                    kegs: []const nb.database.Keg,
+                    store_set: ?*std.StringHashMap(void),
+                    next_idx: std.atomic.Value(usize),
+                };
+                const vWorker = struct {
+                    fn run(ctx: *VCtx) void {
+                        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                        defer arena.deinit();
+                        const a = arena.allocator();
+                        while (true) {
+                            const ki = ctx.next_idx.fetchAdd(1, .monotonic);
+                            if (ki >= ctx.kegs.len) break;
+                            const keg = ctx.kegs[ki];
+                            const r = ctx.rows[ki] orelse continue;
+                            var versions_loaded = false;
+                            var versions: [][]const u8 = &.{};
+                            for (r) |*row| {
+                                row.switchable = (row.sha256.len > 0 and if (ctx.store_set) |set|
+                                    set.contains(row.sha256)
+                                else
+                                    row.sha256.len > 0 and nb.store.hasEntry(g_io, row.sha256)) or blk: {
+                                    if (!versions_loaded) {
+                                        versions = loadKegVersionDirs(a, keg.name) orelse &.{};
+                                        versions_loaded = true;
+                                    }
+                                    for (versions) |v| {
+                                        if (std.mem.eql(u8, v, row.version)) break :blk true;
+                                    }
+                                    break :blk false;
+                                };
+                            }
+                        }
+                    }
+                }.run;
+                var vctx: VCtx = .{ .rows = rows, .kegs = kegs, .store_set = if (store_set) |*s| s else null, .next_idx = std.atomic.Value(usize).init(0) };
+                const n_workers = @min(@as(usize, 4), kegs.len);
+                if (n_workers > 1) {
+                    var handles: [4]std.Thread = undefined;
+                    var spawned: usize = 0;
+                    for (0..n_workers) |_| {
+                        handles[spawned] = std.Thread.spawn(.{}, vWorker, .{&vctx}) catch break;
+                        spawned += 1;
+                    }
+                    for (handles[0..spawned]) |h| h.join();
+                } else {
+                    vWorker(&vctx);
+                }
+            }
+        }
+    }
 
     if (kegs.len == 0 and casks.len == 0 and debs.len == 0) {
-        stdout.print("No packages installed.\n", .{}) catch {};
+        if (!names_only) stdout.print("No packages installed.\n", .{}) catch {};
         return;
     }
 
-    for (kegs) |keg| {
+    for (kegs, 0..) |keg, ki| {
+        if (names_only) {
+            stdout.print("{s}\n", .{keg.name}) catch {};
+            continue;
+        }
         const pin_tag = if (keg.pinned) " [pinned]" else "";
         stdout.print("{s} {s}{s}\n", .{ keg.name, keg.version, pin_tag }) catch {};
         if (show_versions) {
-            // Newest history first. A version is switchable when its blob is
-            // still in the content-addressed store (cleanup may prune it).
-            const hist = db.getHistory(keg.name);
-            var idx = hist.len;
+            // Newest history first; flags were precomputed above.
+            const rows = if (version_rows) |vrs| vrs[ki] orelse &.{} else &.{};
+            var idx = rows.len;
             while (idx > 0) {
                 idx -= 1;
-                const h = hist[idx];
-                var kv_buf: [256]u8 = undefined;
-                const switchable = (h.sha256.len > 0 and nb.store.hasEntry(g_io, h.sha256)) or
-                    nb.cellar.detectKegVersion(keg.name, h.version, &kv_buf) != null;
-                const avail = if (switchable) " (switchable)" else "";
-                stdout.print("    {s}{s}\n", .{ h.version, avail }) catch {};
+                const row = rows[idx];
+                const avail = if (row.switchable) " (switchable)" else "";
+                stdout.print("    {s}{s}\n", .{ row.version, avail }) catch {};
             }
         }
     }
     for (casks) |c| {
-        stdout.print("{s} {s} (cask)\n", .{ c.token, c.version }) catch {};
+        if (names_only) {
+            stdout.print("{s}\n", .{c.token}) catch {};
+        } else {
+            stdout.print("{s} {s} (cask)\n", .{ c.token, c.version }) catch {};
+        }
     }
     for (debs) |d| {
-        stdout.print("{s} {s} (deb)\n", .{ d.name, d.version }) catch {};
+        if (names_only) {
+            stdout.print("{s}\n", .{d.name}) catch {};
+        } else {
+            stdout.print("{s} {s} (deb)\n", .{ d.name, d.version }) catch {};
+        }
     }
 }
 
@@ -1780,6 +2076,25 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
         fetched_formulae.deinit(alloc);
     }
 
+    // The validated bulk sidecar carries dependency lists, so one scan can
+    // answer almost every installed formula without parsing hundreds of JSON
+    // objects. Only taps/upstream-only tokens enter the fallback worker queue.
+    var dependency_index: ?nb.bulk_versions.DependencyIndex = null;
+    defer if (dependency_index) |*idx| idx.deinit();
+    const bulk_names = alloc.alloc([]const u8, kegs.len) catch null;
+    defer if (bulk_names) |names| alloc.free(names);
+    if (bulk_names) |names| {
+        for (kegs, 0..) |keg, i| names[i] = keg.name;
+        dependency_index = nb.bulk_versions.loadFormulaDependenciesForNames(alloc, names) catch null;
+    }
+
+    var fallback_indices: std.ArrayList(usize) = .empty;
+    defer fallback_indices.deinit(alloc);
+    for (kegs, 0..) |keg, i| {
+        const in_bulk = if (dependency_index) |*idx| idx.get(keg.name) != null else false;
+        if (!in_bulk) fallback_indices.append(alloc, i) catch {};
+    }
+
     // Parallel fetch — each worker thread owns a persistent std.http.Client and
     // steals work from a shared atomic counter. Mirrors checkWorkerFn pattern.
     const SlotState = enum(u8) { empty, filled };
@@ -1797,7 +2112,9 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
 
     const LeavesCtx = struct {
         kegs_: []const nb.database.Keg,
+        fallback_indices_: []const usize,
         slots_: []Slot,
+        bulk_snapshot_loaded_: bool,
         next_idx: *std.atomic.Value(usize),
         alloc_: std.mem.Allocator,
     };
@@ -1808,14 +2125,17 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
             defer client.deinit();
 
             while (true) {
-                const idx = ctx.next_idx.fetchAdd(1, .monotonic);
-                if (idx >= ctx.kegs_.len) break;
+                const work_idx = ctx.next_idx.fetchAdd(1, .monotonic);
+                if (work_idx >= ctx.fallback_indices_.len) break;
+                const idx = ctx.fallback_indices_[work_idx];
                 const keg = ctx.kegs_[idx];
-                // Leaves only needs dependency lists — prefer the local
-                // cache/bulk-list lookup; the full fetch (upstream registry,
-                // network) is the fallback for packages outside the bulk list.
+                // A missing row is authoritative only when the validated bulk
+                // snapshot loaded successfully. Local per-name caches still get
+                // first refusal for taps and old/renamed formulae.
                 const formula = nb.api_client.fetchFormulaLocal(ctx.alloc_, keg.name) orelse
-                    (nb.api_client.fetchFormulaWithClient(ctx.alloc_, &client, keg.name) catch continue);
+                    (nb.api_client.fetchFormulaWithClientOptions(ctx.alloc_, &client, keg.name, .{
+                        .check_upstream_freshness = !ctx.bulk_snapshot_loaded_,
+                    }) catch continue);
                 ctx.slots_[idx].formula = formula;
                 ctx.slots_[idx].state = .filled;
             }
@@ -1825,12 +2145,14 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
     var next_idx = std.atomic.Value(usize).init(0);
     const ctx = LeavesCtx{
         .kegs_ = kegs,
+        .fallback_indices_ = fallback_indices.items,
         .slots_ = slots,
+        .bulk_snapshot_loaded_ = dependency_index != null,
         .next_idx = &next_idx,
         .alloc_ = alloc,
     };
 
-    const n_threads = @min(kegs.len, 8);
+    const n_threads = @min(fallback_indices.items.len, 8);
     var threads: [8]std.Thread = undefined;
     var spawned: usize = 0;
     for (0..n_threads) |_| {
@@ -1842,26 +2164,27 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
     // Collect results serially, preserving `kegs` order.
     var failed_names: std.ArrayList([]const u8) = .empty;
     defer failed_names.deinit(alloc);
-    fetched_formulae.ensureTotalCapacity(alloc, kegs.len) catch {};
+    fetched_formulae.ensureTotalCapacity(alloc, fallback_indices.items.len) catch {};
     for (kegs, 0..) |keg, i| {
-        if (slots[i].state != .filled) {
-            failed_names.append(alloc, keg.name) catch {};
-            continue;
+        var deps: []const []const u8 = undefined;
+        if (if (dependency_index) |*idx| idx.get(keg.name) else null) |bulk_deps| {
+            deps = bulk_deps;
+        } else {
+            if (slots[i].state != .filled) {
+                failed_names.append(alloc, keg.name) catch {};
+                continue;
+            }
+            fetched_formulae.append(alloc, slots[i].formula) catch {
+                slots[i].formula.deinit(alloc);
+                continue;
+            };
+            deps = fetched_formulae.items[fetched_formulae.items.len - 1].dependencies;
         }
-        fetched_formulae.append(alloc, slots[i].formula) catch {
-            slots[i].formula.deinit(alloc);
-            continue;
-        };
-        const f = &fetched_formulae.items[fetched_formulae.items.len - 1];
-        if (show_tree) {
-            pkg_deps.put(keg.name, f.dependencies) catch {};
-        }
-        for (f.dependencies) |dep| {
+        if (show_tree) pkg_deps.put(keg.name, deps) catch {};
+        for (deps) |dep| {
             if (std.mem.eql(u8, dep, keg.name)) continue; // skip self-dep
             // O(1) membership test against installed kegs.
-            if (keg_set.contains(dep)) {
-                depended_on.put(dep, {}) catch {};
-            }
+            if (keg_set.contains(dep)) depended_on.put(dep, {}) catch {};
         }
     }
 
@@ -1899,29 +2222,23 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb info ──
 
-fn probeExecutableCommand(alloc: std.mem.Allocator, stdout: ?StdoutWriter, owner: []const u8, path: []const u8) bool {
-    const attempts = [_][]const u8{ "--version", "version", "--help" };
-    const timeout_script = "\"$1\" \"$2\" & pid=$!; (sleep 2; kill $pid 2>/dev/null) & watcher=$!; wait $pid; status=$?; kill $watcher 2>/dev/null; exit $status";
-    for (attempts) |arg| {
-        const res = std.process.run(alloc, g_io, .{ .argv = &.{ "sh", "-c", timeout_script, "nb-probe", path, arg } }) catch continue;
-        defer alloc.free(res.stdout);
-        defer alloc.free(res.stderr);
-        switch (res.term) {
-            .exited => |code| {
-                if (code == 0 or code == 1 or code == 2) return true;
-            },
-            else => {},
-        }
-    }
-    if (stdout) |out| out.print("  ✗ {s}: binary did not answer --version/version/--help within 2s: {s}\n", .{ owner, path }) catch {};
+fn probeExecutableCommand(alloc: std.mem.Allocator, stdout: ?StdoutWriter, owner: []const u8, path: []const u8, session: *nb.trust_probe.Session) bool {
+    if (session.executableAnswers(alloc, path)) return true;
+    if (stdout) |out| out.print("  ✗ {s}: binary did not answer within the package-wide 2s probe budget: {s}\n", .{ owner, path }) catch {};
     return false;
 }
 
-fn verifyCaskSignature(alloc: std.mem.Allocator, stdout: ?StdoutWriter, token: []const u8, app_path: []const u8) bool {
+fn verifyCaskSignature(alloc: std.mem.Allocator, stdout: ?StdoutWriter, token: []const u8, app_path: []const u8, session: *nb.trust_probe.Session) bool {
     if (comptime builtin.os.tag != .macos) return true;
     if (!std.mem.endsWith(u8, app_path, ".app")) return true;
 
-    const res = std.process.run(alloc, g_io, .{ .argv = &.{ "codesign", "--verify", "--deep", "--strict", app_path } }) catch {
+    const res = std.process.run(alloc, g_io, .{
+        .argv = &.{ "codesign", "--verify", "--deep", "--strict", app_path },
+        .cwd = .{ .path = session.cwd() },
+        .timeout = session.timeout(),
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch {
         if (stdout) |out| out.print("  ✗ {s}: codesign verification could not run for {s}\n", .{ token, app_path }) catch {};
         return false;
     };
@@ -1937,18 +2254,72 @@ fn verifyCaskSignature(alloc: std.mem.Allocator, stdout: ?StdoutWriter, token: [
     return false;
 }
 
+fn pathIsWithin(path: []const u8, root: []const u8) bool {
+    var resolved_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = std.Io.Dir.cwd().realPathFile(g_io, path, &resolved_path_buf) catch return false;
+    const resolved_path = resolved_path_buf[0..path_len];
+    var resolved_root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = std.Io.Dir.cwd().realPathFile(g_io, root, &resolved_root_buf) catch return false;
+    const resolved_root = resolved_root_buf[0..root_len];
+    return std.mem.eql(u8, resolved_path, resolved_root) or
+        (resolved_path.len > resolved_root.len and
+            std.mem.startsWith(u8, resolved_path, resolved_root) and
+            resolved_path[resolved_root.len] == '/');
+}
+
+fn symlinkTargetIsWithin(linked: []const u8, root: []const u8) bool {
+    var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const target_len = std.Io.Dir.readLinkAbsolute(g_io, linked, &target_buf) catch return false;
+    return pathIsWithin(target_buf[0..target_len], root);
+}
+
+fn ownedCaskBinaryTarget(cask: nb.database.CaskRecord, linked: []const u8, target_buf: []u8) ?[]const u8 {
+    const target_len = std.Io.Dir.readLinkAbsolute(g_io, linked, target_buf) catch return null;
+    const target = target_buf[0..target_len];
+    const canonical_token = if (cask.canonical_token.len > 0) cask.canonical_token else cask.token;
+    const filesystem_token = nb.cask_installer.filesystemToken(canonical_token) orelse return null;
+    var caskroom_buf: [1024]u8 = undefined;
+    const caskroom = std.fmt.bufPrint(&caskroom_buf, "{s}/{s}/{s}", .{
+        paths.CASKROOM_DIR, filesystem_token, cask.version,
+    }) catch return null;
+    if (pathIsWithin(target, caskroom)) return target;
+
+    for (cask.apps) |app| {
+        var app_buf: [1024]u8 = undefined;
+        const app_path = std.fmt.bufPrint(&app_buf, "/Applications/{s}", .{app}) catch continue;
+        if (pathIsWithin(target, app_path)) return target;
+    }
+    return null;
+}
+
 fn probeInstalledCask(
     alloc: std.mem.Allocator,
     stdout: ?StdoutWriter,
     cask: nb.database.CaskRecord,
+    mode: ProbeMode,
 ) bool {
     var ok = true;
+    var active_checks: usize = 0;
+    var active_session: ?nb.trust_probe.Session = if (mode == .active)
+        nb.trust_probe.Session.init(g_io, .{
+            .raw = std.Io.Duration.fromSeconds(2),
+            .clock = .awake,
+        }) catch return false
+    else
+        null;
+    defer if (active_session) |*session| session.deinit();
+    const canonical_token = if (cask.canonical_token.len > 0) cask.canonical_token else cask.token;
+    const caskroom_token = nb.cask_installer.filesystemToken(canonical_token) orelse return false;
     var caskroom_buf: [512]u8 = undefined;
-    const caskroom_dir = std.fmt.bufPrint(&caskroom_buf, "{s}/{s}/{s}", .{ paths.CASKROOM_DIR, cask.token, cask.version }) catch return false;
+    const caskroom_dir = std.fmt.bufPrint(&caskroom_buf, "{s}/{s}/{s}", .{ paths.CASKROOM_DIR, caskroom_token, cask.version }) catch return false;
     std.Io.Dir.accessAbsolute(g_io, caskroom_dir, .{}) catch {
         if (stdout) |out| out.print("  ✗ {s}: missing Caskroom payload {s}\n", .{ cask.token, caskroom_dir }) catch {};
         return false;
     };
+    if (cask.apps.len == 0 and cask.binaries.len == 0) {
+        if (stdout) |out| out.print("  ✗ {s}: no app or binary artifacts are recorded for verification\n", .{cask.token}) catch {};
+        return false;
+    }
 
     for (cask.apps) |app| {
         var app_buf: [1024]u8 = undefined;
@@ -1961,7 +2332,14 @@ fn probeInstalledCask(
             ok = false;
             continue;
         };
-        if (!verifyCaskSignature(alloc, stdout, cask.token, app_path)) ok = false;
+        if (mode == .active) {
+            active_checks += 1;
+            if (active_session) |*session| {
+                if (!verifyCaskSignature(alloc, stdout, cask.token, app_path, session)) ok = false;
+            } else {
+                ok = false;
+            }
+        }
     }
 
     for (cask.binaries) |bin| {
@@ -1976,10 +2354,31 @@ fn probeInstalledCask(
             ok = false;
             continue;
         };
-        if (!probeExecutableCommand(alloc, stdout, cask.token, linked)) ok = false;
+        var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const target = ownedCaskBinaryTarget(cask, linked, &target_buf) orelse {
+            if (stdout) |out| out.print("  ✗ {s}: binary link is not owned by this cask: {s}\n", .{ cask.token, linked }) catch {};
+            ok = false;
+            continue;
+        };
+        std.Io.Dir.accessAbsolute(g_io, target, .{ .execute = true }) catch {
+            ok = false;
+            continue;
+        };
+        if (mode == .active) {
+            active_checks += 1;
+            if (active_session) |*session| {
+                if (!probeExecutableCommand(alloc, stdout, cask.token, target, session)) ok = false;
+            } else {
+                ok = false;
+            }
+        }
     }
 
-    if (ok) {
+    if (mode == .active and active_checks == 0) {
+        if (stdout) |out| out.print("  ✗ {s}: no executable or signed app artifact was actively checked\n", .{cask.token}) catch {};
+        return false;
+    }
+    if (ok and mode == .active) {
         if (stdout) |out| out.print("  ✓ {s} {s}: cask probe passed\n", .{ cask.token, cask.version }) catch {};
     }
     return ok;
@@ -1991,15 +2390,24 @@ fn probeInstalledFormula(
     name: []const u8,
     version: []const u8,
     declared_binaries: []const []const u8,
+    mode: ProbeMode,
 ) bool {
     var ok = true;
+    var active_checks: usize = 0;
+    var active_session: ?nb.trust_probe.Session = if (mode == .active)
+        nb.trust_probe.Session.init(g_io, .{
+            .raw = std.Io.Duration.fromSeconds(2),
+            .clock = .awake,
+        }) catch return false
+    else
+        null;
+    defer if (active_session) |*session| session.deinit();
     var keg_buf: [512]u8 = undefined;
     const keg_dir = std.fmt.bufPrint(&keg_buf, "{s}/Cellar/{s}/{s}", .{ PREFIX, name, version }) catch return false;
     std.Io.Dir.accessAbsolute(g_io, keg_dir, .{}) catch {
         if (stdout) |out| out.print("  ✗ {s}: missing Cellar dir {s}\n", .{ name, keg_dir }) catch {};
         return false;
     };
-
     if (declared_binaries.len > 0) {
         for (declared_binaries) |rel| {
             const base = std.fs.path.basename(rel);
@@ -2022,12 +2430,24 @@ fn probeInstalledFormula(
                 ok = false;
                 continue;
             };
-            if (!probeExecutableCommand(alloc, stdout, name, linked)) ok = false;
+            if (!symlinkTargetIsWithin(linked, keg_dir)) {
+                if (stdout) |out| out.print("  ✗ {s}: public link is not owned by this keg: {s}\n", .{ name, linked }) catch {};
+                ok = false;
+                continue;
+            }
+            if (mode == .active) {
+                active_checks += 1;
+                if (active_session) |*session| {
+                    if (!probeExecutableCommand(alloc, stdout, name, cellar_bin, session)) ok = false;
+                } else {
+                    ok = false;
+                }
+            }
         }
     } else {
         // No declared binaries in metadata: discover executable files in keg/bin
-        // and verify any that exist are linked. Library-only kegs with no bin/
-        // executables still pass the DB↔disk part of the probe.
+        // and verify any that exist are linked. Library-only kegs can pass the
+        // structural check, but cannot produce active executable evidence.
         var bin_buf: [512]u8 = undefined;
         const bin_dir = std.fmt.bufPrint(&bin_buf, "{s}/bin", .{keg_dir}) catch return false;
         if (std.Io.Dir.openDirAbsolute(g_io, bin_dir, .{ .iterate = true })) |d| {
@@ -2049,12 +2469,28 @@ fn probeInstalledFormula(
                     ok = false;
                     continue;
                 };
-                if (!probeExecutableCommand(alloc, stdout, name, linked)) ok = false;
+                if (!symlinkTargetIsWithin(linked, keg_dir)) {
+                    if (stdout) |out| out.print("  ✗ {s}: public link is not owned by this keg: {s}\n", .{ name, linked }) catch {};
+                    ok = false;
+                    continue;
+                }
+                if (mode == .active) {
+                    active_checks += 1;
+                    if (active_session) |*session| {
+                        if (!probeExecutableCommand(alloc, stdout, name, keg_bin, session)) ok = false;
+                    } else {
+                        ok = false;
+                    }
+                }
             }
         } else |_| {}
     }
 
-    if (ok) {
+    if (mode == .active and active_checks == 0) {
+        if (stdout) |out| out.print("  ✗ {s}: no executable artifact was actively checked\n", .{name}) catch {};
+        return false;
+    }
+    if (ok and mode == .active) {
         if (stdout) |out| out.print("  ✓ {s} {s}: local probe passed\n", .{ name, version }) catch {};
     }
     return ok;
@@ -2081,12 +2517,27 @@ fn runInfo(alloc: std.mem.Allocator, args: []const []const u8) void {
         std.process.exit(1);
     }
 
+    // One command snapshot: multi-name info must not reparse the registry and
+    // installation database for every token. Reusing the HTTP client also keeps
+    // live metadata fallbacks on one connection pool.
+    var registry: ?nb.upstream_registry.Registry = nb.upstream_registry.loadRegistry(alloc) catch null;
+    defer if (registry) |*r| r.deinit(alloc);
+    var db: ?nb.database.Database = nb.database.Database.open(alloc) catch null;
+    defer if (db) |*d| d.close();
+    var client: std.http.Client = .{ .allocator = alloc, .io = g_io };
+    defer client.deinit();
+
     for (names.items) |name| {
         if (is_cask) {
-            showCaskInfo(alloc, stdout, stderr, name);
+            showCaskInfo(alloc, stdout, stderr, name, if (db) |*d| d else null);
         } else {
-            // Try formula first; on failure, try cask as fallback for a hint
-            const f = nb.api_client.fetchFormula(alloc, name) catch {
+            // Try formula first; on failure, try cask as fallback for a hint.
+            const f = nb.api_client.fetchFormulaWithClientAndUpstreamRegistry(
+                alloc,
+                &client,
+                name,
+                if (registry) |*r| r else null,
+            ) catch {
                 // Formula not found — try cask API to give a helpful hint
                 if (nb.api_client.fetchCask(alloc, name)) |cask| {
                     defer cask.deinit(alloc);
@@ -2099,31 +2550,59 @@ fn runInfo(alloc: std.mem.Allocator, args: []const []const u8) void {
             };
             defer f.deinit(alloc);
             const bottled = f.bottle_url.len > 0;
+            var version_buf: [256]u8 = undefined;
+            const displayed_version = f.effectiveVersion(&version_buf);
             stdout.print("{s} {s}{s}\n", .{
                 f.name,
-                f.version,
+                displayed_version,
                 if (bottled) " (bottled)" else "",
             }) catch {};
             if (f.desc.len > 0) stdout.print("  {s}\n", .{f.desc}) catch {};
             if (f.homepage.len > 0) stdout.print("  homepage: {s}\n", .{f.homepage}) catch {};
             if (f.license.len > 0) stdout.print("  license: {s}\n", .{f.license}) catch {};
-            var trust_tier: []const u8 = if (bottled and f.bottle_sha256.len >= 64) "checksum-verified" else "unverified";
-            if (nb.upstream_registry.loadRegistry(alloc)) |registry| {
-                defer registry.deinit(alloc);
-                if (registry.find(f.name, .formula)) |record| {
+            const artifact_sha = formulaArtifactSha(f);
+            var trust_tier: []const u8 = if (artifact_sha.len > 0) "checksum-verified" else "unverified";
+            if (registry) |*loaded_registry| {
+                if (loaded_registry.find(f.name, .formula)) |record| {
                     if (record.upstream.verified) trust_tier = "source-verified";
                 }
-            } else |_| {}
-            if (nb.database.Database.open(alloc)) |db_handle| {
-                var db = db_handle;
-                defer db.close();
-                if (db.findKeg(f.name)) |keg| {
-                    if (probeInstalledFormula(alloc, null, f.name, keg.version, f.install_binaries)) {
-                        trust_tier = "install-verified";
+            }
+            var local_probe_status: []const u8 = "not recorded";
+            var local_probe_time: i64 = 0;
+            if (db) |*loaded_db| {
+                if (loaded_db.findKeg(f.name)) |keg| {
+                    // Install evidence is version/checksum/platform-specific: an
+                    // older keg or a probe produced under different semantics must
+                    // not promote the metadata currently displayed.
+                    if (artifact_sha.len > 0 and
+                        std.mem.eql(u8, keg.version, displayed_version) and
+                        std.mem.eql(u8, keg.sha256, artifact_sha) and
+                        keg.probed_at >= keg.installed_at and
+                        keg.probed_at > 0)
+                    {
+                        local_probe_time = keg.probed_at;
+                        const compatible = keg.probe_schema == LOCAL_PROBE_SCHEMA and
+                            keg.probe_platform == LOCAL_PROBE_PLATFORM;
+                        const structurally_valid = compatible and
+                            keg.probe_success and
+                            probeInstalledFormula(alloc, null, f.name, keg.version, f.install_binaries, .structural);
+                        local_probe_status = if (!compatible)
+                            "stale"
+                        else if (!keg.probe_success)
+                            "failed"
+                        else if (structurally_valid)
+                            "passed"
+                        else
+                            "invalidated";
+                        if (structurally_valid) trust_tier = "install-verified";
                     }
                 }
-            } else |_| {}
-            stdout.print("  trust: {s} (evidence: local, {d})\n", .{ trust_tier, monoUnixSeconds() }) catch {};
+            }
+            if (local_probe_time > 0) {
+                stdout.print("  trust: {s} (local probe: {s}, {d})\n", .{ trust_tier, local_probe_status, local_probe_time }) catch {};
+            } else {
+                stdout.print("  trust: {s} (local probe: not recorded; run `nb doctor --probe {s}`)\n", .{ trust_tier, f.name }) catch {};
+            }
             if (bottled) {
                 stdout.print("  url: {s}\n", .{f.bottle_url}) catch {};
                 if (f.bottle_sha256.len > 0) stdout.print("  sha256: {s}\n", .{f.bottle_sha256}) catch {};
@@ -2156,7 +2635,7 @@ fn runInfo(alloc: std.mem.Allocator, args: []const []const u8) void {
     }
 }
 
-fn showCaskInfo(alloc: std.mem.Allocator, stdout: anytype, stderr: anytype, name: []const u8) void {
+fn showCaskInfo(alloc: std.mem.Allocator, stdout: anytype, stderr: anytype, name: []const u8, db: ?*nb.database.Database) void {
     const cask = nb.api_client.fetchCask(alloc, name) catch {
         stderr.print("nb: cask '{s}' not found\n", .{name}) catch {};
         return;
@@ -2185,16 +2664,48 @@ fn showCaskInfo(alloc: std.mem.Allocator, stdout: anytype, stderr: anytype, name
     // SHA256
     stdout.print("  sha256: {s}\n", .{cask.sha256}) catch {};
 
-    var trust_tier: []const u8 = if (cask.sha256.len >= 64) "checksum-verified" else "unverified";
+    const has_valid_sha256 = nb.store.isValidSha256(cask.sha256);
+    var trust_tier: []const u8 = if (has_valid_sha256) "checksum-verified" else "unverified";
     if (cask.metadata_source == .verified_upstream) trust_tier = "source-verified";
-    if (nb.database.Database.open(alloc)) |db_handle| {
-        var db = db_handle;
-        defer db.close();
-        if (db.findCask(name)) |installed| {
-            if (probeInstalledCask(alloc, null, installed)) trust_tier = "install-verified";
+    const has_immutable_identity = has_valid_sha256 and
+        !cask.auto_updates and
+        !std.mem.eql(u8, cask.version, "latest");
+    var local_probe_status: []const u8 = "not recorded";
+    var local_probe_time: i64 = 0;
+    if (has_immutable_identity) {
+        if (db) |loaded_db| {
+            // Prefer a canonical record and fall back to the requested alias,
+            // while requiring the stored canonical identity to still match.
+            if (loaded_db.findCask(cask.token) orelse loaded_db.findCask(name)) |installed| {
+                if (std.mem.eql(u8, installed.canonical_token, cask.token) and
+                    std.mem.eql(u8, installed.version, cask.version) and
+                    std.mem.eql(u8, installed.sha256, cask.sha256) and
+                    installed.probed_at > 0)
+                {
+                    local_probe_time = installed.probed_at;
+                    const compatible = installed.probe_schema == LOCAL_PROBE_SCHEMA and
+                        installed.probe_platform == LOCAL_PROBE_PLATFORM;
+                    const structurally_valid = compatible and
+                        installed.probe_success and
+                        probeInstalledCask(alloc, null, installed, .structural);
+                    local_probe_status = if (!compatible)
+                        "stale"
+                    else if (!installed.probe_success)
+                        "failed"
+                    else if (structurally_valid)
+                        "passed"
+                    else
+                        "invalidated";
+                    if (structurally_valid) trust_tier = "install-verified";
+                }
+            }
         }
-    } else |_| {}
-    stdout.print("  trust: {s} (evidence: local, {d})\n", .{ trust_tier, monoUnixSeconds() }) catch {};
+    }
+    if (local_probe_time > 0) {
+        stdout.print("  trust: {s} (local probe: {s}, {d})\n", .{ trust_tier, local_probe_status, local_probe_time }) catch {};
+    } else {
+        stdout.print("  trust: {s} (local probe: not recorded; run `nb doctor --probe {s}`)\n", .{ trust_tier, cask.token }) catch {};
+    }
 
     printCaskSecurityWarnings(stdout, "  ", &cask);
 
@@ -2339,7 +2850,9 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
             if (filter_names.len > 0) {
                 var found = false;
                 for (filter_names) |n| {
-                    if (std.mem.eql(u8, n, c.token)) {
+                    if (std.mem.eql(u8, n, c.token) or
+                        std.mem.eql(u8, n, c.canonical_token))
+                    {
                         found = true;
                         break;
                     }
@@ -2347,7 +2860,7 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
                 if (!found) continue;
             }
             to_check.append(alloc, .{
-                .name = c.token,
+                .name = if (c.canonical_token.len > 0) c.canonical_token else c.token,
                 .old_ver = c.version,
                 .is_cask = true,
                 .is_pinned = false,
@@ -2392,16 +2905,32 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
     var cask_index: ?nb.bulk_versions.VersionIndex = null;
     defer if (cask_index) |*idx| idx.deinit();
     {
-        var want_formula = false;
-        var want_cask = false;
+        var formula_names: std.ArrayList([]const u8) = .empty;
+        defer formula_names.deinit(alloc);
+        var cask_names: std.ArrayList([]const u8) = .empty;
+        defer cask_names.deinit(alloc);
+        var formula_names_complete = true;
+        var cask_names_complete = true;
         for (to_check.items) |item| {
-            if (item.is_cask) want_cask = true else want_formula = true;
+            if (item.is_cask) {
+                cask_names.append(alloc, item.name) catch {
+                    cask_names_complete = false;
+                };
+            } else {
+                formula_names.append(alloc, item.name) catch {
+                    formula_names_complete = false;
+                };
+            }
         }
-        if (want_formula) formula_index = nb.bulk_versions.loadFormulaIndex(alloc) catch null;
+        if (formula_names_complete and formula_names.items.len > 0) {
+            formula_index = nb.bulk_versions.loadFormulaIndexForNames(alloc, formula_names.items) catch null;
+        }
         // The bulk cask list exposes a single top-level version that can be
         // the arm64 variant. Intel must use per-cask parsing so architecture
         // conditionals select an actually installable version (#342).
-        if (want_cask and builtin.cpu.arch != .x86_64) cask_index = nb.bulk_versions.loadCaskIndex(alloc) catch null;
+        if (cask_names_complete and cask_names.items.len > 0 and builtin.cpu.arch != .x86_64) {
+            cask_index = nb.bulk_versions.loadCaskIndexForNames(alloc, cask_names.items) catch null;
+        }
     }
 
     // Parallel version check — each thread gets its own HTTP client
@@ -2416,7 +2945,13 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
     for (version_results) |*r| r.* = .{};
 
     // Resolve what we can locally; queue only the misses for network fetch.
-    var fetch_queue: std.ArrayList(usize) = .empty;
+    // Freshness may be skipped only when a successfully loaded bulk index
+    // positively proved that the token was absent.
+    const FetchRequest = struct {
+        item_idx: usize,
+        proven_bulk_miss: bool,
+    };
+    var fetch_queue: std.ArrayList(FetchRequest) = .empty;
     defer fetch_queue.deinit(alloc);
     for (to_check.items, 0..) |item, i| {
         const idx_ref: ?*const nb.bulk_versions.VersionIndex = if (item.is_cask)
@@ -2432,13 +2967,16 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
                 version_results[i].has_update = true;
             }
         } else {
-            fetch_queue.append(alloc, i) catch {};
+            fetch_queue.append(alloc, .{
+                .item_idx = i,
+                .proven_bulk_miss = !item.is_cask and formula_index != null,
+            }) catch {};
         }
     }
 
     const CheckCtx = struct {
         items: []const CheckItem,
-        queue: []const usize,
+        queue: []const FetchRequest,
         results: []VersionResult,
         next_idx: *std.atomic.Value(usize),
         alloc_: std.mem.Allocator,
@@ -2452,7 +2990,8 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
             while (true) {
                 const qpos = ctx.next_idx.fetchAdd(1, .monotonic);
                 if (qpos >= ctx.queue.len) break;
-                const idx = ctx.queue[qpos];
+                const request = ctx.queue[qpos];
+                const idx = request.item_idx;
                 const item = ctx.items[idx];
 
                 if (item.is_cask) {
@@ -2465,11 +3004,18 @@ fn getOutdatedPackages(alloc: std.mem.Allocator, db: *nb.database.Database, filt
                         ctx.results[idx].has_update = true;
                     }
                 } else {
-                    const formula = nb.api_client.fetchFormulaWithClient(ctx.alloc_, &client, item.name) catch continue;
+                    // A proven fresh-bulk miss may be a tap or a verified-
+                    // upstream-only token. If the index failed to load, retain
+                    // the normal live freshness cross-check for correctness.
+                    const formula = nb.api_client.fetchFormulaWithClientOptions(ctx.alloc_, &client, item.name, .{
+                        .check_upstream_freshness = !request.proven_bulk_miss,
+                    }) catch continue;
                     defer formula.deinit(ctx.alloc_);
-                    if (nb.version.isNewer(formula.version, item.old_ver)) {
-                        const len = @min(formula.version.len, 128);
-                        @memcpy(ctx.results[idx].new_ver_buf[0..len], formula.version[0..len]);
+                    var latest_buf: [256]u8 = undefined;
+                    const latest = formula.effectiveVersion(&latest_buf);
+                    if (nb.version.isNewer(latest, item.old_ver)) {
+                        const len = @min(latest.len, 128);
+                        @memcpy(ctx.results[idx].new_ver_buf[0..len], latest[0..len]);
                         ctx.results[idx].new_ver_len = len;
                         ctx.results[idx].has_update = true;
                     }
@@ -2575,12 +3121,7 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
     // to date" because nothing matched the outdated set.
     if (names.items.len > 0) {
         for (names.items) |n| {
-            const found = if (is_cask) blk: {
-                const casks_result = db.listInstalledCasks(alloc) catch break :blk false;
-                defer if (casks_result.len > 0) alloc.free(casks_result);
-                for (casks_result) |c| if (std.mem.eql(u8, c.token, n)) break :blk true;
-                break :blk false;
-            } else (db.findKeg(n) != null);
+            const found = if (is_cask) (db.findCask(n) != null) else (db.findKeg(n) != null);
             if (!found) {
                 const kind = if (is_cask) "cask" else "package";
                 stderr.print("nb: upgrade: {s} '{s}' is not installed\n", .{ kind, n }) catch {};
@@ -2656,21 +3197,12 @@ fn runUpgrade(alloc: std.mem.Allocator, args: []const []const u8) void {
                     continue;
                 }
 
-                // runInstall uses its own Database instance. Keep this outer
-                // instance in sync too, otherwise its stale version remains in
-                // memory for the rest of a multi-package upgrade (#349).
-                const actual_new = installed_new.?;
-                const old_sha = alloc.dupe(u8, keg.sha256) catch {
-                    stderr.print("nb: {s}: could not update installed state\n", .{pkg.name}) catch {};
-                    continue;
-                };
-                defer alloc.free(old_sha);
+                // `runInstall` already persisted the new version, artifact SHA,
+                // and probe evidence through its own fresh Database instance.
+                // Keep this outer snapshot read-only: rewriting it here would
+                // overwrite that identity with the old SHA on close (#349).
                 nb.linker.unlinkKeg(pkg.name, keg.version) catch {};
                 nb.cellar.remove(pkg.name, keg.version) catch {};
-                db.recordInstall(pkg.name, actual_new, old_sha) catch |err| {
-                    stderr.print("nb: {s}: failed to record upgraded version: {}\n", .{ pkg.name, err }) catch {};
-                    continue;
-                };
             }
         }
         stdout.print("==> Upgraded {s} ({s} -> {s})\n", .{ pkg.name, pkg.old_ver, pkg.new_ver }) catch {};
@@ -3186,12 +3718,6 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
 
     var had_error = false;
     for (tokens) |token| {
-        // Check if already installed
-        if (db.findCask(token)) |existing| {
-            stdout.print("==> {s} {s} is already installed\n", .{ token, existing.version }) catch {};
-            continue;
-        }
-
         const token_timer = MonoTimer.start();
         stdout.print("==> Fetching cask metadata for {s}...\n", .{token}) catch {};
         var phase_timer = MonoTimer.start();
@@ -3202,6 +3728,27 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
         };
         defer cask_meta.deinit(alloc);
         nb.cask_installer.traceCaskPhase(cask_trace, token, "metadata", phase_timer.read());
+
+        // Resolve aliases before deciding this is a no-op. A requested alias can
+        // be retargeted to a different canonical cask over time; treating the old
+        // record as the new cask would orphan payloads and transfer identity.
+        if (db.findCask(token)) |existing| {
+            const installed_canonical = if (existing.canonical_token.len > 0) existing.canonical_token else existing.token;
+            if (std.mem.eql(u8, installed_canonical, cask_meta.token)) {
+                stdout.print("==> {s} {s} is already installed\n", .{ token, existing.version }) catch {};
+            } else {
+                stderr.print("nb: cask alias '{s}' now resolves to '{s}', but the installed record resolves to '{s}'\n", .{
+                    token, cask_meta.token, installed_canonical,
+                }) catch {};
+                stderr.print("    remove the existing cask explicitly before installing the retargeted alias\n", .{}) catch {};
+                had_error = true;
+            }
+            continue;
+        }
+        if (db.findCask(cask_meta.token)) |existing| {
+            stdout.print("==> {s} {s} is already installed\n", .{ cask_meta.token, existing.version }) catch {};
+            continue;
+        }
 
         if (cask_meta.metadata_source == .verified_upstream) {
             stdout.print("==> Using verified upstream release metadata for {s}\n", .{token}) catch {};
@@ -3227,16 +3774,23 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
             // current. A foreign app (no Caskroom payload) is still refused so
             // `nb remove` never deletes something nanobrew didn't install.
             var disk_ver_buf: [256]u8 = undefined;
-            if (nb.cask_installer.ownedCaskVersionOnDisk(g_io, paths.CASKROOM_DIR, token, cask_meta.version, &disk_ver_buf)) |disk_ver| {
+            if (nb.cask_installer.ownedCaskVersionOnDisk(g_io, paths.CASKROOM_DIR, cask_meta.token, cask_meta.version, &disk_ver_buf)) |disk_ver| {
                 var apps: std.ArrayList([]const u8) = .empty;
                 defer apps.deinit(alloc);
                 var binaries: std.ArrayList([]const u8) = .empty;
                 defer binaries.deinit(alloc);
                 collectCaskDbEntries(alloc, cask_meta.artifacts, &apps, &binaries);
-                db.recordCaskInstall(token, disk_ver, apps.items, binaries.items) catch {
-                    stderr.print("nb: warning: could not record existing cask install\n", .{}) catch {};
+                // Adoption cannot prove which bytes produced an existing payload.
+                db.recordCaskInstall(token, cask_meta.token, disk_ver, "", apps.items, binaries.items) catch |err| {
+                    stderr.print("nb: could not record existing cask install: {}\n", .{err}) catch {};
+                    had_error = true;
+                    break;
                 };
-                db.flush() catch {};
+                db.flush() catch |err| {
+                    stderr.print("nb: could not persist existing cask install: {}\n", .{err}) catch {};
+                    had_error = true;
+                    break;
+                };
                 if (std.mem.eql(u8, disk_ver, cask_meta.version)) {
                     stdout.print("==> {s} {s} already present on disk; recorded existing install\n", .{ token, disk_ver }) catch {};
                 } else {
@@ -3270,12 +3824,18 @@ fn runCaskInstall(alloc: std.mem.Allocator, tokens: []const []const u8) void {
         collectCaskDbEntries(alloc, cask_meta.artifacts, &apps, &binaries);
 
         phase_timer = MonoTimer.start();
-        db.recordCaskInstall(token, cask_meta.version, apps.items, binaries.items) catch {
-            stderr.print("nb: warning: could not record cask install\n", .{}) catch {};
+        db.recordCaskInstall(token, cask_meta.token, cask_meta.version, cask_meta.sha256, apps.items, binaries.items) catch |err| {
+            stderr.print("nb: payload installed but its database record failed: {}\n", .{err}) catch {};
+            had_error = true;
+            break;
         };
         // Persist after each cask so an interrupted multi-cask run keeps the
         // records for casks that already completed (issue #302).
-        db.flush() catch {};
+        db.flush() catch |err| {
+            stderr.print("nb: payload installed but its database record could not be persisted: {}\n", .{err}) catch {};
+            had_error = true;
+            break;
+        };
         nb.cask_installer.traceCaskPhase(cask_trace, token, "db_record", phase_timer.read());
         nb.cask_installer.traceCaskPhase(cask_trace, token, "command_total", token_timer.read());
 
@@ -3306,7 +3866,8 @@ fn runCaskRemove(alloc: std.mem.Allocator, tokens: []const []const u8) void {
             continue;
         };
 
-        nb.cask_installer.removeCask(alloc, g_io, token, record.version, record.apps, record.binaries) catch |err| {
+        const caskroom_token = if (record.canonical_token.len > 0) record.canonical_token else record.token;
+        nb.cask_installer.removeCask(alloc, g_io, caskroom_token, record.version, record.apps, record.binaries) catch |err| {
             stderr.print("nb: failed to remove cask '{s}': {}\n", .{ token, err }) catch {};
             continue;
         };
@@ -3345,7 +3906,8 @@ fn printUsage() void {
         \\  remove <formula>         Uninstall packages
         \\  remove --cask <app>      Uninstall macOS applications
         \\  remove --deb <pkg>       Uninstall .deb packages (Linux)
-        \\  list [--versions]        List installed packages, casks, and debs
+        \\  list [--versions|--names]
+        \\                           List installed packages, casks, and debs
         \\  leaves [--tree]          List packages with no dependents
         \\  info <formula>           Show formula info from Homebrew API
         \\  info --cask <app>        Show cask info from Homebrew API
@@ -3407,125 +3969,6 @@ fn printUsage() void {
 
 // ── nb doctor ──
 
-// ── nb doctor ──
-
-// ── Legacy post-install probe (#317) ───────────────────────────────────────────────
-// "Does it actually work?" — run each of a keg's binaries and assert it loads
-// and executes. This catches the #324-class failure where a bottle is placed
-// but its interpreter or shared libraries are missing, so the binary exists yet
-// can't run. Cheap and uniform; no per-package scripting.
-
-/// Run `<bin> <flag>` with stdio discarded and a 2s hard timeout. Returns the
-/// exit code, or null on spawn failure / timeout / death by signal.
-fn probeRunFlag(alloc: std.mem.Allocator, bin_path: []const u8, flag: []const u8) ?u8 {
-    const result = std.process.run(alloc, g_io, .{
-        .argv = &.{ bin_path, flag },
-        // Hard timeout: std.process.run kills the child and errors if it hasn't
-        // exited, so a binary that hangs on `--version` can't wedge the probe.
-        .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(2), .clock = .awake } },
-    }) catch return null;
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    return switch (result.term) {
-        .exited => |code| code,
-        else => null,
-    };
-}
-
-/// "Loads and runs": run the binary with `--version`, then `version`, then
-/// `--help` (cheap ways to make it execute and exit quickly). The probe asserts
-/// the binary *executes*, not its CLI semantics — so any clean exit counts as a
-/// pass, EXCEPT the exec/loader-failure codes 126/127 (e.g. a missing perl
-/// interpreter or `libcrypt.so.2`, the #324 class), death by signal, a spawn
-/// failure, or a timeout (all surface as null / a load-failure code). This
-/// avoids false-flagging working tools that require args and exit with a usage
-/// code like 22/64 on `--version`.
-fn probeBinaryRuns(alloc: std.mem.Allocator, bin_path: []const u8) bool {
-    const flags = [_][]const u8{ "--version", "version", "--help" };
-    for (flags) |flag| {
-        if (probeRunFlag(alloc, bin_path, flag)) |code| {
-            if (code != 126 and code != 127) return true;
-        }
-    }
-    return false;
-}
-
-/// Probe one installed keg: its Cellar dir exists and every binary in the keg's
-/// `bin/` runs. Returns true on pass; prints a one-line verdict.
-fn probeKeg(alloc: std.mem.Allocator, stdout: StdoutWriter, name: []const u8, version: []const u8) bool {
-    if (!kegHasBackingCellar(name, version)) {
-        stdout.print("  ✗ {s} {s}: no Cellar directory (phantom DB entry)\n", .{ name, version }) catch {};
-        return false;
-    }
-    var bin_buf: [768]u8 = undefined;
-    const bin_dir = std.fmt.bufPrint(&bin_buf, "{s}/Cellar/{s}/{s}/bin", .{ PREFIX, name, version }) catch return false;
-    var dir = std.Io.Dir.openDirAbsolute(g_io, bin_dir, .{ .iterate = true }) catch {
-        // No bin/ — a library-only keg. DB + Cellar present, nothing to run.
-        stdout.print("  ✓ {s} {s}: installed (no binaries)\n", .{ name, version }) catch {};
-        return true;
-    };
-    defer dir.close(g_io);
-    var iter = dir.iterate();
-    var checked: usize = 0;
-    var bad_buf: [256]u8 = undefined;
-    var bad: ?[]const u8 = null;
-    while (iter.next(g_io) catch null) |entry| {
-        if (entry.kind == .directory) continue;
-        var path_buf: [1024]u8 = undefined;
-        const bin_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ bin_dir, entry.name }) catch continue;
-        checked += 1;
-        if (!probeBinaryRuns(alloc, bin_path)) {
-            bad = std.fmt.bufPrint(&bad_buf, "{s}", .{entry.name}) catch entry.name;
-            break;
-        }
-    }
-    if (bad) |b| {
-        stdout.print("  ✗ {s} {s}: '{s}' did not run (missing interpreter or libraries?)\n", .{ name, version, b }) catch {};
-        return false;
-    }
-    stdout.print("  ✓ {s} {s}: {d} binar{s} run\n", .{ name, version, checked, if (checked == 1) @as([]const u8, "y") else "ies" }) catch {};
-    return true;
-}
-
-/// `nb doctor --probe [pkg]` — run the post-install probe over every installed
-/// keg (or just `pkg`). A later phase runs this automatically on install (#317);
-/// for now it's an on-demand "is it actually working?" diagnostic.
-fn runProbe(alloc: std.mem.Allocator, only: ?[]const u8) void {
-    const stdout = StdoutWriter{};
-    const stderr = StderrWriter{};
-    stdout.print("==> Probing installed packages (does each binary run?)...\n", .{}) catch {};
-
-    var db = nb.database.Database.open(alloc) catch {
-        stderr.print("nb: could not open database\n", .{}) catch {};
-        std.process.exit(1);
-    };
-    defer db.close();
-
-    const kegs = db.listInstalled(alloc) catch &.{};
-    defer if (kegs.len > 0) alloc.free(kegs);
-
-    var probed: usize = 0;
-    var failed: usize = 0;
-    for (kegs) |keg| {
-        if (only) |o| {
-            if (!std.mem.eql(u8, keg.name, o)) continue;
-        }
-        probed += 1;
-        if (!probeKeg(alloc, stdout, keg.name, keg.version)) failed += 1;
-    }
-
-    if (only != null and probed == 0) {
-        stderr.print("nb: '{s}' is not installed\n", .{only.?}) catch {};
-        std.process.exit(1);
-    }
-    if (failed > 0) {
-        stdout.print("==> Probe: {d}/{d} package(s) failed\n", .{ failed, probed }) catch {};
-        std.process.exit(1);
-    } else {
-        stdout.print("==> Probe: all {d} package(s) OK\n", .{probed}) catch {};
-    }
-}
-
 fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
     const stdout = StdoutWriter{};
     const stderr = StderrWriter{};
@@ -3542,12 +3985,16 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
                 if (db.findKeg(name)) |keg| {
                     const f = nb.api_client.fetchFormula(alloc, name) catch null;
                     defer if (f) |formula| formula.deinit(alloc);
-                    const declared = if (f) |formula| formula.install_binaries else &.{};
-                    if (!probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared)) issues += 1;
+                    const declared = installedFormulaDeclarations(f, keg);
+                    const passed = probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared, .active);
+                    db.recordKegProbe(keg.name, keg.version, keg.sha256, passed, LOCAL_PROBE_SCHEMA, LOCAL_PROBE_PLATFORM) catch {};
+                    if (!passed) issues += 1;
                     continue;
                 }
                 if (db.findCask(name)) |cask| {
-                    if (!probeInstalledCask(alloc, stdout, cask)) issues += 1;
+                    const passed = probeInstalledCask(alloc, stdout, cask, .active);
+                    db.recordCaskProbe(cask.canonical_token, cask.version, cask.sha256, passed, LOCAL_PROBE_SCHEMA, LOCAL_PROBE_PLATFORM) catch {};
+                    if (!passed) issues += 1;
                     continue;
                 }
                 stdout.print("  ✗ {s}: not installed\n", .{name}) catch {};
@@ -3559,13 +4006,23 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
             for (kegs) |keg| {
                 const f = nb.api_client.fetchFormula(alloc, keg.name) catch null;
                 defer if (f) |formula| formula.deinit(alloc);
-                const declared = if (f) |formula| formula.install_binaries else &.{};
-                if (!probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared)) issues += 1;
+                const declared = installedFormulaDeclarations(f, keg);
+                const passed = probeInstalledFormula(alloc, stdout, keg.name, keg.version, declared, .active);
+                db.recordKegProbe(keg.name, keg.version, keg.sha256, passed, LOCAL_PROBE_SCHEMA, LOCAL_PROBE_PLATFORM) catch {};
+                if (!passed) issues += 1;
             }
             for (db.casks.items) |cask| {
-                if (!probeInstalledCask(alloc, stdout, cask)) issues += 1;
+                const passed = probeInstalledCask(alloc, stdout, cask, .active);
+                db.recordCaskProbe(cask.canonical_token, cask.version, cask.sha256, passed, LOCAL_PROBE_SCHEMA, LOCAL_PROBE_PLATFORM) catch {};
+                if (!passed) issues += 1;
             }
         }
+        // `std.process.exit` skips defers, so persist failed evidence before the
+        // non-zero exit as well as successful results.
+        db.flush() catch |err| {
+            stderr.print("nb: doctor --probe: could not persist evidence: {} (package state changed; rerun the probe)\n", .{err}) catch {};
+            issues += 1;
+        };
         printDoctorSummary(stdout, issues);
         if (issues > 0) std.process.exit(1);
         return;
@@ -3606,26 +4063,70 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
 
     // 3. Check for broken symlinks in prefix/bin/
     {
-        var broken_links: usize = 0;
+        const LinkCheck = struct {
+            name: []const u8,
+            broken: bool = false,
+            target: [std.Io.Dir.max_path_bytes]u8 = undefined,
+            target_len: usize = 0,
+        };
+        var checks: std.ArrayList(LinkCheck) = .empty;
+        defer checks.deinit(alloc);
         if (std.Io.Dir.openDirAbsolute(g_io, PREFIX ++ "/bin", .{ .iterate = true })) |d| {
             var dir = d;
             defer dir.close(g_io);
             var iter = dir.iterate();
             while (iter.next(g_io) catch null) |entry| {
                 if (entry.kind != .sym_link) continue;
-                var link_buf: [1024]u8 = undefined;
-                const link_path = std.fmt.bufPrint(&link_buf, "{s}/bin/{s}", .{ PREFIX, entry.name }) catch continue;
-                var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-                const target_n = std.Io.Dir.readLinkAbsolute(g_io, link_path, &target_buf) catch continue;
-                const target = target_buf[0..target_n];
-                std.Io.Dir.accessAbsolute(g_io, target, .{}) catch {
-                    if (broken_links < 5) {
-                        stdout.print("  ✗ Broken symlink: {s} -> {s}\n", .{ entry.name, target }) catch {};
-                    }
-                    broken_links += 1;
-                };
+                const name = alloc.dupe(u8, entry.name) catch continue;
+                checks.append(alloc, .{ .name = name }) catch continue;
             }
         } else |_| {}
+
+        // access(2) on the link path itself resolves the target, cutting the
+        // per-link cost from readlink+access to a single syscall (readlink
+        // only runs for broken links, to fill the report). A real install has
+        // 800+ links here, so a small pool splits the syscall latency.
+        const LinkCtx = struct {
+            checks: []LinkCheck,
+            next_idx: std.atomic.Value(usize),
+        };
+        const linkWorker = struct {
+            fn run(ctx: *LinkCtx) void {
+                while (true) {
+                    const i = ctx.next_idx.fetchAdd(1, .monotonic);
+                    if (i >= ctx.checks.len) break;
+                    const c = &ctx.checks[i];
+                    var link_buf: [1024]u8 = undefined;
+                    const link_path = std.fmt.bufPrint(&link_buf, "{s}/bin/{s}", .{ PREFIX, c.name }) catch continue;
+                    std.Io.Dir.accessAbsolute(g_io, link_path, .{}) catch {
+                        c.broken = true;
+                        c.target_len = std.Io.Dir.readLinkAbsolute(g_io, link_path, &c.target) catch 0;
+                    };
+                }
+            }
+        }.run;
+        var link_ctx: LinkCtx = .{ .checks = checks.items, .next_idx = std.atomic.Value(usize).init(0) };
+        const n_workers = @min(@as(usize, 8), checks.items.len);
+        if (n_workers > 1) {
+            var handles: [8]std.Thread = undefined;
+            var spawned: usize = 0;
+            for (0..n_workers) |_| {
+                handles[spawned] = std.Thread.spawn(.{}, linkWorker, .{&link_ctx}) catch break;
+                spawned += 1;
+            }
+            for (handles[0..spawned]) |h| h.join();
+        } else if (checks.items.len > 0) {
+            linkWorker(&link_ctx);
+        }
+
+        var broken_links: usize = 0;
+        for (checks.items) |*c| {
+            if (!c.broken) continue;
+            if (broken_links < 5) {
+                stdout.print("  ✗ Broken symlink: {s} -> {s}\n", .{ c.name, c.target[0..c.target_len] }) catch {};
+            }
+            broken_links += 1;
+        }
         if (broken_links > 5) {
             stdout.print("  ✗ ...and {d} more broken symlinks\n", .{broken_links - 5}) catch {};
         }
@@ -3685,11 +4186,26 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
 
         // 5b. Installed versions whose registry pin has since been revoked
         // (CVE'd): new installs already fall back, but machines that
-        // installed before the revocation only find out here.
-        if (nb.upstream_registry.loadRegistry(alloc)) |registry| {
-            defer registry.deinit(alloc);
+        // installed before the revocation only find out here. Per-keg
+        // loadRecord rides the memoized registry snapshot (one pass to build
+        // the token map, then O(1) per keg) instead of parsing all ~650KB of
+        // records into a DOM just to look up the installed ones.
+        {
+            // Only registry records that actually carry a revocation get
+            // parsed — most snapshots have none, so this sweep is one textual
+            // pass instead of a full parse per installed keg.
+            const revoked_records = nb.upstream_registry.revokedCandidateFormulaRecords(alloc) catch &.{};
+            defer {
+                for (revoked_records) |*r| r.deinit(alloc);
+                if (revoked_records.len > 0) alloc.free(revoked_records);
+            }
             for (kegs) |keg| {
-                const record = registry.find(keg.name, .formula) orelse continue;
+                const record = blk: {
+                    for (revoked_records) |*r| {
+                        if (std.mem.eql(u8, r.token, keg.name)) break :blk r;
+                    }
+                    break :blk null;
+                } orelse continue;
                 const resolved = record.resolved orelse continue;
                 const revoked = resolved.revoked orelse continue;
                 if (!std.mem.startsWith(u8, keg.version, resolved.version)) continue;
@@ -3705,7 +4221,7 @@ fn runDoctor(alloc: std.mem.Allocator, args: []const []const u8) void {
                 }
                 issues += 1;
             }
-        } else |_| {}
+        }
     }
 
     // 6. Platform-specific checks
@@ -3771,6 +4287,9 @@ fn runCleanup(alloc: std.mem.Allocator, args: []const []const u8) void {
 
     stdout.print("  Checking tmp files...\n", .{}) catch {};
     cleanupCacheDir(ROOT ++ "/cache/tmp", dry_run, &reclaimed, stdout);
+
+    // 1b. Keg trees parked for deferred removal whose reaper never ran.
+    if (!dry_run) nb.purge.sweep(g_io);
 
     // 2. Orphaned blobs and store entries
     stdout.print("  Checking orphaned entries...\n", .{}) catch {};
@@ -4241,7 +4760,7 @@ fn runLink(alloc: std.mem.Allocator, args: []const []const u8) void {
             continue;
         };
 
-        // Detect the real on-disk version (a keg dir may carry a rebuild suffix).
+        // Detect the real on-disk version (a keg dir may carry a revision suffix).
         var ver_buf: [256]u8 = undefined;
         const actual_ver = nb.cellar.detectKegVersion(name, keg.version, &ver_buf) orelse keg.version;
 
@@ -4868,7 +5387,7 @@ fn runCompletions(args: []const []const u8) void {
             \\
             \\_nb_installed() {{
             \\  local -a pkgs
-            \\  pkgs=(${{(f)"$(nb list 2>/dev/null | awk '{{print $1}}')" }})
+            \\  pkgs=(${{(f)"$(nb list --names 2>/dev/null)"}})
             \\  (( ${{#pkgs}} )) && _describe 'installed package' pkgs
             \\}}
             \\
@@ -4884,7 +5403,7 @@ fn runCompletions(args: []const []const u8) void {
             \\  else
             \\    case "${{COMP_WORDS[1]}}" in
             \\      remove|uninstall|upgrade|pin|unpin|rollback|link|unlink)
-            \\        local installed="$(nb list 2>/dev/null | awk '{{print $1}}')"
+            \\        local installed="$(nb list --names 2>/dev/null)"
             \\        COMPREPLY=($(compgen -W "$installed" -- "${{COMP_WORDS[COMP_CWORD]}}")) ;;
             \\      install)
             \\        COMPREPLY=($(compgen -W "--cask --deb --shims" -- "${{COMP_WORDS[COMP_CWORD]}}")) ;;
@@ -4934,7 +5453,7 @@ fn runCompletions(args: []const []const u8) void {
             \\complete -c nb -n '__fish_use_subcommand' -a 'nuke' -d 'Completely uninstall nanobrew'
             \\complete -c nb -n '__fish_use_subcommand' -a 'migrate' -d 'Import existing Homebrew packages'
             \\complete -c nb -n '__fish_use_subcommand' -a 'help' -d 'Show help'
-            \\complete -c nb -n '__fish_seen_subcommand_from remove uninstall upgrade pin unpin rollback link unlink' -a '(nb list 2>/dev/null | awk "{{print \\$1}}")'
+            \\complete -c nb -n '__fish_seen_subcommand_from remove uninstall upgrade pin unpin rollback link unlink' -a '(nb list --names 2>/dev/null)'
             \\complete -c nb -n '__fish_seen_subcommand_from install info' -l cask -d 'Cask mode'
             \\complete -c nb -n '__fish_seen_subcommand_from install' -l deb -d 'Deb mode'
             \\complete -c nb -n '__fish_seen_subcommand_from install' -l shims -d 'Use private dependency executable shims'
@@ -5926,7 +6445,7 @@ fn runMigrate(alloc: std.mem.Allocator) void {
 
                 const empty_apps: []const []const u8 = &.{};
                 const empty_bins: []const []const u8 = &.{};
-                db.recordCaskInstall(token, version, empty_apps, empty_bins) catch {
+                db.recordCaskInstall(token, token, version, "", empty_apps, empty_bins) catch {
                     stderr.print("nb: failed to record cask {s} {s}\n", .{ token, version }) catch {};
                     continue;
                 };

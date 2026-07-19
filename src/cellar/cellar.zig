@@ -9,6 +9,7 @@
 const std = @import("std");
 const paths = @import("../platform/paths.zig");
 const copy = @import("../platform/copy.zig");
+const purge = @import("../platform/purge.zig");
 
 /// Materialize a keg from the store into the Cellar.
 pub fn materialize(io: std.Io, sha256: []const u8, name: []const u8, version: []const u8) !void {
@@ -62,7 +63,9 @@ pub fn remove(name: []const u8, version: []const u8) !void {
     const lib_io = paths.safe_io;
     var buf: [512]u8 = undefined;
     const keg_dir = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ paths.CELLAR_DIR, name, version }) catch return error.PathTooLong;
-    std.Io.Dir.cwd().deleteTree(lib_io, keg_dir) catch {};
+    if (std.Io.Dir.accessAbsolute(lib_io, keg_dir, .{})) |_| {
+        purge.deferTreeRemoval(lib_io, keg_dir);
+    } else |_| {}
 
     var parent_buf: [512]u8 = undefined;
     const parent_dir = std.fmt.bufPrint(&parent_buf, "{s}/{s}", .{ paths.CELLAR_DIR, name }) catch return;

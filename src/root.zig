@@ -29,6 +29,7 @@ pub const blob_cache = @import("store/blob_cache.zig");
 pub const store = @import("store/store.zig");
 pub const cellar = @import("cellar/cellar.zig");
 pub const linker = @import("linker/linker.zig");
+pub const purge = @import("platform/purge.zig");
 pub const database = @import("db/database.zig");
 pub const cask = @import("api/cask.zig");
 pub const cask_installer = @import("cask/install.zig");
@@ -40,6 +41,7 @@ pub const bulk_versions = @import("api/bulk_versions.zig");
 pub const tap = @import("api/tap.zig");
 pub const services = @import("services/services.zig");
 pub const version = @import("version.zig");
+pub const trust_probe = @import("trust/probe.zig");
 pub const upstream_registry = @import("upstream/registry.zig");
 pub const upstream_github = @import("upstream/github.zig");
 
@@ -74,6 +76,7 @@ comptime {
     _ = deb_extract;
     _ = deb_distro;
     _ = version;
+    _ = trust_probe;
     _ = upstream_registry;
     _ = upstream_github;
     _ = search_api;

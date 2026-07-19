@@ -439,7 +439,7 @@ License: [Apache 2.0](./LICENSE)
 | `nb install user/tap/formula` | | Install from a third-party tap |
 | `nb remove <pkg>` | `nb ui` | Uninstall packages |
 | `nb remove --deb <pkg>` | | Remove a .deb package (Linux/Docker) |
-| `nb list` | `nb ls` | List installed packages (brew + deb) |
+| `nb list [--versions\|--names]` | `nb ls` | List installed packages, version history, or names-only output |
 | `nb leaves [--tree]` | | List installed formulae with no dependents |
 | `nb where <pattern>` | `nb wh` | Show installed kegs, prefix files, and index hits matching pattern |
 | `nb info <pkg>` | | Show package details |

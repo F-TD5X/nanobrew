@@ -185,8 +185,11 @@ pub fn materializeFromRelocated(io: std.Io, sha256: []const u8, name: []const u8
         else => return err,
     };
 
-    // Remove existing keg if present (fresh reinstall)
-    std.Io.Dir.cwd().deleteTree(io, dest_dir) catch {};
+    // Remove existing keg if present (fresh reinstall; deferred removal)
+    const purge = @import("../platform/purge.zig");
+    if (std.Io.Dir.accessAbsolute(io, dest_dir, .{})) |_| {
+        purge.deferTreeRemoval(io, dest_dir);
+    } else |_| {}
 
     const copy = @import("../platform/copy.zig");
     if (!copy.cloneTree(&src_buf, &dest_buf)) {

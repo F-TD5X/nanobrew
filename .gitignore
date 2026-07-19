@@ -12,3 +12,5 @@ nb-linux-fresh
 dist/
 __pycache__/
 .bench-bin/
+.graff/
+.harness/

@@ -35,6 +35,9 @@ jobs:
       - name: Unit tests
         run: zig build test
 
+      - name: Shell completion regression tests
+        run: bash tests/completions.sh ./zig-out/bin/nb
+
       - name: Repository checks
         run: zig build repo-checks
 

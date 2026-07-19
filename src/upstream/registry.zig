@@ -156,6 +156,8 @@ pub const Revoked = struct {
 pub const Resolved = struct {
     tag: []const u8,
     version: []const u8,
+    revision: u32 = 0,
+    rebuild: u32 = 0,
     assets: []const ResolvedAsset,
     security_warnings: []const SecurityWarning,
     revoked: ?Revoked = null,
@@ -293,7 +295,454 @@ pub fn loadRecord(alloc: std.mem.Allocator, token: []const u8, kind: Kind) !Reco
     return loadRecordWithOptions(alloc, options, token, kind);
 }
 
+/// Process-wide memo of the cached registry snapshot. Every per-formula
+/// upstream lookup used to open + read the ~650KB cache file and needle-scan
+/// it end to end, so a resolve touching N formulae paid N file reads plus N
+/// full scans — and a token absent from the registry (most formulae) re-paid
+/// that miss path in every single process. The memo shares the snapshot bytes
+/// plus a token -> record-range map built in one pass, making every later
+/// lookup (hit or miss) O(1). Published slices are never freed; a changed
+/// cache file (mtime) replaces the memo, leaking the old one — bounded and
+/// fine for a short-lived CLI.
+const RecordRange = struct { start: usize, end: usize };
+
+const RegistryMemo = struct {
+    cache_path: []const u8,
+    mtime_ns: i96,
+    data: []const u8,
+    map: std.StringHashMap(RecordRange),
+    /// Cache snapshot is byte-identical to the embedded registry, so a
+    /// cache-map miss is definitive without consulting the embedded map.
+    embedded_identical: bool,
+    /// Last monotonic revalidation of the file's mtime. Stats are rate-limited:
+    /// a resolve burst issues hundreds of lookups in a few milliseconds.
+    last_validate_mono_ns: u64,
+};
+
+fn registryMonoNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+const REGISTRY_MEMO_REVALIDATE_NS: u64 = 20 * std.time.ns_per_ms;
+var g_registry_memo_mutex: std.atomic.Mutex = .unlocked;
+var g_registry_memo: ?*RegistryMemo = null;
+var g_embedded_map: ?std.StringHashMap(RecordRange) = null;
+
+const RegistryMemoHit = union(enum) { record: Record, miss, bypass };
+
+fn registryMemoLock() void {
+    while (!g_registry_memo_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Textual `"<field>": "<value>"` extraction from one record object.
+fn recordFieldValue(record_json: []const u8, field: []const u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{field}) catch return null;
+    const k = std.mem.indexOf(u8, record_json, needle) orelse return null;
+    var i = k + needle.len;
+    while (i < record_json.len and (record_json[i] == ' ' or record_json[i] == ':' or record_json[i] == '\t' or record_json[i] == '\n' or record_json[i] == '\r')) i += 1;
+    if (i >= record_json.len or record_json[i] != '"') return null;
+    const start = i + 1;
+    const end = std.mem.indexOfScalarPos(u8, record_json, start, '"') orelse return null;
+    return record_json[start..end];
+}
+
+/// Textual `"token": "<value>"` extraction from one record object.
+fn recordTokenValue(record_json: []const u8) ?[]const u8 {
+    return recordFieldValue(record_json, "token");
+}
+
+/// One structural pass over a registry snapshot producing token -> byte range
+/// for every record object. Keys point into `json`, which must outlive the map.
+fn buildRecordRangeMap(pa: std.mem.Allocator, json: []const u8) ?std.StringHashMap(RecordRange) {
+    var map = std.StringHashMap(RecordRange).init(pa);
+    // Root object: record '{' appears at depth 1. Root array: depth 0.
+    var rec_depth: usize = 1;
+    for (json) |c| {
+        if (c == '{') {
+            rec_depth = 1;
+            break;
+        } else if (c == '[') {
+            rec_depth = 0;
+            break;
+        } else if (c != ' ' and c != '\t' and c != '\n' and c != '\r') break;
+    }
+
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    var rec_start: usize = 0;
+    var i: usize = 0;
+    while (i < json.len) : (i += 1) {
+        const c = json[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{') {
+            if (depth == rec_depth) rec_start = i;
+            depth += 1;
+        } else if (c == '}') {
+            if (depth == rec_depth + 1) {
+                const range = RecordRange{ .start = rec_start, .end = i + 1 };
+                const slice = json[range.start..range.end];
+                if (recordTokenValue(slice)) |tok| {
+                    // Key by kind as well as token: the same token can appear
+                    // as both a formula and a cask, and a kind-mismatched hit
+                    // used to fall back to a full snapshot scan.
+                    const kind_str = recordFieldValue(slice, "kind") orelse "";
+                    var key_buf: [320]u8 = undefined;
+                    if (std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ kind_str, tok })) |key| {
+                        if (pa.dupe(u8, key)) |key_owned| {
+                            const gop = map.getOrPut(key_owned) catch {
+                                pa.free(key_owned);
+                                depth -= 1;
+                                continue;
+                            };
+                            if (gop.found_existing) {
+                                pa.free(key_owned);
+                            } else {
+                                gop.value_ptr.* = range;
+                            }
+                        } else |_| {}
+                    } else |_| {}
+                }
+            }
+            depth -= 1;
+        }
+    }
+    if (map.count() == 0) {
+        map.deinit();
+        return null;
+    }
+    return map;
+}
+
+/// On-disk companion index for a registry snapshot: `kind:token\tstart\tend`
+/// rows plus a validated row-count footer, written atomically. Rebuilding the
+/// token map is a full structural pass over ~650KB of JSON; the sidecar lets
+/// every later process load it in one small read. Rows point into the JSON
+/// bytes, so the snapshot is still read (but not scanned) per process.
+const REGISTRY_IDX_SUFFIX = ".idx.v1";
+const REGISTRY_IDX_FOOTER_PREFIX = "#nanobrew-registry-index-v1\t";
+
+fn registryIdxLoad(pa: std.mem.Allocator, idx_path: []const u8, json_mtime_ns: i96) ?std.StringHashMap(RecordRange) {
+    const io = paths.safe_io;
+    const file = openReadableFile(io, idx_path) catch return null;
+    defer file.close(io);
+    const st = file.stat(io) catch return null;
+    // A sidecar older than the snapshot it indexes is stale: byte ranges no
+    // longer line up (the per-record token check would catch it, but every
+    // lookup would fall back to a full scan — rebuild instead).
+    if (st.mtime.nanoseconds < json_mtime_ns) return null;
+    const sz: usize = @intCast(st.size);
+    if (sz == 0 or sz > 4 * 1024 * 1024) return null;
+    const buf = pa.alloc(u8, sz) catch return null;
+    const n = file.readPositionalAll(io, buf, 0) catch {
+        pa.free(buf);
+        return null;
+    };
+    if (n != sz) {
+        pa.free(buf);
+        return null;
+    }
+    const tsv = buf;
+    // Footer validation (SIMD row count), same contract as the search idx.
+    if (tsv.len == 0 or tsv[tsv.len - 1] != '\n') {
+        pa.free(tsv);
+        return null;
+    }
+    const without_final = tsv[0 .. tsv.len - 1];
+    const footer_start = if (std.mem.lastIndexOfScalar(u8, without_final, '\n')) |idx| idx + 1 else 0;
+    const footer = without_final[footer_start..];
+    if (!std.mem.startsWith(u8, footer, REGISTRY_IDX_FOOTER_PREFIX)) {
+        pa.free(tsv);
+        return null;
+    }
+    const expected = std.fmt.parseInt(usize, footer[REGISTRY_IDX_FOOTER_PREFIX.len..], 10) catch {
+        pa.free(tsv);
+        return null;
+    };
+    const body = tsv[0..footer_start];
+    if (std.mem.count(u8, body, "\n") != expected) {
+        pa.free(tsv);
+        return null;
+    }
+
+    var map = std.StringHashMap(RecordRange).init(pa);
+    var line_iter = std.mem.splitScalar(u8, body, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        var cols = std.mem.splitScalar(u8, line, '\t');
+        const key = cols.next() orelse continue;
+        const start_s = cols.next() orelse continue;
+        const end_s = cols.next() orelse continue;
+        const start = std.fmt.parseInt(usize, start_s, 10) catch continue;
+        const end = std.fmt.parseInt(usize, end_s, 10) catch continue;
+        const key_owned = pa.dupe(u8, key) catch continue;
+        map.put(key_owned, .{ .start = start, .end = end }) catch {
+            pa.free(key_owned);
+            continue;
+        };
+    }
+    if (map.count() == 0) {
+        map.deinit();
+        pa.free(tsv);
+        return null;
+    }
+    return map;
+}
+
+fn registryIdxWrite(idx_path: []const u8, map: *const std.StringHashMap(RecordRange)) void {
+    const io = paths.safe_io;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        buf.print(std.heap.page_allocator, "{s}\t{d}\t{d}\n", .{ entry.key_ptr.*, entry.value_ptr.start, entry.value_ptr.end }) catch return;
+    }
+    buf.print(std.heap.page_allocator, "{s}{d}\n", .{ REGISTRY_IDX_FOOTER_PREFIX, map.count() }) catch return;
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp.{d}.{d}", .{
+        idx_path, std.c.getpid(), std.Thread.getCurrentId(),
+    }) catch return;
+    const file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    file.writeStreamingAll(io, buf.items) catch {
+        file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return;
+    };
+    file.sync(io) catch {};
+    file.close(io);
+    std.Io.Dir.renameAbsolute(tmp_path, idx_path, io) catch {
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+    };
+}
+
+fn recordFromRangeMap(alloc: std.mem.Allocator, data: []const u8, map: *const std.StringHashMap(RecordRange), token: []const u8, kind: Kind) ?Record {
+    var key_buf: [320]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ @tagName(kind), token }) catch return null;
+    const range = map.get(key) orelse return null;
+    var record = parseRecordJson(alloc, data[range.start..range.end]) catch return null;
+    if (record.kind == kind and std.mem.eql(u8, record.token, token)) return record;
+    record.deinit(alloc);
+    // Defensive: a kind-keyed hit should always validate; keep the old
+    // full-scan behavior as the safety net.
+    return parseRecordFromRegistryJson(alloc, data, token, kind) catch null;
+}
+
+fn registryMemoFastPath(alloc: std.mem.Allocator, options: LoadOptions, token: []const u8, kind: Kind) RegistryMemoHit {
+    const io = paths.safe_io;
+    if (options.cache_path.len == 0) return .bypass;
+
+    // Memo bookkeeping under the lock; the memo and maps are immutable once
+    // published, so all lookups after the first run lock-free. The file's
+    // mtime is re-statted at most once every 20ms — a resolve burst issues
+    // hundreds of lookups in less time than that.
+    const m: *RegistryMemo = blk: {
+        if (g_registry_memo) |old| {
+            if (std.mem.eql(u8, old.cache_path, options.cache_path) and
+                registryMonoNs() - old.last_validate_mono_ns < REGISTRY_MEMO_REVALIDATE_NS)
+            {
+                break :blk old;
+            }
+        }
+
+        registryMemoLock();
+        defer g_registry_memo_mutex.unlock();
+
+        // Stat the cache file; a missing/unreadable file cannot be memoized.
+        const file = openReadableFile(io, options.cache_path) catch {
+            g_registry_memo = null;
+            return .bypass;
+        };
+        const st = file.stat(io) catch {
+            file.close(io);
+            return .bypass;
+        };
+        file.close(io);
+        if (st.size == 0 or st.size > MAX_REGISTRY_JSON_BYTES) {
+            g_registry_memo = null;
+            return .bypass;
+        }
+        const mtime_ns = st.mtime.nanoseconds;
+
+        if (g_registry_memo) |old| {
+            if (std.mem.eql(u8, old.cache_path, options.cache_path) and old.mtime_ns == mtime_ns) {
+                old.last_validate_mono_ns = registryMonoNs();
+                break :blk old;
+            }
+            g_registry_memo = null; // stale memo: leak, a thread may still read it
+        }
+        if (g_registry_memo == null) {
+            const pa = std.heap.page_allocator;
+            const data = data_blk: {
+                const f = openReadableFile(io, options.cache_path) catch return .bypass;
+                defer f.close(io);
+                const sz: usize = @intCast(st.size);
+                const buf = pa.alloc(u8, sz) catch return .bypass;
+                const n = f.readPositionalAll(io, buf, 0) catch {
+                    pa.free(buf);
+                    return .bypass;
+                };
+                if (n != sz) {
+                    pa.free(buf);
+                    return .bypass;
+                }
+                break :data_blk buf;
+            };
+            // Prefer the sidecar index (one small read) over a full structural
+            // pass; it must be at least as new as the snapshot it indexes.
+            var idx_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const idx_path = std.fmt.bufPrint(&idx_path_buf, "{s}{s}", .{ options.cache_path, REGISTRY_IDX_SUFFIX }) catch "";
+            var map: ?std.StringHashMap(RecordRange) = null;
+            if (idx_path.len > 0) {
+                if (registryIdxLoad(pa, idx_path, mtime_ns)) |loaded| {
+                    map = loaded;
+                }
+            }
+            if (map == null) {
+                map = buildRecordRangeMap(pa, data);
+                if (map != null and idx_path.len > 0) {
+                    // Publish for later processes; a stale sidecar is only
+                    // refreshed when at least as new as the snapshot (write
+                    // the sidecar then bump nothing — mtime ordering vs the
+                    // snapshot is the reader's guard).
+                    registryIdxWrite(idx_path, &map.?);
+                }
+            }
+            if (map == null) {
+                pa.free(data);
+                return .bypass;
+            }
+            const path_copy = pa.dupe(u8, options.cache_path) catch {
+                pa.free(data);
+                return .bypass;
+            };
+            const memo = pa.create(RegistryMemo) catch {
+                pa.free(data);
+                pa.free(path_copy);
+                return .bypass;
+            };
+            memo.* = .{
+                .cache_path = path_copy,
+                .mtime_ns = mtime_ns,
+                .data = data,
+                .map = map.?,
+                .embedded_identical = std.mem.eql(u8, data, DEFAULT_REGISTRY_JSON),
+                .last_validate_mono_ns = registryMonoNs(),
+            };
+            g_registry_memo = memo;
+        }
+        break :blk g_registry_memo.?;
+    };
+
+    // Freshness is per-call (time advances); a stale cache must run the
+    // caller's remote-refresh flow, so stay out of the way.
+    const now_ts = std.Io.Timestamp.now(io, .real);
+    const fresh = options.cache_ttl_ns < 0 or (now_ts.nanoseconds - m.mtime_ns) <= options.cache_ttl_ns;
+    if (!fresh) return .bypass;
+
+    if (recordFromRangeMap(alloc, m.data, &m.map, token, kind)) |record| {
+        return .{ .record = record };
+    }
+    // Embedded fallback, preserving cache ∪ embedded union semantics. When the
+    // cached snapshot is byte-identical to the embedded one (the common case:
+    // the cache is a refresh of this same registry), a cache-map miss is
+    // already definitive — skip the embedded map entirely.
+    if (!m.embedded_identical) {
+        registryMemoLock();
+        const have_map = g_embedded_map != null;
+        if (!have_map) {
+            g_embedded_map = buildRecordRangeMap(std.heap.page_allocator, DEFAULT_REGISTRY_JSON);
+        }
+        const emap_opt = g_embedded_map;
+        g_registry_memo_mutex.unlock();
+        if (emap_opt) |*emap| {
+            if (recordFromRangeMap(alloc, DEFAULT_REGISTRY_JSON, emap, token, kind)) |record| {
+                return .{ .record = record };
+            }
+        }
+    }
+    // Absent from both snapshots: within the TTL a remote refetch returns this
+    // same registry, so the miss is authoritative.
+    return .miss;
+}
+
+/// Read-only view over the memoized registry snapshot for callers that scan
+/// many records (e.g. doctor's revocation sweep). Null when no fresh cache
+/// snapshot is available.
+pub const RegistrySnapshot = struct {
+    data: []const u8,
+    map: *const std.StringHashMap(RecordRange),
+};
+
+pub fn registrySnapshot() ?RegistrySnapshot {
+    var options: LoadOptions = .{};
+    if (envSlice("NANOBREW_UPSTREAM_REGISTRY_CACHE")) |cache_path| {
+        if (cache_path.len > 0) options.cache_path = cache_path;
+    }
+    const m: *RegistryMemo = blk: {
+        // Reuse registryMemoFastPath's ensure logic by probing a token that
+        // cannot exist; the memo is built as a side effect.
+        _ = registryMemoFastPath(std.heap.page_allocator, options, "\x00", .formula);
+        registryMemoLock();
+        defer g_registry_memo_mutex.unlock();
+        break :blk g_registry_memo orelse return null;
+    };
+    return .{ .data = m.data, .map = &m.map };
+}
+
+/// Every formula record whose slice mentions "revoked" (present or null), so
+/// callers checking installed versions against revocations parse only the
+/// handful of candidate records instead of the whole registry.
+pub fn revokedCandidateFormulaRecords(alloc: std.mem.Allocator) ![]Record {
+    var out: std.ArrayList(Record) = .empty;
+    errdefer {
+        for (out.items) |*r| r.deinit(alloc);
+        out.deinit(alloc);
+    }
+    const snap = registrySnapshot() orelse return out.toOwnedSlice(alloc);
+    var it = snap.map.iterator();
+    while (it.next()) |entry| {
+        const range = entry.value_ptr.*;
+        const slice = snap.data[range.start..range.end];
+        if (std.mem.indexOf(u8, slice, "\"revoked\"") == null) continue;
+        var record = parseRecordJson(alloc, slice) catch continue;
+        if (record.kind != .formula) {
+            record.deinit(alloc);
+            continue;
+        }
+        if (record.resolved == null or record.resolved.?.revoked == null) {
+            record.deinit(alloc);
+            continue;
+        }
+        out.append(alloc, record) catch {
+            record.deinit(alloc);
+            continue;
+        };
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn loadRecordWithOptions(alloc: std.mem.Allocator, options: LoadOptions, token: []const u8, kind: Kind) !Record {
+    switch (registryMemoFastPath(alloc, options, token, kind)) {
+        .record => |record| return record,
+        .miss => return error.UpstreamRecordNotFound,
+        .bypass => {},
+    }
+
     var stale_record: ?Record = null;
     errdefer if (stale_record) |record| record.deinit(alloc);
 
@@ -722,7 +1171,12 @@ fn parseRecord(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !Record {
 
     if (obj.get("resolved")) |resolved_val| {
         if (resolved_val != .object) return error.InvalidField;
-        resolved = try parseResolved(alloc, resolved_val.object);
+        var parsed_resolved = try parseResolved(alloc, resolved_val.object);
+        // Existing registries store the current pin's package identity at the
+        // record level. Nested fallbacks keep their own optional identity.
+        if (resolved_val.object.get("revision") == null) parsed_resolved.revision = revision;
+        if (resolved_val.object.get("rebuild") == null) parsed_resolved.rebuild = rebuild;
+        resolved = parsed_resolved;
     }
 
     return .{
@@ -835,6 +1289,8 @@ fn parseResolved(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !Resolved {
     errdefer alloc.free(tag);
     const version = try dupRequiredString(alloc, obj, "version");
     errdefer alloc.free(version);
+    const revision = if (obj.get("revision")) |v| parseU32(v) orelse return error.InvalidField else 0;
+    const rebuild = if (obj.get("rebuild")) |v| parseU32(v) orelse return error.InvalidField else 0;
 
     const assets_val = obj.get("assets") orelse return error.MissingField;
     if (assets_val != .object) return error.InvalidField;
@@ -901,6 +1357,8 @@ fn parseResolved(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !Resolved {
     return .{
         .tag = tag,
         .version = version,
+        .revision = revision,
+        .rebuild = rebuild,
         .assets = try assets.toOwnedSlice(alloc),
         .security_warnings = security_warnings,
         .revoked = revoked,
@@ -1346,6 +1804,8 @@ test "parseRegistry parses Homebrew bottle formula locks" {
     try testing.expectEqual(@as(usize, 0), record.assets.len);
     try testing.expect(record.resolved != null);
     try testing.expectEqualStrings("4.3.2", record.resolved.?.version);
+    try testing.expectEqual(@as(u32, 1), record.resolved.?.revision);
+    try testing.expectEqual(@as(u32, 2), record.resolved.?.rebuild);
 }
 
 test "parseRecordFromRegistryJson extracts a single matching record" {

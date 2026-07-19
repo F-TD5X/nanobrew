@@ -174,13 +174,8 @@ fn fetchFormulaList(alloc: std.mem.Allocator) ![]u8 {
 
     const body = fetch.get(alloc, "https://formulae.brew.sh/api/formula.json") catch return error.FetchFailed;
 
-    // Write to cache
-    const _lio_fl = paths.safe_io;
-    std.Io.Dir.createDirAbsolute(_lio_fl, API_CACHE_DIR, .default_dir) catch {};
-    if (std.Io.Dir.createFileAbsolute(_lio_fl, list_cache_path, .{})) |file| {
-        defer file.close(_lio_fl);
-        file.writeStreamingAll(_lio_fl, body) catch {};
-    } else |_| {}
+    // Publish under the same lock used by bulk sidecar builders.
+    search_api.writeFormulaListCacheAtomic(body);
 
     return body;
 }
@@ -207,9 +202,26 @@ fn readCachedList(alloc: std.mem.Allocator, path: []const u8, ttl_ns: u64) ?[]u8
     return buf;
 }
 
+pub const FormulaFetchOptions = struct {
+    /// Verified-upstream metadata is already immutable and checksum-pinned.
+    /// Install/info paths cross-check it against Homebrew's live API so stale
+    /// pins do not hide updates; inventory paths can disable that redundant
+    /// request after consulting the fresh bulk version index.
+    check_upstream_freshness: bool = true,
+};
+
 /// Fetch formula using a shared HTTP client (avoids repeated TLS handshakes).
 pub fn fetchFormulaWithClient(alloc: std.mem.Allocator, client: ?*std.http.Client, name: []const u8) !Formula {
-    return fetchFormulaWithClientAndUpstreamRegistry(alloc, client, name, null);
+    return fetchFormulaWithClientOptions(alloc, client, name, .{});
+}
+
+pub fn fetchFormulaWithClientOptions(
+    alloc: std.mem.Allocator,
+    client: ?*std.http.Client,
+    name: []const u8,
+    options: FormulaFetchOptions,
+) !Formula {
+    return fetchFormulaWithClientAndUpstreamRegistryOptions(alloc, client, name, null, options);
 }
 
 /// Fetch formula using a shared HTTP client and, when available, a preloaded
@@ -220,6 +232,16 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
     client: ?*std.http.Client,
     name: []const u8,
     registry: ?*const upstream_registry.Registry,
+) !Formula {
+    return fetchFormulaWithClientAndUpstreamRegistryOptions(alloc, client, name, registry, .{});
+}
+
+fn fetchFormulaWithClientAndUpstreamRegistryOptions(
+    alloc: std.mem.Allocator,
+    client: ?*std.http.Client,
+    name: []const u8,
+    registry: ?*const upstream_registry.Registry,
+    options: FormulaFetchOptions,
 ) !Formula {
     const tap_ref = isTapRef(name);
 
@@ -235,9 +257,13 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
             // tap refs have no core API and any live-fetch failure keeps the pin.
             // Exception: a revoked pin's fallback is a deliberate downgrade —
             // the registry is authoritative and freshness must not undo it.
-            if (!tap_ref and !upstream_formula.revoked_fallback and upstreamFreshnessEnabled()) {
+            if (options.check_upstream_freshness and
+                !tap_ref and
+                !upstream_formula.revoked_fallback and
+                upstreamFreshnessEnabled())
+            {
                 if (fetchFormulaLive(alloc, client, name) catch null) |live| {
-                    if (version_cmp.isNewer(live.version, upstream_formula.version)) {
+                    if (formulaMetadataIsNewer(live, upstream_formula)) {
                         upstream_formula.deinit(alloc);
                         return live;
                     }
@@ -268,7 +294,7 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
             if (resolveFormulaAlias(alloc, name)) |resolved_name| {
                 defer alloc.free(resolved_name);
                 if (!std.mem.eql(u8, resolved_name, name)) {
-                    return fetchFormulaWithClientAndUpstreamRegistry(alloc, client, resolved_name, registry) catch err;
+                    return fetchFormulaWithClientAndUpstreamRegistryOptions(alloc, client, resolved_name, registry, options) catch err;
                 }
             }
         }
@@ -279,6 +305,22 @@ pub fn fetchFormulaWithClientAndUpstreamRegistry(
 /// Fetch a formula directly from the live Homebrew API (cache → network),
 /// bypassing the verified-upstream registry. Used both as the no-upstream path
 /// and for the freshness comparison above.
+fn parseBulkFormulaJson(alloc: std.mem.Allocator, name: []const u8, entry_json: []const u8) ?Formula {
+    const formula = parseFormulaJson(alloc, entry_json) catch return null;
+    if (!std.mem.eql(u8, formula.name, name)) {
+        formula.deinit(alloc);
+        return null;
+    }
+    return formula;
+}
+
+fn formulaFromNewerBulkCache(alloc: std.mem.Allocator, name: []const u8, cache_path: []const u8) ?Formula {
+    const entry_json = search_api.bulkFormulaEntryJsonNewerThan(alloc, name, cache_path) orelse return null;
+    defer alloc.free(entry_json);
+    const formula = parseBulkFormulaJson(alloc, name, entry_json) orelse return null;
+    return formula;
+}
+
 /// Local-only formula lookup: per-name disk cache, then a slice out of the
 /// fresh bulk list. No network and no upstream-registry resolution — callers
 /// that only need metadata (version, dependencies) try this before paying
@@ -287,6 +329,8 @@ pub fn fetchFormulaLocal(alloc: std.mem.Allocator, name: []const u8) ?Formula {
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}.json", .{ API_CACHE_DIR, name }) catch return null;
 
+    if (formulaFromNewerBulkCache(alloc, name, cache_path)) |formula| return formula;
+
     if (readCached(alloc, cache_path)) |cached_json| {
         defer alloc.free(cached_json);
         if (parseFormulaJson(alloc, cached_json)) |formula| return formula else |_| {}
@@ -294,10 +338,9 @@ pub fn fetchFormulaLocal(alloc: std.mem.Allocator, name: []const u8) ?Formula {
 
     if (search_api.bulkFormulaEntryJson(alloc, name)) |entry_json| {
         defer alloc.free(entry_json);
-        if (parseFormulaJson(alloc, entry_json)) |formula| {
-            writeCacheFile(cache_path, entry_json);
+        if (parseBulkFormulaJson(alloc, name, entry_json)) |formula| {
             return formula;
-        } else |_| {}
+        }
     }
 
     return null;
@@ -306,6 +349,8 @@ pub fn fetchFormulaLocal(alloc: std.mem.Allocator, name: []const u8) ?Formula {
 fn fetchFormulaLive(alloc: std.mem.Allocator, client: ?*std.http.Client, name: []const u8) !Formula {
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}.json", .{ API_CACHE_DIR, name }) catch return error.NameTooLong;
+
+    if (formulaFromNewerBulkCache(alloc, name, cache_path)) |formula| return formula;
 
     if (readCached(alloc, cache_path)) |cached_json| {
         const formula = parseFormulaJson(alloc, cached_json) catch {
@@ -322,13 +367,21 @@ fn fetchFormulaLive(alloc: std.mem.Allocator, client: ?*std.http.Client, name: [
     // commands hit the cheaper path above.
     if (search_api.bulkFormulaEntryJson(alloc, name)) |entry_json| {
         defer alloc.free(entry_json);
-        if (parseFormulaJson(alloc, entry_json)) |formula| {
-            writeCacheFile(cache_path, entry_json);
+        if (parseBulkFormulaJson(alloc, name, entry_json)) |formula| {
             return formula;
-        } else |_| {}
+        }
     }
 
     return fetchAndCache(alloc, client, name, cache_path);
+}
+
+fn formulaMetadataIsNewer(candidate: Formula, current: Formula) bool {
+    var candidate_buf: [256]u8 = undefined;
+    var current_buf: [256]u8 = undefined;
+    const candidate_version = candidate.effectiveVersion(&candidate_buf);
+    const current_version = current.effectiveVersion(&current_buf);
+    return version_cmp.isNewer(candidate_version, current_version) or
+        (std.mem.eql(u8, candidate_version, current_version) and candidate.rebuild > current.rebuild);
 }
 
 /// Whether to cross-check verified-upstream pins against the live Homebrew API.
@@ -406,8 +459,11 @@ fn fetchCaskLive(alloc: std.mem.Allocator, token: []const u8) !Cask {
     if (search_api.bulkCaskEntryJson(alloc, token)) |entry_json| {
         defer alloc.free(entry_json);
         if (parseCaskJson(alloc, entry_json)) |cask| {
-            writeCacheFile(cache_path, entry_json);
-            return cask;
+            if (!std.mem.eql(u8, cask.token, token)) {
+                cask.deinit(alloc);
+            } else {
+                return cask;
+            }
         } else |_| {}
     }
 
@@ -820,11 +876,35 @@ fn resolveUserAgent(ua: []const u8) ?[]const u8 {
 }
 
 fn writeCacheFile(cache_path: []const u8, data: []const u8) void {
-    std.Io.Dir.createDirAbsolute(paths.safe_io, API_CACHE_DIR, .default_dir) catch {};
-    if (std.Io.Dir.createFileAbsolute(paths.safe_io, cache_path, .{})) |file| {
-        defer file.close(paths.safe_io);
-        file.writeStreamingAll(paths.safe_io, data) catch {};
-    } else |_| {}
+    const io = paths.safe_io;
+    std.Io.Dir.createDirAbsolute(io, API_CACHE_DIR, .default_dir) catch {};
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_buf, "{s}.lock", .{cache_path}) catch return;
+    const lock = std.Io.Dir.createFileAbsolute(io, lock_path, .{
+        .truncate = false,
+        .lock = .exclusive,
+    }) catch return;
+    defer lock.close(io);
+
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp.{d}.{d}", .{
+        cache_path, std.c.getpid(), std.Thread.getCurrentId(),
+    }) catch return;
+    const file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    file.writeStreamingAll(io, data) catch {
+        file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return;
+    };
+    file.sync(io) catch {
+        file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return;
+    };
+    file.close(io);
+    std.Io.Dir.renameAbsolute(tmp_path, cache_path, io) catch {
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+    };
 }
 
 fn fetchAndCache(alloc: std.mem.Allocator, shared_client: ?*std.http.Client, name: []const u8, cache_path: []const u8) !Formula {
@@ -1093,6 +1173,20 @@ fn isVersionTokenChar(c: u8) bool {
 }
 
 const testing = std.testing;
+
+test "formulaMetadataIsNewer compares revisions before bottle rebuilds" {
+    const revision_update = Formula{ .name = "tool", .version = "1.0", .revision = 2 };
+    const old_revision = Formula{ .name = "tool", .version = "1.0", .revision = 1, .rebuild = 9 };
+    try testing.expect(formulaMetadataIsNewer(revision_update, old_revision));
+    try testing.expect(!formulaMetadataIsNewer(old_revision, revision_update));
+}
+
+test "formulaMetadataIsNewer detects a newer bottle rebuild at one Cellar version" {
+    const rebuilt = Formula{ .name = "tool", .version = "1.0", .revision = 1, .rebuild = 2 };
+    const original = Formula{ .name = "tool", .version = "1.0", .revision = 1, .rebuild = 1 };
+    try testing.expect(formulaMetadataIsNewer(rebuilt, original));
+    try testing.expect(!formulaMetadataIsNewer(original, rebuilt));
+}
 
 test "parseFormulaJson - parses complete formula" {
     const json =

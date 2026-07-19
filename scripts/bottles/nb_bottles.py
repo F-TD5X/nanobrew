@@ -1011,11 +1011,19 @@ def _registry_files():
     return paths
 
 
-def _previous_resolved_from_git(token, current_version, want=None):
+def _resolved_identity(record):
+    resolved = record.get("resolved") or {}
+    return (
+        resolved.get("version"),
+        int(resolved.get("revision", record.get("revision", 0)) or 0),
+        int(resolved.get("rebuild", record.get("rebuild", 0)) or 0),
+    )
+
+
+def _previous_resolved_from_git(token, current_identity, want=None):
     """Most recent resolved block for `token` (in the embedded registry's git
-    history) whose version differs from the current pin — the natural
-    fallback when the current pin gets revoked. Pass `want` to demand one
-    specific historical version instead of the most recent."""
+    history) whose full version/revision/rebuild identity differs from the
+    current pin. Pass `want` to demand one specific base version."""
     rel = REGISTRY_JSON.relative_to(REPO_ROOT)
     shas = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "log", "--format=%H", "-n", "500", "--", str(rel)],
@@ -1037,9 +1045,15 @@ def _previous_resolved_from_git(token, current_version, want=None):
                 continue
             resolved = r.get("resolved") or {}
             version = resolved.get("version")
-            if version and version != current_version and (want is None or version == want):
+            historical_identity = _resolved_identity(r)
+            if version and historical_identity != current_identity and (want is None or version == want):
                 resolved.pop("revoked", None)
                 resolved.pop("fallback", None)
+                # Package identity belongs to the historical pin, not the
+                # currently revoked record. Preserve it inside the fallback.
+                for field in ("revision", "rebuild"):
+                    if field in r:
+                        resolved[field] = r[field]
                 return resolved, sha
     return None, None
 
@@ -1102,7 +1116,7 @@ def _previous_resolved(rec, want=None):
     homebrew_bottle pins; digests were already vetted), then the upstream
     GitHub releases list (covers young registries with single-version
     history)."""
-    fallback, src = _previous_resolved_from_git(rec["token"], rec["resolved"]["version"], want=want)
+    fallback, src = _previous_resolved_from_git(rec["token"], _resolved_identity(rec), want=want)
     if fallback:
         return fallback, f"git {src[:12]}"
     return _previous_resolved_from_upstream(rec, want=want)

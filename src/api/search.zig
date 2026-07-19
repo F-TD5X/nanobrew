@@ -4,6 +4,7 @@
 // case-insensitive substring matching on name and description.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fetch = @import("../net/fetch.zig");
 const FORMULA_LIST_URL = "https://formulae.brew.sh/api/formula.json";
 const CASK_LIST_URL = "https://formulae.brew.sh/api/cask.json";
@@ -11,8 +12,11 @@ const paths = @import("../platform/paths.zig");
 const CACHE_DIR = paths.API_CACHE_DIR;
 const FORMULA_CACHE = CACHE_DIR ++ "/_formula_list.json";
 const CASK_CACHE = CACHE_DIR ++ "/_cask_list.json";
-const FORMULA_IDX = FORMULA_CACHE ++ ".idx";
-const CASK_IDX = CASK_CACHE ++ ".idx";
+// v5 adds platform-aware formula dependency lists plus a validated row-count
+// footer and atomic writes, so a torn sidecar cannot make a miss authoritative.
+const FORMULA_IDX = FORMULA_CACHE ++ ".idx.v5";
+const CASK_IDX = CASK_CACHE ++ ".idx.v5";
+const INDEX_FOOTER_PREFIX = "#nanobrew-index-v5\t";
 const CACHE_TTL_NS = 3600 * std.time.ns_per_s; // 1 hour
 
 pub const SearchResult = struct {
@@ -49,14 +53,53 @@ pub fn search(alloc: std.mem.Allocator, query: []const u8) ![]SearchResult {
     return results.toOwnedSlice(alloc);
 }
 
+fn acquireCacheLock(idx_path: []const u8, lock_buf: []u8) !std.Io.File {
+    const lock_path = try std.fmt.bufPrint(lock_buf, "{s}.lock", .{idx_path});
+    if (std.Io.Dir.createFileAbsolute(paths.safe_io, lock_path, .{
+        .truncate = false,
+        .lock = .exclusive,
+    })) |file| {
+        return file;
+    } else |_| {
+        // First run: the cache directory may not exist yet. Create it on this
+        // slow path only instead of paying a mkdir walk on every lock.
+        std.Io.Dir.createDirAbsolute(paths.safe_io, CACHE_DIR, .default_dir) catch {};
+        return std.Io.Dir.createFileAbsolute(paths.safe_io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+        });
+    }
+}
+
 /// Cached bulk formula list (1h TTL, shared with `nb outdated`/`upgrade`).
 pub fn cachedFormulaListJson(alloc: std.mem.Allocator) ![]u8 {
+    // Lock-free fast path: a fresh cache needs no coordination. Writes are
+    // atomic renames, so readers never observe a partial file.
+    if (readCachedFile(alloc, FORMULA_CACHE)) |data| return data;
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock = try acquireCacheLock(FORMULA_IDX, &lock_buf);
+    defer lock.close(paths.safe_io);
     return fetchCachedList(alloc, FORMULA_LIST_URL, FORMULA_CACHE);
 }
 
 /// Cached bulk cask list (1h TTL, shared with `nb outdated`/`upgrade`).
 pub fn cachedCaskListJson(alloc: std.mem.Allocator) ![]u8 {
+    // Lock-free fast path: a fresh cache needs no coordination. Writes are
+    // atomic renames, so readers never observe a partial file.
+    if (readCachedFile(alloc, CASK_CACHE)) |data| return data;
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock = try acquireCacheLock(CASK_IDX, &lock_buf);
+    defer lock.close(paths.safe_io);
     return fetchCachedList(alloc, CASK_LIST_URL, CASK_CACHE);
+}
+
+/// Alias resolution also refreshes the shared formula JSON. Publish it under
+/// the same lock used by sidecar builders so readers never observe mixed writers.
+pub fn writeFormulaListCacheAtomic(data: []const u8) void {
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock = acquireCacheLock(FORMULA_IDX, &lock_buf) catch return;
+    defer lock.close(paths.safe_io);
+    writeFileAtomic(FORMULA_CACHE, data);
 }
 
 fn fetchCachedList(alloc: std.mem.Allocator, url: []const u8, cache_path: []const u8) ![]u8 {
@@ -66,18 +109,14 @@ fn fetchCachedList(alloc: std.mem.Allocator, url: []const u8, cache_path: []cons
     // Fetch from network (native HTTP, no curl)
     const body = fetch.get(alloc, url) catch return error.FetchFailed;
 
-    // Write to cache
-    std.Io.Dir.createDirAbsolute(paths.safe_io, CACHE_DIR, .default_dir) catch {};
-    if (std.Io.Dir.createFileAbsolute(paths.safe_io, cache_path, .{})) |file| {
-        defer file.close(paths.safe_io);
-        file.writeStreamingAll(paths.safe_io, body) catch {};
-    } else |_| {}
+    // Publish atomically while the caller holds the matching cache lock.
+    writeFileAtomic(cache_path, body);
 
     return body;
 }
 
-/// TSV index sidecar — one `name\tversion\tdesc\n` row per bulk-list entry.
-/// ~20x smaller than the source JSON and trivially parseable, so `nb search`
+/// TSV index sidecar — one `name\tversion\tdesc\tstart\tend\tdeps\n` row per entry.
+/// Far smaller than the source JSON and trivially parseable, so `nb search`
 /// and `nb outdated`/`upgrade` skip re-scanning ~46 MB of JSON per command.
 /// Rebuilt whenever the JSON cache is refreshed (mtime ordering).
 pub fn cachedFormulaIndexTsv(alloc: std.mem.Allocator) ![]u8 {
@@ -93,16 +132,34 @@ const ListKind = enum { formula, cask };
 fn cachedIndexTsv(alloc: std.mem.Allocator, url: []const u8, json_path: []const u8, idx_path: []const u8, kind: ListKind) ![]u8 {
     const lib_io = paths.safe_io;
 
-    // Fast path: fresh JSON cache + sidecar at least as new -> read sidecar only.
+    // Lock-free fast path: fresh JSON cache + sidecar at least as new. The
+    // sidecar is published by atomic rename and re-validated on every read,
+    // so readers never need the writer's lock.
     if (fileMtimeNs(json_path)) |json_mtime| {
         const now_ts = std.Io.Timestamp.now(lib_io, .real);
         if (now_ts.nanoseconds - json_mtime <= CACHE_TTL_NS) {
             if (fileMtimeNs(idx_path)) |idx_mtime| {
                 if (idx_mtime >= json_mtime) {
-                    if (readFileAlloc(alloc, idx_path)) |buf| return buf;
+                    if (readFileAlloc(alloc, idx_path)) |buf| {
+                        if (validateIndexTsv(buf)) return buf;
+                        alloc.free(buf);
+                    }
                 }
             }
-            // JSON is fresh but the sidecar is missing/stale: rebuild from disk.
+            // JSON is fresh but the sidecar is missing/stale/invalid: rebuild
+            // from disk, serialized with other writers.
+            var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const lock = try acquireCacheLock(idx_path, &lock_buf);
+            defer lock.close(lib_io);
+            // Re-check under the lock: another process may have rebuilt it.
+            if (fileMtimeNs(idx_path)) |idx_mtime| {
+                if (idx_mtime >= json_mtime) {
+                    if (readFileAlloc(alloc, idx_path)) |buf| {
+                        if (validateIndexTsv(buf)) return buf;
+                        alloc.free(buf);
+                    }
+                }
+            }
             if (readFileAlloc(alloc, json_path)) |json| {
                 defer alloc.free(json);
                 return buildAndWriteIndexTsv(alloc, json, idx_path, kind);
@@ -111,6 +168,9 @@ fn cachedIndexTsv(alloc: std.mem.Allocator, url: []const u8, json_path: []const 
     }
 
     // JSON cache is missing/stale: refetch (writes the JSON cache), then build.
+    var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock = try acquireCacheLock(idx_path, &lock_buf);
+    defer lock.close(lib_io);
     const json = try fetchCachedList(alloc, url, json_path);
     defer alloc.free(json);
     return buildAndWriteIndexTsv(alloc, json, idx_path, kind);
@@ -126,9 +186,102 @@ pub fn bulkFormulaEntryJson(alloc: std.mem.Allocator, name: []const u8) ?[]u8 {
     return bulkEntryJson(alloc, FORMULA_CACHE, FORMULA_IDX, name);
 }
 
+/// Return the bulk formula entry only when its source JSON is newer than a
+/// per-name cache. This prevents a still-fresh stale per-name entry from hiding
+/// a formula revision published by a newer bulk refresh.
+pub fn bulkFormulaEntryJsonNewerThan(alloc: std.mem.Allocator, name: []const u8, other_path: []const u8) ?[]u8 {
+    const bulk_mtime = fileMtimeNs(FORMULA_CACHE) orelse return null;
+    const other_mtime = fileMtimeNs(other_path) orelse return bulkFormulaEntryJson(alloc, name);
+    if (bulk_mtime <= other_mtime) return null;
+    return bulkFormulaEntryJson(alloc, name);
+}
+
 /// Cask analogue of bulkFormulaEntryJson, keyed by token.
 pub fn bulkCaskEntryJson(alloc: std.mem.Allocator, token: []const u8) ?[]u8 {
     return bulkEntryJson(alloc, CASK_CACHE, CASK_IDX, token);
+}
+
+/// Process-wide memo of a TSV sidecar. bulkEntryJson runs once per formula
+/// lookup (a `nb deps`/`leaves` run does dozens to hundreds), and re-reading
+/// the same sidecar for every lookup dominated local resolve time. Published
+/// slices are never freed, so racing readers are safe; a stale memo is only
+/// replaced (leaking the old bytes) when the file's mtime changes, which a
+/// short-lived CLI does at most a handful of times.
+const IdxMemo = struct {
+    path: []const u8,
+    mtime: i96,
+    bytes: []const u8,
+    /// name -> byte range into the bulk JSON; keys point into `bytes`.
+    map: std.StringHashMap(EntryRange),
+};
+var g_idx_memo_mutex: std.atomic.Mutex = .unlocked;
+var g_idx_memos: [2]?*IdxMemo = .{ null, null };
+
+/// One pass over the sidecar building a name -> range map so each per-name
+/// lookup after the first is O(1) instead of a full TSV scan.
+fn buildEntryMap(pa: std.mem.Allocator, tsv: []const u8) ?std.StringHashMap(EntryRange) {
+    var map = std.StringHashMap(EntryRange).init(pa);
+    var line_iter = std.mem.splitScalar(u8, tsv, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var cols = std.mem.splitScalar(u8, line, '\t');
+        const name = cols.next() orelse continue;
+        _ = cols.next(); // version
+        _ = cols.next(); // desc
+        const start_s = cols.next() orelse continue;
+        const end_s = cols.next() orelse continue;
+        const start = std.fmt.parseInt(usize, start_s, 10) catch continue;
+        const end = std.fmt.parseInt(usize, end_s, 10) catch continue;
+        const gop = map.getOrPut(name) catch continue;
+        if (!gop.found_existing) gop.value_ptr.* = .{ .start = start, .end = end };
+    }
+    if (map.count() == 0) {
+        map.deinit();
+        return null;
+    }
+    return map;
+}
+
+fn readIdxMemoized(idx_path: []const u8, idx_mtime: i96) ?*const IdxMemo {
+    const pa = std.heap.page_allocator;
+    while (!g_idx_memo_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer g_idx_memo_mutex.unlock();
+    for (&g_idx_memos) |*slot| {
+        if (slot.*) |m| {
+            if (std.mem.eql(u8, m.path, idx_path)) {
+                if (m.mtime == idx_mtime) return m;
+                // Stale sidecar: replace the memo, intentionally leaking the
+                // old one — another thread may still be reading it.
+                slot.* = null;
+                break;
+            }
+        }
+    }
+    const bytes = readFileAlloc(pa, idx_path) orelse return null;
+    const map = buildEntryMap(pa, bytes) orelse {
+        pa.free(bytes);
+        return null;
+    };
+    const path_copy = pa.dupe(u8, idx_path) catch {
+        pa.free(bytes);
+        return null;
+    };
+    const memo = pa.create(IdxMemo) catch {
+        pa.free(bytes);
+        pa.free(path_copy);
+        return null;
+    };
+    memo.* = .{ .path = path_copy, .mtime = idx_mtime, .bytes = bytes, .map = map };
+    for (&g_idx_memos) |*slot| {
+        if (slot.* == null) {
+            slot.* = memo;
+            return memo;
+        }
+    }
+    // Both slots hold the other sidecar (formula vs cask); evict slot 0 by
+    // leaking it — readers may still hold its pointer.
+    g_idx_memos[0] = memo;
+    return memo;
 }
 
 fn bulkEntryJson(alloc: std.mem.Allocator, json_path: []const u8, idx_path: []const u8, name: []const u8) ?[]u8 {
@@ -139,9 +292,8 @@ fn bulkEntryJson(alloc: std.mem.Allocator, json_path: []const u8, idx_path: []co
     const idx_mtime = fileMtimeNs(idx_path) orelse return null;
     if (idx_mtime < json_mtime) return null;
 
-    const tsv = readFileAlloc(alloc, idx_path) orelse return null;
-    defer alloc.free(tsv);
-    const range = findEntryRange(tsv, name) orelse return null;
+    const memo = readIdxMemoized(idx_path, idx_mtime) orelse return null;
+    const range = memo.map.get(name) orelse return null;
 
     // pread exactly the entry's bytes out of the bulk JSON.
     const file = std.Io.Dir.openFileAbsolute(lib_io, json_path, .{}) catch return null;
@@ -208,13 +360,58 @@ fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
     return buf;
 }
 
+fn validateIndexTsv(tsv: []const u8) bool {
+    if (tsv.len == 0 or tsv[tsv.len - 1] != '\n') return false;
+    const without_final_newline = tsv[0 .. tsv.len - 1];
+    const footer_start = if (std.mem.lastIndexOfScalar(u8, without_final_newline, '\n')) |idx| idx + 1 else 0;
+    const footer = without_final_newline[footer_start..];
+    if (!std.mem.startsWith(u8, footer, INDEX_FOOTER_PREFIX)) return false;
+    const expected = std.fmt.parseInt(usize, footer[INDEX_FOOTER_PREFIX.len..], 10) catch return false;
+    if (expected == 0) return false;
+
+    // SIMD counts over the body: rows are machine-generated as exactly six
+    // tab-separated columns (tabs in desc are blanked at build time), so a
+    // truncated, torn, or column-mangled sidecar cannot match both counts.
+    // (Sidecar writes are atomic renames, so a partial file can only ever
+    // come from a crash mid-publish.)
+    const body = tsv[0..footer_start];
+    const actual = std.mem.count(u8, body, "\n");
+    if (actual != expected) return false;
+    const tabs = std.mem.count(u8, body, "\t");
+    return tabs == 5 * expected;
+}
+
+fn writeFileAtomic(idx_path: []const u8, tsv: []const u8) void {
+    const io = paths.safe_io;
+    std.Io.Dir.createDirAbsolute(io, CACHE_DIR, .default_dir) catch {};
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp.{d}.{d}", .{
+        idx_path, std.c.getpid(), std.Thread.getCurrentId(),
+    }) catch return;
+    const file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    file.writeStreamingAll(io, tsv) catch {
+        file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return;
+    };
+    file.sync(io) catch {
+        file.close(io);
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return;
+    };
+    file.close(io);
+    std.Io.Dir.renameAbsolute(tmp_path, idx_path, io) catch {
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+    };
+}
+
 fn buildAndWriteIndexTsv(alloc: std.mem.Allocator, json: []const u8, idx_path: []const u8, kind: ListKind) ![]u8 {
     const tsv = try buildIndexTsv(alloc, json, kind);
-    std.Io.Dir.createDirAbsolute(paths.safe_io, CACHE_DIR, .default_dir) catch {};
-    if (std.Io.Dir.createFileAbsolute(paths.safe_io, idx_path, .{})) |file| {
-        defer file.close(paths.safe_io);
-        file.writeStreamingAll(paths.safe_io, tsv) catch {};
-    } else |_| {}
+    if (!validateIndexTsv(tsv)) {
+        alloc.free(tsv);
+        return error.InvalidIndex;
+    }
+    writeFileAtomic(idx_path, tsv);
     return tsv;
 }
 
@@ -235,6 +432,7 @@ fn buildIndexTsv(alloc: std.mem.Allocator, json: []const u8, kind: ListKind) ![]
         .cask => "token",
     };
 
+    var row_count: usize = 0;
     while (true) {
         switch (try scanner.next()) {
             .array_end => break,
@@ -248,6 +446,9 @@ fn buildIndexTsv(alloc: std.mem.Allocator, json: []const u8, kind: ListKind) ![]
         var name: []const u8 = "";
         var desc: []const u8 = "";
         var version: []const u8 = "";
+        var revision: u32 = 0;
+        var dependencies: std.ArrayList(u8) = .empty;
+        defer dependencies.deinit(alloc);
         var name_owned: ?[]u8 = null;
         var desc_owned: ?[]u8 = null;
         var version_owned: ?[]u8 = null;
@@ -276,6 +477,42 @@ fn buildIndexTsv(alloc: std.mem.Allocator, json: []const u8, kind: ListKind) ![]
                 captureString(&scanner, alloc, &name, &name_owned) catch return error.UnexpectedJson;
             } else if (std.mem.eql(u8, key, "desc")) {
                 captureString(&scanner, alloc, &desc, &desc_owned) catch return error.UnexpectedJson;
+            } else if (kind == .formula and
+                (std.mem.eql(u8, key, "dependencies") or
+                    (builtin.os.tag == .macos and std.mem.eql(u8, key, "uses_from_macos"))))
+            {
+                if ((try scanner.next()) != .array_begin) return error.UnexpectedJson;
+                while (true) {
+                    const dep_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+                    switch (dep_token) {
+                        .array_end => break,
+                        .string => |dep| {
+                            if (dependencies.items.len > 0) try dependencies.append(alloc, ',');
+                            try appendSanitized(&dependencies, alloc, dep);
+                        },
+                        .allocated_string => |dep| {
+                            defer alloc.free(dep);
+                            if (dependencies.items.len > 0) try dependencies.append(alloc, ',');
+                            try appendSanitized(&dependencies, alloc, dep);
+                        },
+                        // Homebrew also uses objects such as {"bison":"build"}
+                        // in uses_from_macos. Formula parsing ignores those
+                        // build-only entries, so mirror that behavior here.
+                        .object_begin => while (true) {
+                            const object_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+                            switch (object_token) {
+                                .object_end => break,
+                                .string => try scanner.skipValue(),
+                                .allocated_string => |object_key| {
+                                    defer alloc.free(object_key);
+                                    try scanner.skipValue();
+                                },
+                                else => return error.UnexpectedJson,
+                            }
+                        },
+                        else => return error.UnexpectedJson,
+                    }
+                }
             } else if (kind == .formula and std.mem.eql(u8, key, "versions")) {
                 if ((try scanner.next()) != .object_begin) continue;
                 while (true) {
@@ -298,6 +535,16 @@ fn buildIndexTsv(alloc: std.mem.Allocator, json: []const u8, kind: ListKind) ![]
                         try scanner.skipValue();
                     }
                 }
+            } else if (kind == .formula and std.mem.eql(u8, key, "revision")) {
+                const revision_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+                switch (revision_token) {
+                    .number => |n| revision = std.fmt.parseInt(u32, n, 10) catch 0,
+                    .allocated_number => |n| {
+                        defer alloc.free(n);
+                        revision = std.fmt.parseInt(u32, n, 10) catch 0;
+                    },
+                    else => return error.UnexpectedJson,
+                }
             } else if (kind == .cask and std.mem.eql(u8, key, "version")) {
                 captureString(&scanner, alloc, &version, &version_owned) catch return error.UnexpectedJson;
             } else {
@@ -311,11 +558,16 @@ fn buildIndexTsv(alloc: std.mem.Allocator, json: []const u8, kind: ListKind) ![]
         try out.appendSlice(alloc, name);
         try out.append(alloc, '\t');
         try appendSanitized(&out, alloc, version);
+        if (kind == .formula and revision > 0) try out.print(alloc, "_{d}", .{revision});
         try out.append(alloc, '\t');
         try appendSanitized(&out, alloc, desc);
-        try out.print(alloc, "\t{d}\t{d}\n", .{ entry_start, entry_end });
+        try out.print(alloc, "\t{d}\t{d}\t", .{ entry_start, entry_end });
+        try out.appendSlice(alloc, dependencies.items);
+        try out.append(alloc, '\n');
+        row_count += 1;
     }
 
+    try out.print(alloc, "{s}{d}\n", .{ INDEX_FOOTER_PREFIX, row_count });
     return out.toOwnedSlice(alloc);
 }
 
@@ -417,18 +669,21 @@ const testing = std.testing;
 
 test "buildIndexTsv - formula entries become rows with valid entry offsets" {
     const json =
-        \\[{"name":"ripgrep","desc":"Search tool","versions":{"stable":"14.1.1","head":"HEAD"},"revision":0},
-        \\ {"name":"weird","desc":"tab\there","versions":{"stable":"1.0"}}]
+        \\[{"name":"ripgrep","desc":"Search tool","versions":{"stable":"14.1.1","head":"HEAD"},"revision":0,"dependencies":["pcre2"],"uses_from_macos":["libedit",{"bison":"build"}]},
+        \\ {"name":"weird","desc":"tab\there","versions":{"stable":"1.0"},"revision":2,"bottle":{"stable":{"rebuild":1}}}]
     ;
     const tsv = try buildIndexTsv(testing.allocator, json, .formula);
     defer testing.allocator.free(tsv);
 
-    // Rows are name\tversion\tdesc\tstart\tend; desc sanitized.
+    // Rows are name\tversion\tdesc\tstart\tend\tdeps; desc sanitized.
     var lines = std.mem.splitScalar(u8, tsv, '\n');
     const row1 = lines.next().?;
     try testing.expect(std.mem.startsWith(u8, row1, "ripgrep\t14.1.1\tSearch tool\t"));
+    var row1_cols = std.mem.splitScalar(u8, row1, '\t');
+    for (0..5) |_| _ = row1_cols.next();
+    try testing.expectEqualStrings(if (builtin.os.tag == .macos) "pcre2,libedit" else "pcre2", row1_cols.next().?);
     const row2 = lines.next().?;
-    try testing.expect(std.mem.startsWith(u8, row2, "weird\t1.0\ttab here\t"));
+    try testing.expect(std.mem.startsWith(u8, row2, "weird\t1.0_2\ttab here\t"));
 
     // The offsets must slice back to exactly the entry's JSON object.
     const r1 = findEntryRange(tsv, "ripgrep").?;
@@ -458,6 +713,15 @@ test "buildIndexTsv - cask entries use token and version" {
     try testing.expect(std.mem.startsWith(u8, tsv, "raycast\t1.101.1\tLauncher\t"));
     const r = findEntryRange(tsv, "raycast").?;
     try testing.expect(json[r.start] == '{' and json[r.end - 1] == '}');
+    try testing.expect(validateIndexTsv(tsv));
+}
+
+test "validateIndexTsv rejects torn and count-mismatched sidecars" {
+    const valid = "one\t1.0\tdesc\t0\t1\tdep\ntwo\t2.0\tdesc\t2\t3\t\n#nanobrew-index-v5\t2\n";
+    try testing.expect(validateIndexTsv(valid));
+    try testing.expect(!validateIndexTsv(valid[0 .. valid.len - 1]));
+    try testing.expect(!validateIndexTsv("one\t1.0\tdesc\t0\t1\t\n#nanobrew-index-v5\t2\n"));
+    try testing.expect(!validateIndexTsv("one\t1.0\n#nanobrew-index-v5\t1\n"));
 }
 
 test "searchIndexTsv - matches name and desc case-insensitively" {

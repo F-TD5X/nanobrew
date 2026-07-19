@@ -121,7 +121,7 @@ fn fetchBottleFormulaFromRecord(alloc: std.mem.Allocator, record: *const registr
     const resolved = (try effectiveResolved(record)) orelse return error.MissingAsset;
     const platform = currentPlatform() orelse return error.UnsupportedPlatform;
     const asset = resolved.findAsset(platform) orelse return error.UnsupportedPlatform;
-    var formula = try formulaFromBottleResolvedFields(alloc, record, resolved.version, asset.url, asset.sha256);
+    var formula = try formulaFromBottleResolvedFields(alloc, record, resolved.version, resolved.revision, resolved.rebuild, asset.url, asset.sha256);
     formula.revoked_fallback = recordIsRevoked(record);
     return formula;
 }
@@ -238,6 +238,8 @@ fn formulaFromBottleResolvedFields(
     alloc: std.mem.Allocator,
     record: *const registry_mod.Record,
     version: []const u8,
+    revision: u32,
+    rebuild: u32,
     url_value: []const u8,
     sha256_value: []const u8,
 ) !Formula {
@@ -273,8 +275,8 @@ fn formulaFromBottleResolvedFields(
     return .{
         .name = name,
         .version = owned_version,
-        .revision = record.revision,
-        .rebuild = record.rebuild,
+        .revision = revision,
+        .rebuild = rebuild,
         .desc = desc,
         .homepage = homepage,
         .license = license,
@@ -1240,6 +1242,7 @@ test "fetchFormulaFromRecord falls back to previous version when pin is revoked"
         \\    "token": "cvetool",
         \\    "name": "cvetool",
         \\    "kind": "formula",
+        \\    "revision": 1,
         \\    "upstream": {
         \\      "type": "homebrew_bottle",
         \\      "verified": true
@@ -1304,6 +1307,9 @@ test "fetchFormulaFromRecord falls back to previous version when pin is revoked"
     defer formula.deinit(testing.allocator);
 
     try testing.expectEqualStrings("1.9.0", formula.version);
+    try testing.expectEqual(@as(u32, 0), formula.revision);
+    var effective_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("1.9.0", formula.effectiveVersion(&effective_buf));
     try testing.expect(std.mem.indexOf(u8, formula.bottle_url, "sha256:bbbb") != null);
     try testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", formula.bottle_sha256);
     // The flag is what stops the live-API freshness override (#308) from
@@ -1319,6 +1325,7 @@ test "fetchFormulaFromRecord fails closed on revoked pin without fallback" {
         \\    "token": "cvetool",
         \\    "name": "cvetool",
         \\    "kind": "formula",
+        \\    "revision": 1,
         \\    "upstream": {
         \\      "type": "homebrew_bottle",
         \\      "verified": true

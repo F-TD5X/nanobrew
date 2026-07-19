@@ -51,6 +51,20 @@ pub fn firstInstallConflict(io: std.Io, cask: Cask, conflict_buf: []u8) !?Destin
 /// (which may be newer and would freeze `nb upgrade` on a stale payload).
 /// `caskroom_dir` may be absolute (production) or relative (tests); access
 /// goes through the cwd handle, which accepts both.
+/// Canonical cask identities from third-party taps can contain slashes, while
+/// Caskroom always uses the final token component as its filesystem directory.
+pub fn filesystemToken(token: []const u8) ?[]const u8 {
+    const basename = if (std.mem.lastIndexOfScalar(u8, token, '/')) |idx|
+        token[idx + 1 ..]
+    else
+        token;
+    if (basename.len == 0 or std.mem.eql(u8, basename, ".") or std.mem.eql(u8, basename, "..")) return null;
+    for (basename) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '@' and c != '+' and c != '_' and c != '.' and c != '-') return null;
+    }
+    return basename;
+}
+
 pub fn ownedCaskVersionOnDisk(
     io: std.Io,
     caskroom_dir: []const u8,
@@ -60,10 +74,7 @@ pub fn ownedCaskVersionOnDisk(
 ) ?[]const u8 {
     // Third-party tap tokens may contain slashes ("indaco/tap/sley"); the
     // Caskroom dir uses only the basename, matching installCask above.
-    const safe_token = if (std.mem.lastIndexOfScalar(u8, token, '/')) |idx|
-        token[idx + 1 ..]
-    else
-        token;
+    const safe_token = filesystemToken(token) orelse return null;
 
     // Exact version match first (the common adopt case).
     var exact_buf: [1024]u8 = undefined;
@@ -111,10 +122,7 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
 
     // For third-party taps, cask.token may contain slashes (e.g. "indaco/tap/sley").
     // Use only the basename for filesystem paths to avoid creating nested directories.
-    const safe_token = if (std.mem.lastIndexOfScalar(u8, cask.token, '/')) |idx|
-        cask.token[idx + 1 ..]
-    else
-        cask.token;
+    const safe_token = filesystemToken(cask.token) orelse return error.UnsafeToken;
 
     // 1. Download artifact
     const format = cask.downloadFormat();
@@ -145,10 +153,13 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
     var caskroom_buf: [512]u8 = undefined;
     const caskroom_path = cask.caskroomPath(&caskroom_buf);
     std.Io.Dir.createDirAbsolute(lib_io, CASKROOM_DIR, .default_dir) catch {};
+    std.Io.Dir.accessAbsolute(lib_io, CASKROOM_DIR, .{ .write = true }) catch return error.CaskroomUnavailable;
     var token_dir_buf: [512]u8 = undefined;
     const token_dir = std.fmt.bufPrint(&token_dir_buf, "{s}/{s}", .{ CASKROOM_DIR, safe_token }) catch return error.PathTooLong;
     std.Io.Dir.createDirAbsolute(lib_io, token_dir, .default_dir) catch {};
+    std.Io.Dir.accessAbsolute(lib_io, token_dir, .{ .write = true }) catch return error.CaskroomUnavailable;
     std.Io.Dir.createDirAbsolute(lib_io, caskroom_path, .default_dir) catch {};
+    std.Io.Dir.accessAbsolute(lib_io, caskroom_path, .{ .write = true }) catch return error.CaskroomUnavailable;
     traceCaskPhase(trace_enabled, cask.token, "caskroom", phase_timer.read());
 
     // 3. Mount/extract based on format
@@ -538,6 +549,7 @@ pub fn removeCask(
     binaries: []const []const u8,
 ) !void {
     const lib_io = io;
+    const safe_token = filesystemToken(token) orelse return error.UnsafeToken;
 
     // 1. Delete apps from /Applications/
     for (apps) |app| {
@@ -559,12 +571,12 @@ pub fn removeCask(
 
     // 3. Delete Caskroom entry
     var caskroom_buf: [512]u8 = undefined;
-    const ver_dir = std.fmt.bufPrint(&caskroom_buf, "{s}/Caskroom/{s}/{s}", .{ PREFIX, token, version }) catch return;
+    const ver_dir = std.fmt.bufPrint(&caskroom_buf, "{s}/Caskroom/{s}/{s}", .{ PREFIX, safe_token, version }) catch return;
     std.Io.Dir.cwd().deleteTree(lib_io, ver_dir) catch {};
 
     // Try to remove parent dir if empty
     var parent_buf: [512]u8 = undefined;
-    const parent = std.fmt.bufPrint(&parent_buf, "{s}/Caskroom/{s}", .{ PREFIX, token }) catch return;
+    const parent = std.fmt.bufPrint(&parent_buf, "{s}/Caskroom/{s}", .{ PREFIX, safe_token }) catch return;
     std.Io.Dir.deleteDirAbsolute(lib_io, parent) catch {};
 }
 

@@ -25,6 +25,7 @@ pub fn discoverServices(alloc: std.mem.Allocator, io: std.Io) ![]Service {
     var keg_iter = cellar.iterate();
     while (keg_iter.next(lib_io) catch null) |keg_entry| {
         if (keg_entry.kind != .directory) continue;
+        if (keg_entry.name.len == 0 or keg_entry.name[0] == '.') continue; // skip .purge/
         const keg_name = keg_entry.name;
 
         var keg_dir_buf: [512]u8 = undefined;
