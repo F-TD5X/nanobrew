@@ -27,6 +27,7 @@
 const std = @import("std");
 const placeholder = @import("../platform/placeholder.zig");
 const paths = @import("../platform/paths.zig");
+const short = @import("../platform/short_prefix.zig");
 
 const ELF_DIRS = [_][]const u8{ "bin", "sbin", "lib", "lib64", "libexec" };
 
@@ -39,21 +40,14 @@ const TEXT_EXTS = [_][]const u8{ ".pc", ".cmake", ".la", ".sh", ".cfg" };
 const LINUXBREW_LITERAL = "/home/linuxbrew/.linuxbrew/";
 const PREFIX_SLASH = paths.PREFIX ++ "/";
 
-/// Short prefix symlink target: /opt/nb → <PREFIX>. Strictly shorter than
-/// every @@HOMEBREW_*@@ placeholder, which is what makes in-place ELF
-/// patching universally valid (replacement never grows a string).
-pub const SHORT_PREFIX = "/opt/nb";
-const SHORT_CELLAR = SHORT_PREFIX ++ "/Cellar";
-
 comptime {
-    if (SHORT_PREFIX.len > paths.PLACEHOLDER_PREFIX.len or
-        SHORT_CELLAR.len > paths.PLACEHOLDER_CELLAR.len or
-        paths.REAL_REPOSITORY.len > paths.PLACEHOLDER_REPOSITORY.len or
-        PREFIX_SLASH.len > LINUXBREW_LITERAL.len)
-    {
-        @compileError("ELF in-place relocation requires every replacement to be no longer than its source");
+    if (PREFIX_SLASH.len > LINUXBREW_LITERAL.len) {
+        @compileError("ELF in-place linuxbrew relocation requires PREFIX_SLASH to be no longer than LINUXBREW_LITERAL");
     }
 }
+// SHORT_PREFIX / SHORT_CELLAR / REAL_REPOSITORY length guarantees and the
+// /opt/nb → <PREFIX> symlink helper live in platform/short_prefix.zig,
+// shared with the Mach-O relocator.
 
 // Process-wide coordination for the auto-install path. When `nb install`
 // fans out parallel workers and patchelf is missing, every worker would
@@ -66,53 +60,8 @@ const PatchelfState = enum(u8) { unknown, present, install_failed };
 var patchelf_mutex: std.Io.Mutex = .init;
 var patchelf_state: PatchelfState = .unknown;
 
-// Same memoization pattern for the /opt/nb short-prefix symlink: one
-// readlink/symlink attempt per process, shared across install workers.
-const ShortLinkState = enum(u8) { unknown, ok, unavailable };
-var short_link_mutex: std.Io.Mutex = .init;
-var short_link_state: ShortLinkState = .unknown;
-
-/// Ensure /opt/nb → <PREFIX> exists. Returns false when it can't be created
-/// (no permission on /opt and not already present) or when /opt/nb exists
-/// but is not ours — in that case the caller must use the patchelf fallback.
-pub fn ensureShortPrefixLink(io: std.Io) bool {
-    short_link_mutex.lockUncancelable(io);
-    defer short_link_mutex.unlock(io);
-
-    switch (short_link_state) {
-        .ok => return true,
-        .unavailable => return false,
-        .unknown => {},
-    }
-
-    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.Io.Dir.readLinkAbsolute(io, SHORT_PREFIX, &target_buf)) |n| {
-        short_link_state = if (std.mem.eql(u8, target_buf[0..n], paths.PREFIX)) .ok else .unavailable;
-        return short_link_state == .ok;
-    } else |_| {}
-
-    // Exists but isn't a symlink (a real dir/file someone put there) — leave it alone.
-    if (std.Io.Dir.accessAbsolute(io, SHORT_PREFIX, .{})) |_| {
-        short_link_state = .unavailable;
-        return false;
-    } else |_| {}
-
-    if (std.c.symlink(paths.PREFIX, SHORT_PREFIX) == 0) {
-        short_link_state = .ok;
-        return true;
-    }
-
-    // Lost a race with a concurrent nb process? Accept its link if correct.
-    if (std.Io.Dir.readLinkAbsolute(io, SHORT_PREFIX, &target_buf)) |n| {
-        if (std.mem.eql(u8, target_buf[0..n], paths.PREFIX)) {
-            short_link_state = .ok;
-            return true;
-        }
-    } else |_| {}
-
-    short_link_state = .unavailable;
-    return false;
-}
+// Same memoization pattern for the /opt/nb short-prefix symlink lives in
+// platform/short_prefix.zig now (shared with the Mach-O relocator).
 
 /// Ensure patchelf is available, attempting a one-shot auto-install on
 /// first call. Safe to call concurrently — only one caller drives the
@@ -321,7 +270,7 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     // C-string and length-delimited consumers alike, with every byte
     // offset in the binary untouched. See #269 and rewriteAllInPlace.
     if (has_linuxbrew) {
-        rewriteAllInPlace(data, LINUXBREW_LITERAL, PREFIX_SLASH);
+        short.rewriteAllInPlace(data, LINUXBREW_LITERAL, PREFIX_SLASH);
         changed = true;
     }
 
@@ -330,11 +279,11 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     // strategy covers everything patchelf used to do for us, in one pass.
     var needs_patchelf = false;
     if (has_placeholder) {
-        rewriteAllInPlace(data, paths.PLACEHOLDER_REPOSITORY, paths.REAL_REPOSITORY);
+        short.rewriteAllInPlace(data, paths.PLACEHOLDER_REPOSITORY, paths.REAL_REPOSITORY);
         changed = true;
-        if (ensureShortPrefixLink(io)) {
-            rewriteAllInPlace(data, paths.PLACEHOLDER_CELLAR, SHORT_CELLAR);
-            rewriteAllInPlace(data, paths.PLACEHOLDER_PREFIX, SHORT_PREFIX);
+        if (short.ensureShortPrefixLink(io)) {
+            short.rewriteAllInPlace(data, paths.PLACEHOLDER_CELLAR, short.SHORT_CELLAR);
+            short.rewriteAllInPlace(data, paths.PLACEHOLDER_PREFIX, short.SHORT_PREFIX);
             // @@HOMEBREW_LIBRARY@@ and friends may remain in .rodata; they
             // are not linkage-relevant and were never patched before either.
         } else {
@@ -372,27 +321,10 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     }
 }
 
-/// In-place replace every occurrence of `needle` with the no-longer
-/// `replacement`, padding the freed bytes with '/' at the path-component
-/// boundary: `@@HOMEBREW_PREFIX@@/lib` → `/opt/nb////////////` + `/lib`.
-/// POSIX resolves any run of slashes as one, so the rewritten bytes are a
-/// valid path for C-string consumers (ld.so, dlopen, execve) AND for
-/// length-delimited ones — perl bakes its @INC entries with compile-time
-/// `sizeof` lengths, so an earlier NUL-padding strategy left embedded NULs
-/// *inside* @INC paths and broke module resolution ("Can't locate
-/// strict.pm"). No tail shift and no length change: every byte offset in
-/// the file stays put, and later occurrences inside the same C string
-/// (colon-separated rpath lists) keep their original offsets.
-fn rewriteAllInPlace(data: []u8, needle: []const u8, replacement: []const u8) void {
-    std.debug.assert(replacement.len <= needle.len);
-    const pad = needle.len - replacement.len;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, data, i, needle)) |hit| {
-        @memcpy(data[hit..][0..replacement.len], replacement);
-        @memset(data[hit + replacement.len ..][0..pad], '/');
-        i = hit + needle.len;
-    }
-}
+/// In-place byte rewriting (`short.rewriteAllInPlace`) lives in
+/// platform/short_prefix.zig, shared with the Mach-O relocator. The
+/// '/'-padding strategy is POSIX-valid for C-string consumers (ld.so,
+/// dlopen, execve, dyld) and length-delimited ones (perl @INC sizes).
 
 /// Find PT_INTERP in a 64-bit little-endian ELF and, when the interpreter
 /// points into the nanobrew tree but the file doesn't exist, overwrite it
@@ -424,7 +356,7 @@ fn fixInterpreterInPlace(io: std.Io, data: []u8) bool {
 
         // Only repair interpreters that point into our tree; system loaders
         // and unrewritten (still-placeholder'd) paths are left alone.
-        const ours = std.mem.startsWith(u8, interp, SHORT_PREFIX ++ "/") or
+        const ours = std.mem.startsWith(u8, interp, short.SHORT_PREFIX ++ "/") or
             std.mem.startsWith(u8, interp, paths.ROOT ++ "/");
         if (!ours) return false;
 
@@ -544,7 +476,7 @@ test "hasElfMagic identifies only complete ELF headers" {
 
 test "rewriteAllInPlace - single occurrence pads with slashes, offsets and length preserved" {
     var buf = "xx@@HOMEBREW_PREFIX@@/lib\x00yy".*;
-    rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
     // Replacement + '/'-padding + untouched tail: same strlen as the original,
     // NUL in its original position, trailing bytes untouched.
     const expected = "/opt/nb" ++ @as([12]u8, @splat('/')) ++ "/lib";
@@ -556,8 +488,8 @@ test "rewriteAllInPlace - single occurrence pads with slashes, offsets and lengt
 
 test "rewriteAllInPlace - two placeholders inside one colon-separated rpath string" {
     var buf = "@@HOMEBREW_CELLAR@@/x265/4.0/lib:@@HOMEBREW_PREFIX@@/lib\x00tail".*;
-    rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
-    rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
     const expected = "/opt/nb/Cellar" ++ @as([5]u8, @splat('/')) ++ "/x265/4.0/lib:/opt/nb" ++ @as([12]u8, @splat('/')) ++ "/lib";
     try testing.expectEqualStrings(expected, std.mem.sliceTo(&buf, 0));
     // bytes after the original string's NUL are untouched
@@ -566,7 +498,7 @@ test "rewriteAllInPlace - two placeholders inside one colon-separated rpath stri
 
 test "rewriteAllInPlace - linuxbrew literal pads at the path boundary" {
     var buf = "a/home/linuxbrew/.linuxbrew/lib\x00".*;
-    rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
+    short.rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
     try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ @as([7]u8, @splat('/')) ++ "lib", std.mem.sliceTo(buf[1..], 0));
 }
 
@@ -575,7 +507,7 @@ test "rewriteAllInPlace - no NULs inside the rewritten string (perl @INC regress
     // lengths, not strlen — embedded NULs inside the original string extent
     // broke module resolution ("Can't locate strict.pm in @INC").
     var buf = "/home/linuxbrew/.linuxbrew/lib/perl5/site_perl/5.42.2\x00".*;
-    rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
+    short.rewriteAllInPlace(&buf, "/home/linuxbrew/.linuxbrew/", "/opt/nanobrew/prefix/");
     const extent = buf[0 .. buf.len - 1]; // original string, original length
     try testing.expect(std.mem.indexOfScalar(u8, extent, 0) == null);
     try testing.expectEqualStrings("/opt/nanobrew/prefix" ++ @as([7]u8, @splat('/')) ++ "lib/perl5/site_perl/5.42.2", extent);

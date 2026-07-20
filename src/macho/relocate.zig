@@ -1,17 +1,33 @@
-// nanobrew — Mach-O relocator (native header parsing, minimal subprocess spawns)
+// nanobrew — Mach-O relocator (native byte-pass, install_name_tool fallback)
 //
-// Homebrew bottles embed @@HOMEBREW_PREFIX@@ and @@HOMEBREW_CELLAR@@
-// placeholders in Mach-O load commands. This module:
-//   1. Parses Mach-O headers natively (no otool subprocess)
-//   2. Calls install_name_tool only when placeholders are found
-//   3. Batches codesign into a single call for all modified binaries
+// Homebrew bottles embed @@HOMEBREW_*@@ placeholders in Mach-O load commands
+// AND bake literal /opt/homebrew/… paths into .rodata / __DATA as compile-time
+// defaults (OpenSSL OPENSSLDIR/ENGINESDIR, git --html-path/--man-path,
+// GIT_CONFIG_SYSTEM/GIT_ATTR_SYSTEM, …). install_name_tool only rewrites load
+// commands, so .rodata survives broken — the root cause of #347.
 //
-// OLD: otool + install_name_tool + codesign = 3N process spawns
-// NEW: install_name_tool + 1 codesign = N+1 process spawns (3x fewer)
+// This module mirrors the ELF relocator's native-first design:
+//   1. Read the whole Mach-O (or fat/universal) file once.
+//   2. When /opt/nb → <PREFIX> is available, rewrite every @@HOMEBREW_*@@
+//      placeholder and literal /opt/homebrew/… / /usr/local/… IN PLACE with
+//      strictly-shorter replacements, '/'-padding the freed bytes. One pass
+//      covers .rodata, load-command dylib IDs/rpaths/loads, and every fat
+//      slice uniformly — no install_name_tool, no otool. dyld and the kernel
+//      both collapse '/' runs; every byte offset is unchanged, so only a
+//      re-sign is needed afterward.
+//   3. When /opt/nb can't be created (non-root upgrade of an old install),
+//      fall back to install_name_tool for load commands only (.rodata stays
+//      as-is — no regression vs the previous behavior) and warn to run
+//      `sudo nb init`.
+//   4. Batch ad-hoc re-sign every Mach-O in the keg in one codesign call.
+//
+// The short-prefix guarantee and rewriteAllInPlace live in
+// platform/short_prefix.zig, shared with the ELF relocator. See #347.
 
 const std = @import("std");
 const paths = @import("../platform/paths.zig");
 const ph = @import("../platform/placeholder.zig");
+const short = @import("../platform/short_prefix.zig");
 
 const CELLAR_DIR = paths.CELLAR_DIR;
 const PREFIX = paths.PREFIX;
@@ -21,6 +37,28 @@ const PLACEHOLDER_CELLAR = paths.PLACEHOLDER_CELLAR;
 
 const REAL_PREFIX = paths.REAL_PREFIX;
 const REAL_CELLAR = paths.REAL_CELLAR;
+
+// Short-prefix replacements (via /opt/nb → <PREFIX>) and literal Homebrew
+// prefixes baked into .rodata. Every replacement is strictly shorter than
+// its source so the in-place byte pass never shifts an offset.
+const SHORT_PREFIX = short.SHORT_PREFIX; // /opt/nb (7)  < @@HOMEBREW_PREFIX@@ (19)
+const SHORT_CELLAR = short.SHORT_CELLAR; // /opt/nb/Cellar (14) < @@HOMEBREW_CELLAR@@ (19)
+const SHORT_PREFIX_SLASH = SHORT_PREFIX ++ "/"; // /opt/nb/ (8) < /opt/homebrew/ (14)
+const SHORT_CELLAR_SLASH = SHORT_CELLAR ++ "/"; // /opt/nb/Cellar/ (15) < /usr/local/Cellar/ (18)
+const SHORT_OPT_SLASH = SHORT_PREFIX ++ "/opt/"; // /opt/nb/opt/ (12) < /usr/local/opt/ (14)
+
+const HOMEBREW_LITERAL_PREFIX = "/opt/homebrew/";
+const INTEL_CELLAR_LITERAL = "/usr/local/Cellar/";
+const INTEL_OPT_LITERAL = "/usr/local/opt/";
+
+comptime {
+    if (SHORT_PREFIX_SLASH.len > HOMEBREW_LITERAL_PREFIX.len or
+        SHORT_CELLAR_SLASH.len > INTEL_CELLAR_LITERAL.len or
+        SHORT_OPT_SLASH.len > INTEL_OPT_LITERAL.len)
+    {
+        @compileError("Mach-O in-place literal relocation requires every short replacement to be no longer than its source");
+    }
+}
 
 // Mach-O constants
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
@@ -231,38 +269,108 @@ fn walkAndRelocate(
     }
 }
 
-/// Inspect `path`; if it is a Mach-O binary, run install_name_tool for any
-/// @@HOMEBREW_*@@ placeholders found and return `true`. Returns `true` even
-/// when no install_name_tool invocation was needed, as long as the file is
-/// a Mach-O binary — the caller then ad-hoc re-signs every Mach-O in the
-/// keg, because install_name_tool unconditionally invalidates a file's
-/// code signature when invoked, AND some upstream bottles ship with sealed
-/// framework resources whose hashes drift after any bundled file changes.
-/// Returns `false` only when the file is not a Mach-O (or unreadable).
+/// Inspect `path`; if it is a Mach-O (or fat/universal) binary containing
+/// @@HOMEBREW_*@@ placeholders or literal /opt/homebrew/… / /usr/local/…
+/// paths, rewrite them in place and return `true` so the caller re-signs
+/// the file. Returns `false` for non-Mach-O files and for clean Mach-O
+/// files (nothing to rewrite → no re-sign needed).
+///
+/// Primary path: a whole-file byte pass via /opt/nb (strictly-shorter
+/// replacements, '/'-padded) covers .rodata compile-time defaults AND
+/// load-command dylib IDs/rpaths/loads AND every fat slice in one go —
+/// no install_name_tool, no otool. dyld and the kernel both collapse '/'
+/// runs; every byte offset is unchanged, so only a re-sign is needed.
+/// Falls back to install_name_tool for load commands only when /opt/nb
+/// can't be created (#347).
 fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
-    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return false;
+    var file_open = true;
+    defer if (file_open) file.close(io);
 
-    // Read just the header region (load commands are in first ~32KB typically)
-    var header_buf: [65536]u8 = undefined;
-    const n = file.readPositional(io, &.{header_buf[0..]}, 0) catch {
-        file.close(io);
-        return false;
-    };
-    file.close(io);
-    if (n < 32) return false;
-    const data = header_buf[0..n];
+    const stat = file.stat(io) catch return false;
+    if (stat.size < 32 or stat.size > 256 * 1024 * 1024) return false;
 
-    const magic = std.mem.readInt(u32, data[0..4], .little);
-    if (magic != MH_MAGIC_64) {
-        // Check for fat binary — use fallback scan
-        const magic_be = std.mem.readInt(u32, data[0..4], .big);
-        if (magic_be == FAT_MAGIC or magic_be == FAT_CIGAM) {
-            return relocateFat(alloc, io, path, data);
+    // Probe magic before allocating/reading the whole file: most files under
+    // lib/ are not Mach-O.
+    var magic_buf: [4]u8 = undefined;
+    const magic_n = file.readPositional(io, &.{magic_buf[0..]}, 0) catch return false;
+    if (magic_n < 4) return false;
+    const magic_le = std.mem.readInt(u32, magic_buf[0..4], .little);
+    const magic_be = std.mem.readInt(u32, magic_buf[0..4], .big);
+    const is_macho_64 = magic_le == MH_MAGIC_64 or magic_le == MH_CIGAM_64;
+    const is_fat = magic_be == FAT_MAGIC or magic_be == FAT_CIGAM;
+    if (!is_macho_64 and !is_fat) return false;
+
+    const size: usize = @intCast(stat.size);
+    const heap = std.heap.smp_allocator;
+    const buf = heap.alloc(u8, size) catch return false;
+    defer heap.free(buf);
+    const read_n = file.readPositionalAll(io, buf, 0) catch return false;
+    const data = buf[0..read_n];
+    if (data.len < 32) return false;
+
+    const has_placeholder = std.mem.indexOf(u8, data, "@@HOMEBREW") != null;
+    const has_homebrew_literal =
+        std.mem.indexOf(u8, data, HOMEBREW_LITERAL_PREFIX) != null or
+        std.mem.indexOf(u8, data, INTEL_CELLAR_LITERAL) != null or
+        std.mem.indexOf(u8, data, INTEL_OPT_LITERAL) != null;
+    if (!has_placeholder and !has_homebrew_literal) return false; // clean: 1 read, 0 writes, 0 subprocesses
+
+    // Primary path: /opt/nb short prefix available → one in-place byte pass
+    // over the whole file (.rodata + load commands + fat slices).
+    if (short.ensureShortPrefixLink(io)) {
+        var changed = false;
+        if (std.mem.indexOf(u8, data, paths.PLACEHOLDER_REPOSITORY) != null) {
+            short.rewriteAllInPlace(data, paths.PLACEHOLDER_REPOSITORY, paths.REAL_REPOSITORY);
+            changed = true;
         }
-        return false;
+        if (std.mem.indexOf(u8, data, paths.PLACEHOLDER_CELLAR) != null) {
+            short.rewriteAllInPlace(data, paths.PLACEHOLDER_CELLAR, SHORT_CELLAR);
+            changed = true;
+        }
+        if (std.mem.indexOf(u8, data, paths.PLACEHOLDER_PREFIX) != null) {
+            short.rewriteAllInPlace(data, paths.PLACEHOLDER_PREFIX, SHORT_PREFIX);
+            changed = true;
+        }
+        if (std.mem.indexOf(u8, data, HOMEBREW_LITERAL_PREFIX) != null) {
+            short.rewriteAllInPlace(data, HOMEBREW_LITERAL_PREFIX, SHORT_PREFIX_SLASH);
+            changed = true;
+        }
+        if (std.mem.indexOf(u8, data, INTEL_CELLAR_LITERAL) != null) {
+            short.rewriteAllInPlace(data, INTEL_CELLAR_LITERAL, SHORT_CELLAR_SLASH);
+            changed = true;
+        }
+        if (std.mem.indexOf(u8, data, INTEL_OPT_LITERAL) != null) {
+            short.rewriteAllInPlace(data, INTEL_OPT_LITERAL, SHORT_OPT_SLASH);
+            changed = true;
+        }
+        // @@HOMEBREW_LIBRARY@@ / @@HOMEBREW_PERL@@ are intentionally NOT
+        // rewritten here: REAL_LIBRARY is longer than its placeholder (can't
+        // shrink in place) and neither is linkage-relevant — mirrors the ELF
+        // relocator. Text-file shebangs/.pc are handled by the placeholder
+        // walker, which skips binaries.
+        if (changed) file.writePositionalAll(io, data, 0) catch return false;
+        return changed;
     }
 
-    return relocateMachO64(alloc, io, path, data);
+    // Fallback: no /opt/nb (non-root upgrade of an old install). install_name_tool
+    // resizes load commands to the long REAL_PREFIX form — load commands are
+    // fixed, but .rodata compile-time defaults are left as-is (no regression vs
+    // the previous behavior; run `sudo nb init` to enable the full byte pass).
+    // Close our handle before install_name_tool rewrites the file.
+    file.close(io);
+    file_open = false;
+    warnNoShortPrefix(io);
+    if (is_macho_64) return relocateMachO64(alloc, io, path, data);
+    return relocateFat(alloc, io, path, data);
+}
+
+var warned_no_short_prefix = std.atomic.Value(bool).init(false);
+
+fn warnNoShortPrefix(io: std.Io) void {
+    if (warned_no_short_prefix.swap(true, .acq_rel)) return; // already warned this process
+    const msg = "nb: note: /opt/nb short-prefix symlink unavailable — Mach-O .rodata not relocated; run `sudo nb init` and reinstall affected packages\n";
+    std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
 }
 
 fn relocateMachO64(alloc: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) bool {
@@ -619,4 +727,107 @@ test "replacePlaceholders - rewrites literal /opt/homebrew/Cellar/ paths" {
     const result = try replacePlaceholders(testing.allocator, "/opt/homebrew/Cellar/imagemagick/7.1.2-21/lib/libMagickCore.dylib");
     defer testing.allocator.free(result);
     try testing.expectEqualStrings("/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-21/lib/libMagickCore.dylib", result);
+}
+
+// ── byte-pass (short.rewriteAllInPlace) tests ─────────────────────────────
+// These exercise the in-place path that relocateFile now uses for .rodata +
+// load commands when /opt/nb is available. Replacements are strictly shorter
+// and '/'-padded so byte length and every offset are preserved (#347).
+
+test "byte-pass - PREFIX placeholder pads with slashes, length preserved" {
+    var buf = "@@HOMEBREW_PREFIX@@/lib/libz.dylib\x00tail".*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    try testing.expectEqual(before_len, buf.len);
+    // /opt/nb (7) + 12 slashes + /lib/libz.dylib\x00tail
+    try testing.expect(std.mem.startsWith(u8, &buf, "/opt/nb/////////////lib/libz.dylib"));
+    try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW") == null);
+}
+
+test "byte-pass - CELLAR placeholder pads with slashes" {
+    var buf = "@@HOMEBREW_CELLAR@@/openssl@3/3.6.2/lib/libssl.3.dylib".*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
+    try testing.expectEqual(before_len, buf.len);
+    try testing.expect(std.mem.startsWith(u8, &buf, "/opt/nb/Cellar"));
+    try testing.expect(std.mem.indexOf(u8, &buf, "openssl@3/3.6.2/lib/libssl.3.dylib") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW") == null);
+}
+
+test "byte-pass - REPOSITORY placeholder (no short symlink needed)" {
+    var buf = "@@HOMEBREW_REPOSITORY@@/Library/Taps".*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_REPOSITORY@@", "/opt/nanobrew");
+    try testing.expectEqual(before_len, buf.len);
+    try testing.expect(std.mem.startsWith(u8, &buf, "/opt/nanobrew"));
+    try testing.expect(std.mem.indexOf(u8, &buf, "Library/Taps") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW") == null);
+}
+
+test "byte-pass - literal /opt/homebrew/ .rodata default (openssl OPENSSLDIR, #347)" {
+    // Mirrors a compile-time default baked into .rodata: openssl's OPENSSLDIR.
+    var buf = "OPENSSLDIR: \"/opt/homebrew/etc/openssl@3\"\x00".*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, "/opt/homebrew/", "/opt/nb/");
+    try testing.expectEqual(before_len, buf.len);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/opt/homebrew/") == null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/opt/nb") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "etc/openssl@3") != null);
+    // No NULs introduced inside the rewritten run (NUL terminator preserved).
+    const rewritten = std.mem.sliceTo(&buf, 0);
+    try testing.expect(std.mem.indexOfScalar(u8, rewritten, 0) == null);
+}
+
+test "byte-pass - literal /opt/homebrew/ subsumes Cellar/opt subpaths" {
+    var buf = "/opt/homebrew/Cellar/git/2.54.0/libexec/git-core\x00".*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, "/opt/homebrew/", "/opt/nb/");
+    try testing.expectEqual(before_len, buf.len);
+    // The single /opt/homebrew/ -> /opt/nb/ rewrite covers the Cellar subpath.
+    try testing.expect(std.mem.indexOf(u8, &buf, "/opt/homebrew/") == null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/opt/nb") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "Cellar/git/2.54.0/libexec/git-core") != null);
+}
+
+test "byte-pass - two placeholders inside one colon-separated rpath" {
+    var buf = "@@HOMEBREW_CELLAR@@/x265/4.0/lib:@@HOMEBREW_PREFIX@@/lib\x00tail".*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    try testing.expectEqual(before_len, buf.len);
+    try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW") == null);
+    try testing.expect(std.mem.startsWith(u8, &buf, "/opt/nb/Cellar"));
+    try testing.expect(std.mem.indexOf(u8, &buf, "x265/4.0/lib:") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/lib\x00tail") != null);
+}
+
+test "byte-pass - LIBRARY placeholder is intentionally left in place" {
+    // Mirrors the ELF relocator: @@HOMEBREW_LIBRARY@@ is not linkage-relevant
+    // and REAL_LIBRARY is longer than the placeholder, so it is NOT rewritten.
+    var buf = "@@HOMEBREW_LIBRARY@@/Homebrew\x00".*;
+    const before_len = buf.len;
+    // relocateFile does not call rewriteAllInPlace for LIBRARY; simulate by
+    // confirming the placeholder survives a pass that only handles the others.
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
+    try testing.expectEqual(before_len, buf.len);
+    try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW_LIBRARY@@") != null);
+}
+
+test "byte-pass - whole-file pass mirrors relocateFile (placeholder + literal)" {
+    // A tiny stand-in for a Mach-O file body: a placeholder dylib id plus a
+    // literal /opt/homebrew/ .rodata default. relocateFile rewrites both in
+    // one pass without shifting any byte offset.
+    var buf = ("LC_ID:@@HOMEBREW_CELLAR@@/openssl@3/3.6.2/lib/libssl.3.dylib"
+        ++ "|OPENSSLDIR=\"/opt/homebrew/etc/openssl@3\"\x00").*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_REPOSITORY@@", "/opt/nanobrew");
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
+    short.rewriteAllInPlace(&buf, "@@HOMEBREW_PREFIX@@", "/opt/nb");
+    short.rewriteAllInPlace(&buf, "/opt/homebrew/", "/opt/nb/");
+    try testing.expectEqual(before_len, buf.len);
+    try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW") == null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/opt/homebrew/") == null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "openssl@3/3.6.2/lib/libssl.3.dylib") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "etc/openssl@3") != null);
 }

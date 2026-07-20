@@ -18,6 +18,15 @@ const BIN_DIR = paths.BIN_DIR;
 const OPT_DIR = paths.OPT_DIR;
 const LIB_DIR = paths.LIB_DIR;
 const INCLUDE_DIR = paths.INCLUDE_DIR;
+
+/// Duplicate `s` into the arena as a NUL-terminated string. Replaces the
+/// `std.mem.Allocator.dupeZ` helper removed in Zig 0.17 (allocSentinel +
+/// memcpy is the 0.17 idiom, already used via allocPrintSentinel below).
+fn dupeZ(arena: std.mem.Allocator, s: []const u8) error{OutOfMemory}![:0]u8 {
+    const z = try arena.allocSentinel(u8, s.len, 0);
+    @memcpy(z, s);
+    return z;
+}
 const SHARE_DIR = paths.SHARE_DIR;
 const ETC_DIR = paths.ETC_DIR;
 const FORTUNE_NAME = "fortune";
@@ -689,7 +698,7 @@ fn collectLinkBucket(
     defer dir.close(lib_io);
 
     var bucket = LinkBucket{
-        .dest_dir = arena.dupeZ(u8, prefix_dest) catch return,
+        .dest_dir = dupeZ(arena, prefix_dest) catch return,
         .preserve_user_edits = preserve_user_edits,
     };
     var subdirs: std.ArrayListUnmanaged([2][:0]const u8) = .empty;
@@ -704,12 +713,12 @@ fn collectLinkBucket(
         }
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         const src = std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ keg_subdir, entry.name }, 0) catch continue;
-        const leaf_name = arena.dupeZ(u8, entry.name) catch continue;
+        const leaf_name = dupeZ(arena, entry.name) catch continue;
         bucket.leaves.append(arena, .{ .src = src, .name = leaf_name }) catch continue;
         plan.total_leaves += 1;
     }
 
-    const dest_z = arena.dupeZ(u8, prefix_dest) catch return;
+    const dest_z = dupeZ(arena, prefix_dest) catch return;
     plan.dest_dirs.append(arena, dest_z) catch return;
     plan.buckets.append(arena, bucket) catch return;
 
@@ -900,7 +909,7 @@ fn collectUnlinkBucket(
     } else |_| return;
 
     var bucket = UnlinkBucket{
-        .dest_dir = arena.dupeZ(u8, prefix_dest) catch return,
+        .dest_dir = dupeZ(arena, prefix_dest) catch return,
         .keg_prefix = arena.dupe(u8, keg_subdir) catch return,
     };
     if (std.Io.Dir.openDirAbsolute(lib_io, prefix_dest, .{ .iterate = true })) |d| {
@@ -909,7 +918,7 @@ fn collectUnlinkBucket(
         var iter = dest_dir.iterate();
         while (iter.next(lib_io) catch null) |entry| {
             if (entry.kind != .sym_link) continue;
-            const name_z = arena.dupeZ(u8, entry.name) catch continue;
+            const name_z = dupeZ(arena, entry.name) catch continue;
             bucket.names.append(arena, name_z) catch continue;
             plan.total_names += 1;
         }
@@ -917,7 +926,7 @@ fn collectUnlinkBucket(
     plan.buckets.append(arena, bucket) catch return;
 
     if (!is_root) {
-        const dest_z = arena.dupeZ(u8, prefix_dest) catch return;
+        const dest_z = dupeZ(arena, prefix_dest) catch return;
         plan.rmdir_dirs.append(arena, dest_z) catch {};
     }
 

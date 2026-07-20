@@ -36,6 +36,8 @@ comptime {
         _ = @import("api/search.zig");
     } else if (std.mem.eql(u8, step, "test-upstream-github")) {
         _ = @import("upstream_github_test.zig");
+    } else if (std.mem.eql(u8, step, "test-macho")) {
+        _ = @import("macho/relocate.zig");
     } else {
         @compileError("unknown per-module test step: " ++ step);
     }

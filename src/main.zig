@@ -375,21 +375,25 @@ fn runInit() void {
         else => {},
     };
 
-    // Linux: create the /opt/nb -> PREFIX short-prefix symlink used by the
-    // native ELF relocator. Placeholder replacements must be strictly
-    // shorter than the placeholder tokens for in-place patching; /opt/nb
-    // (7 bytes) guarantees that where /opt/nanobrew/prefix (20 bytes) is
-    // one byte too long for @@HOMEBREW_PREFIX@@ (19 bytes).
-    if (comptime builtin.os.tag == .linux) {
+    // Create the /opt/nb -> PREFIX short-prefix symlink used by the native
+    // relocator on BOTH Linux (ELF) and macOS (Mach-O). Placeholder and
+    // literal-prefix replacements must be strictly shorter than their
+    // source tokens for in-place binary patching; /opt/nb (7 bytes)
+    // guarantees that where /opt/nanobrew/prefix (20 bytes) is one byte
+    // too long for @@HOMEBREW_PREFIX@@ (19 bytes). On macOS this also lets
+    // the Mach-O byte-pass rewrite .rodata compile-time defaults (OpenSSL
+    // OPENSSLDIR, git --html-path, GIT_CONFIG_SYSTEM) that install_name_tool
+    // never touches. See #347.
+    if (comptime builtin.os.tag == .linux or builtin.os.tag == .macos) {
         std.Io.Dir.symLinkAbsolute(g_io, PREFIX, "/opt/nb", .{}) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 var nb_target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 if (std.Io.Dir.readLinkAbsolute(g_io, "/opt/nb", &nb_target_buf)) |target_n| {
                     if (!std.mem.eql(u8, nb_target_buf[0..target_n], PREFIX)) {
-                        stdout.print("nb: note: /opt/nb points elsewhere — ELF relocation will fall back to patchelf\n", .{}) catch {};
+                        stdout.print("nb: note: /opt/nb points elsewhere — binary relocation will fall back to install_name_tool / patchelf\n", .{}) catch {};
                     }
                 } else |_| {
-                    stdout.print("nb: note: /opt/nb exists and is not a symlink — ELF relocation will fall back to patchelf\n", .{}) catch {};
+                    stdout.print("nb: note: /opt/nb exists and is not a symlink — binary relocation will fall back to install_name_tool / patchelf\n", .{}) catch {};
                 }
             },
             else => {},

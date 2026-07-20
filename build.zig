@@ -85,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .{ "test-security", "src/security_test.zig", "Run security tests" },
         .{ "test-search", "src/api/search.zig", "Run search tests" },
         .{ "test-upstream-github", "src/upstream_github_test.zig", "Run GitHub upstream resolver tests" },
+        .{ "test-macho", "src/macho/relocate.zig", "Run Mach-O relocate tests" },
     };
     inline for (test_modules) |entry| {
         const opts = b.addOptions();
