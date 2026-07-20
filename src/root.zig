@@ -85,6 +85,7 @@ comptime {
     _ = tar;
     _ = native_tar;
     _ = certs;
+    _ = linker;
     _ = @import("platform/copy.zig");
     _ = @import("platform/placeholder.zig");
     _ = security_test;

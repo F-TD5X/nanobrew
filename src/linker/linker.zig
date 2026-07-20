@@ -43,6 +43,14 @@ const SubdirMapping = struct {
     /// upgrade leaves a user-edited config file alone, matching Homebrew's
     /// `etc/` semantics.
     preserve_user_edits: bool = false,
+    /// Homebrew bottles ship mutable runtime payload (config under `etc/`,
+    /// runtime state under `var/`) beneath a `.bottle/` prefix rather than the
+    /// keg root, so pour can install it into the *shared* prefix instead of
+    /// leaving it pinned to one keg version. When set, the linker also links
+    /// from `<keg>/<bottle_src>` into `dest` using the same bucket logic — a
+    /// graceful no-op when the keg has no `.bottle/` payload (e.g. source
+    /// builds, or bottles that ship `etc/` at the root). See #347.
+    bottle_src: ?[]const u8 = null,
 };
 
 pub const LinkMode = enum {
@@ -62,7 +70,7 @@ const subdir_mappings = [_]SubdirMapping{
     .{ .src = "lib", .dest = LIB_DIR },
     .{ .src = "include", .dest = INCLUDE_DIR },
     .{ .src = "share", .dest = SHARE_DIR },
-    .{ .src = "etc", .dest = ETC_DIR, .preserve_user_edits = true },
+    .{ .src = "etc", .dest = ETC_DIR, .preserve_user_edits = true, .bottle_src = ".bottle/etc" },
 };
 
 /// Extract the package name from a Cellar path.
@@ -874,6 +882,11 @@ fn fastLinkKegGlobal(keg_dir: []const u8) void {
         var sub_buf: [512]u8 = undefined;
         const keg_subdir = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ keg_dir, mapping.src }) catch continue;
         collectLinkBucket(&plan, keg_subdir, mapping.dest, mapping.preserve_user_edits);
+        if (mapping.bottle_src) |bsrc| {
+            var bbuf: [512]u8 = undefined;
+            const bottle_subdir = std.fmt.bufPrint(&bbuf, "{s}/{s}", .{ keg_dir, bsrc }) catch continue;
+            collectLinkBucket(&plan, bottle_subdir, mapping.dest, mapping.preserve_user_edits);
+        }
     }
     if (bench) {
         std.debug.print("[nb-bench] link collect: {d}ms ({d} leaves)\n", .{ milliTimestamp() - t0, plan.total_leaves });
@@ -1002,6 +1015,11 @@ fn fastUnlinkKeg(keg_dir: []const u8) void {
         var sub_buf: [512]u8 = undefined;
         const keg_subdir = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ keg_dir, mapping.src }) catch continue;
         collectUnlinkBucket(&plan, keg_subdir, mapping.dest, true);
+        if (mapping.bottle_src) |bsrc| {
+            var bbuf: [512]u8 = undefined;
+            const bottle_subdir = std.fmt.bufPrint(&bbuf, "{s}/{s}", .{ keg_dir, bsrc }) catch continue;
+            collectUnlinkBucket(&plan, bottle_subdir, mapping.dest, true);
+        }
     }
     executeUnlinkPlan(&plan);
     if (bench) std.debug.print("[nb-bench] unlink: {d}ms ({d} candidates)\n", .{ milliTimestamp() - t0, plan.total_names });
@@ -1063,6 +1081,13 @@ pub fn linkKegWithOptions(name: []const u8, version: []const u8, options: LinkOp
                 }
             } else {
                 linkSubdirOpts(keg_subdir, mapping.dest, keg_dir, mapping.preserve_user_edits);
+            }
+            // Homebrew mutable payload (.bottle/etc) is never executable, so
+            // link it with the same preserve-user-edits rule as etc/ (#347).
+            if (mapping.bottle_src) |bsrc| {
+                var bbuf: [512]u8 = undefined;
+                const bottle_subdir = std.fmt.bufPrint(&bbuf, "{s}/{s}", .{ keg_dir, bsrc }) catch continue;
+                linkSubdirOpts(bottle_subdir, mapping.dest, keg_dir, mapping.preserve_user_edits);
             }
         }
     }
@@ -1175,6 +1200,11 @@ pub fn unlinkKeg(name: []const u8, version: []const u8) !void {
             var sub_buf: [512]u8 = undefined;
             const keg_subdir = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ keg_dir, mapping.src }) catch continue;
             unlinkSubdir(keg_subdir, mapping.dest);
+            if (mapping.bottle_src) |bsrc| {
+                var bbuf: [512]u8 = undefined;
+                const bottle_subdir = std.fmt.bufPrint(&bbuf, "{s}/{s}", .{ keg_dir, bsrc }) catch continue;
+                unlinkSubdir(bottle_subdir, mapping.dest);
+            }
         }
     }
 
@@ -1239,4 +1269,196 @@ test "renderShimWrapper includes ImageMagick env vars" {
     try std.testing.expect(std.mem.indexOf(u8, script, "MAGICK_CONFIGURE_PATH=\"/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-26/etc/ImageMagick-7\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "export MAGICK_CODER_MODULE_PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "exec \"/opt/nanobrew/prefix/Cellar/imagemagick/7.1.2-26/bin/magick\" \"$@\"") != null);
+}
+
+// ── .bottle/ mutable-payload linking (#347) ──────────────────────────────
+//
+// Homebrew bottles ship config under `.bottle/etc/` (and runtime state under
+// `.bottle/var/`) rather than the keg root, so pour can install it into the
+// *shared* prefix. The linker now links that payload into `<prefix>/etc/` so
+// relocated binaries find their config — e.g. OpenSSL's OPENSSLDIR resolves to
+// `<prefix>/etc/openssl@3/openssl.cnf` instead of a non-existent path. The
+// tests below drive the link/unlink mechanisms with a `.bottle/etc` source
+// path (what the subdir_mappings loop now routes to them) and check that a
+// non-keg symlink added by a postinstall step (cert.pem -> ca-certificates)
+// survives unlink.
+
+fn testWriteFile(io: std.Io, path: []const u8, content: []const u8) !void {
+    const f = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, content);
+}
+
+/// Create `abs_path` and every missing ancestor (ignores already-exists).
+fn testMkPath(io: std.Io, abs_path: []const u8) void {
+    var i: usize = 1;
+    while (std.mem.indexOfScalarPos(u8, abs_path, i, '/')) |slash| {
+        std.Io.Dir.createDirAbsolute(io, abs_path[0..slash], .default_dir) catch {};
+        i = slash + 1;
+    }
+    std.Io.Dir.createDirAbsolute(io, abs_path, .default_dir) catch {};
+}
+
+const BottleFixture = struct {
+    root: []const u8,
+    keg_dir: []const u8,
+    keg_etc: []const u8,
+    keg_cfg: []const u8,
+    keg_misc: []const u8,
+    elsewhere: []const u8,
+    dest_etc: []const u8,
+    dest_cfg: []const u8,
+    dest_cert: []const u8,
+};
+
+/// Builds a fake keg carrying `.bottle/etc/openssl@3/{openssl.cnf,misc/foo.cnf}`
+/// plus an `elsewhere/cert.pem` (the target a postinstall cert.pem symlink
+/// would point at). `dest/` is left empty for link tests; unlink tests populate
+/// it themselves before calling.
+fn makeBottleFixture(a: std.mem.Allocator, io: std.Io, tag: []const u8) !BottleFixture {
+    var root_buf: [128]u8 = undefined;
+    const root_tmp = try std.fmt.bufPrint(&root_buf, "/tmp/nb-test-bottle-{s}-{d}", .{ tag, std.c.getpid() });
+    const root = try a.dupe(u8, root_tmp);
+    std.Io.Dir.createDirAbsolute(io, root, .default_dir) catch {};
+
+    const keg_dir = try std.fmt.allocPrint(a, "{s}/keg", .{root});
+    const keg_etc = try std.fmt.allocPrint(a, "{s}/.bottle/etc", .{keg_dir});
+    const keg_pkg = try std.fmt.allocPrint(a, "{s}/openssl@3", .{keg_etc});
+    const keg_misc_dir = try std.fmt.allocPrint(a, "{s}/misc", .{keg_pkg});
+    const keg_cfg = try std.fmt.allocPrint(a, "{s}/openssl.cnf", .{keg_pkg});
+    const keg_misc = try std.fmt.allocPrint(a, "{s}/foo.cnf", .{keg_misc_dir});
+    const elsewhere_dir = try std.fmt.allocPrint(a, "{s}/elsewhere", .{root});
+    const elsewhere = try std.fmt.allocPrint(a, "{s}/cert.pem", .{elsewhere_dir});
+    const dest_etc = try std.fmt.allocPrint(a, "{s}/dest/etc", .{root});
+    const dest_cfg = try std.fmt.allocPrint(a, "{s}/openssl@3/openssl.cnf", .{dest_etc});
+    const dest_cert = try std.fmt.allocPrint(a, "{s}/openssl@3/cert.pem", .{dest_etc});
+
+    testMkPath(io, keg_misc_dir);
+    try testWriteFile(io, keg_cfg, "# openssl config\n");
+    try testWriteFile(io, keg_misc, "# misc\n");
+    testMkPath(io, elsewhere_dir);
+    try testWriteFile(io, elsewhere, "ca-cert\n");
+
+    return .{
+        .root = root,
+        .keg_dir = keg_dir,
+        .keg_etc = keg_etc,
+        .keg_cfg = keg_cfg,
+        .keg_misc = keg_misc,
+        .elsewhere = elsewhere,
+        .dest_etc = dest_etc,
+        .dest_cfg = dest_cfg,
+        .dest_cert = dest_cert,
+    };
+}
+
+test "subdir_mappings: etc carries .bottle/etc fallback, others do not" {
+    var found_etc = false;
+    for (subdir_mappings) |mapping| {
+        if (std.mem.eql(u8, mapping.src, "etc")) {
+            found_etc = true;
+            try std.testing.expect(mapping.preserve_user_edits);
+            try std.testing.expect(mapping.bottle_src != null);
+            if (mapping.bottle_src) |bsrc| {
+                try std.testing.expectEqualStrings(".bottle/etc", bsrc);
+            }
+        } else {
+            try std.testing.expect(mapping.bottle_src == null);
+        }
+    }
+    try std.testing.expect(found_etc);
+}
+
+test "bottle payload: fast-path links .bottle/etc into shared prefix (#347)" {
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try makeBottleFixture(arena.allocator(), lib_io, "fastlink");
+    defer std.Io.Dir.cwd().deleteTree(lib_io, f.root) catch {};
+
+    // linkSubdirOpts/executeLinkPlan create the leaf dest dir but not its
+    // parent (<root>/dest); create the dest tree up front.
+    testMkPath(lib_io, f.dest_etc);
+
+    var plan = LinkPlan.init();
+    defer plan.deinit();
+    collectLinkBucket(&plan, f.keg_etc, f.dest_etc, true);
+    try std.testing.expectEqual(@as(usize, 2), plan.total_leaves); // openssl.cnf + misc/foo.cnf
+    executeLinkPlan(&plan, f.keg_dir);
+
+    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const n_cfg = try std.Io.Dir.readLinkAbsolute(lib_io, f.dest_cfg, &tbuf);
+    try std.testing.expectEqualStrings(f.keg_cfg, tbuf[0..n_cfg]);
+
+    const dest_misc = try std.fmt.allocPrint(arena.allocator(), "{s}/openssl@3/misc/foo.cnf", .{f.dest_etc});
+    const n_misc = try std.Io.Dir.readLinkAbsolute(lib_io, dest_misc, &tbuf);
+    try std.testing.expectEqualStrings(f.keg_misc, tbuf[0..n_misc]);
+}
+
+test "bottle payload: slow-path links .bottle/etc into shared prefix (#347)" {
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try makeBottleFixture(arena.allocator(), lib_io, "slowlink");
+    defer std.Io.Dir.cwd().deleteTree(lib_io, f.root) catch {};
+
+    testMkPath(lib_io, f.dest_etc);
+
+    linkSubdirOpts(f.keg_etc, f.dest_etc, f.keg_dir, true);
+
+    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const n_cfg = try std.Io.Dir.readLinkAbsolute(lib_io, f.dest_cfg, &tbuf);
+    try std.testing.expectEqualStrings(f.keg_cfg, tbuf[0..n_cfg]);
+
+    const dest_misc = try std.fmt.allocPrint(arena.allocator(), "{s}/openssl@3/misc/foo.cnf", .{f.dest_etc});
+    const n_misc = try std.Io.Dir.readLinkAbsolute(lib_io, dest_misc, &tbuf);
+    try std.testing.expectEqualStrings(f.keg_misc, tbuf[0..n_misc]);
+}
+
+test "bottle payload: fast-path unlink removes keg symlinks, keeps non-keg (#347)" {
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try makeBottleFixture(arena.allocator(), lib_io, "fastunlink");
+    defer std.Io.Dir.cwd().deleteTree(lib_io, f.root) catch {};
+
+    // Populate dest as if a prior link + a postinstall cert.pem had run.
+    testMkPath(lib_io, std.fmt.allocPrint(arena.allocator(), "{s}/openssl@3", .{f.dest_etc}) catch unreachable);
+    std.Io.Dir.symLinkAbsolute(lib_io, f.keg_cfg, f.dest_cfg, .{}) catch {};
+    std.Io.Dir.symLinkAbsolute(lib_io, f.elsewhere, f.dest_cert, .{}) catch {};
+
+    var plan = UnlinkPlan.init();
+    defer plan.deinit();
+    collectUnlinkBucket(&plan, f.keg_etc, f.dest_etc, true);
+    executeUnlinkPlan(&plan);
+
+    // keg symlink gone ...
+    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.Io.Dir.readLinkAbsolute(lib_io, f.dest_cfg, &tbuf)) |_| {
+        return error.TestUnexpectedKegSymlinkSurvived;
+    } else |_| {}
+    // ... non-keg symlink preserved.
+    const n_cert = try std.Io.Dir.readLinkAbsolute(lib_io, f.dest_cert, &tbuf);
+    try std.testing.expectEqualStrings(f.elsewhere, tbuf[0..n_cert]);
+}
+
+test "bottle payload: slow-path unlink removes keg symlinks, keeps non-keg (#347)" {
+    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const f = try makeBottleFixture(arena.allocator(), lib_io, "slowunlink");
+    defer std.Io.Dir.cwd().deleteTree(lib_io, f.root) catch {};
+
+    testMkPath(lib_io, std.fmt.allocPrint(arena.allocator(), "{s}/openssl@3", .{f.dest_etc}) catch unreachable);
+    std.Io.Dir.symLinkAbsolute(lib_io, f.keg_cfg, f.dest_cfg, .{}) catch {};
+    std.Io.Dir.symLinkAbsolute(lib_io, f.elsewhere, f.dest_cert, .{}) catch {};
+
+    unlinkSubdir(f.keg_etc, f.dest_etc);
+
+    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.Io.Dir.readLinkAbsolute(lib_io, f.dest_cfg, &tbuf)) |_| {
+        return error.TestUnexpectedKegSymlinkSurvived;
+    } else |_| {}
+    const n_cert = try std.Io.Dir.readLinkAbsolute(lib_io, f.dest_cert, &tbuf);
+    try std.testing.expectEqualStrings(f.elsewhere, tbuf[0..n_cert]);
 }
