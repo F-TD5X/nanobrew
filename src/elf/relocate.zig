@@ -235,18 +235,38 @@ fn hasElfMagic(data: []const u8) bool {
 }
 
 fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return;
-    var file_open = true;
-    defer if (file_open) file.close(io);
+    // Probe with a read-only open first: bottled payload sometimes ships
+    // without the owner-write bit (perl's 0555 bin/ and lib/ payload on
+    // Linux too), and an eager read-write open EACCES-skips exactly the
+    // files the byte pass must rewrite (#347). Only confirmed ELF files get
+    // the write-bit lift and the read-write reopen.
+    const probe = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+    var probe_open = true;
+    defer if (probe_open) probe.close(io);
 
-    const stat = file.stat(io) catch return;
+    const stat = probe.stat(io) catch return;
     if (stat.size < 16 or stat.size > 256 * 1024 * 1024) return;
 
     // Most regular files below lib/ are not ELF binaries. Probe the magic
     // first so they do not incur a full-file allocation and read.
     var header: [ELF_MAGIC.len]u8 = undefined;
-    const header_n = file.readPositional(io, &.{header[0..]}, 0) catch return;
+    const header_n = probe.readPositional(io, &.{header[0..]}, 0) catch return;
     if (!hasElfMagic(header[0..header_n])) return;
+
+    probe.close(io);
+    probe_open = false;
+
+    const orig_mode = stat.permissions.toMode();
+    const lifted = short.liftOwnerWrite(io, path, orig_mode);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch {
+        if (lifted) short.restoreMode(io, path, orig_mode);
+        return;
+    };
+    var file_open = true;
+    defer if (file_open) {
+        if (lifted) _ = std.c.fchmod(file.handle, @intCast(orig_mode));
+        file.close(io);
+    };
 
     const size: usize = @intCast(stat.size);
     const heap = std.heap.smp_allocator;
@@ -314,11 +334,15 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
                 defer std.heap.smp_allocator.free(_tmp);
                 std.Io.File.stderr().writeStreamingAll(io, _tmp) catch {};
             });
+            if (lifted) short.restoreMode(io, path, orig_mode);
             return;
         };
+        // patchelf may rewrite the file in place, so the write-bit lift
+        // stays active until it is done.
         patchInterpreter(alloc, io, path);
         patchelfRelocateRpathAndNeeded(alloc, io, path);
     }
+    if (lifted) short.restoreMode(io, path, orig_mode);
 }
 
 /// In-place byte rewriting (`short.rewriteAllInPlace`) lives in

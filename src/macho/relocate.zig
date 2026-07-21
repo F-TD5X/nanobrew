@@ -283,23 +283,43 @@ fn walkAndRelocate(
 /// Falls back to install_name_tool for load commands only when /opt/nb
 /// can't be created (#347).
 fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
-    var file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch return false;
-    var file_open = true;
-    defer if (file_open) file.close(io);
+    // Probe with a read-only open first: bottled payload sometimes ships
+    // without the owner-write bit (perl: 0555 bin/perl, libperl.dylib), and
+    // an eager read-write open EACCES-skips exactly the files the byte pass
+    // must rewrite (#347). Only confirmed Mach-O files get the write-bit
+    // lift and the read-write reopen.
+    const probe = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    var probe_open = true;
+    defer if (probe_open) probe.close(io);
 
-    const stat = file.stat(io) catch return false;
+    const stat = probe.stat(io) catch return false;
     if (stat.size < 32 or stat.size > 256 * 1024 * 1024) return false;
 
     // Probe magic before allocating/reading the whole file: most files under
     // lib/ are not Mach-O.
     var magic_buf: [4]u8 = undefined;
-    const magic_n = file.readPositional(io, &.{magic_buf[0..]}, 0) catch return false;
+    const magic_n = probe.readPositional(io, &.{magic_buf[0..]}, 0) catch return false;
     if (magic_n < 4) return false;
     const magic_le = std.mem.readInt(u32, magic_buf[0..4], .little);
     const magic_be = std.mem.readInt(u32, magic_buf[0..4], .big);
     const is_macho_64 = magic_le == MH_MAGIC_64 or magic_le == MH_CIGAM_64;
     const is_fat = magic_be == FAT_MAGIC or magic_be == FAT_CIGAM;
     if (!is_macho_64 and !is_fat) return false;
+
+    probe.close(io);
+    probe_open = false;
+
+    const orig_mode = stat.permissions.toMode();
+    const lifted = short.liftOwnerWrite(io, path, orig_mode);
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }) catch {
+        if (lifted) short.restoreMode(io, path, orig_mode);
+        return false;
+    };
+    var file_open = true;
+    defer if (file_open) {
+        if (lifted) _ = std.c.fchmod(file.handle, @intCast(orig_mode));
+        file.close(io);
+    };
 
     const size: usize = @intCast(stat.size);
     const heap = std.heap.smp_allocator;
@@ -357,7 +377,10 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     // resizes load commands to the long REAL_PREFIX form — load commands are
     // fixed, but .rodata compile-time defaults are left as-is (no regression vs
     // the previous behavior; run `sudo nb init` to enable the full byte pass).
-    // Close our handle before install_name_tool rewrites the file.
+    // Close our handle before install_name_tool rewrites the file; restore
+    // the original mode first so the fresh file install_name_tool renames
+    // into place inherits it.
+    if (lifted) _ = std.c.fchmod(file.handle, @intCast(orig_mode));
     file.close(io);
     file_open = false;
     warnNoShortPrefix(io);
@@ -742,6 +765,44 @@ test "byte-pass - PREFIX placeholder pads with slashes, length preserved" {
     // /opt/nb (7) + 12 slashes + /lib/libz.dylib\x00tail
     try testing.expect(std.mem.startsWith(u8, &buf, "/opt/nb/////////////lib/libz.dylib"));
     try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW") == null);
+}
+
+test "byte-pass - liftOwnerWrite opens 0555 payload for rewrite, restoreMode puts the bit back" {
+    // perl's bottle ships bin/perl and libperl.dylib as 0555; the eager
+    // read-write open used to EACCES-skip them silently (#347).
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const f = tmp_dir.dir.createFile(testing.io, "ro_payload", .{}) catch unreachable;
+    f.writeStreamingAll(testing.io, "@@HOMEBREW_PREFIX@@/opt/perl/lib/libperl.dylib") catch unreachable;
+    f.close(testing.io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_n = tmp_dir.dir.realPathFile(testing.io, "ro_payload", &path_buf) catch unreachable;
+    const abs_path = path_buf[0..path_n];
+    const ro = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
+    _ = std.c.fchmod(ro.handle, 0o555);
+    ro.close(testing.io);
+
+    // Read-write open is denied while the file is 0555 …
+    try testing.expectError(error.AccessDenied, std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{ .mode = .read_write }));
+    // … the lift makes the same open succeed …
+    try testing.expect(short.liftOwnerWrite(testing.io, abs_path, 0o555));
+    const rw = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{ .mode = .read_write }) catch unreachable;
+    var payload: [64]u8 = undefined;
+    const n = rw.readPositionalAll(testing.io, &payload, 0) catch unreachable;
+    short.rewriteAllInPlace(payload[0..n], "@@HOMEBREW_PREFIX@@", short.SHORT_PREFIX);
+    rw.writePositionalAll(testing.io, payload[0..n], 0) catch unreachable;
+    rw.close(testing.io);
+    // … and the restore returns the original mode for the later batch codesign.
+    short.restoreMode(testing.io, abs_path, 0o555);
+
+    const v = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
+    defer v.close(testing.io);
+    const mode = (v.stat(testing.io) catch unreachable).permissions.toMode();
+    try testing.expect((mode & 0o200) == 0);
+    var out: [64]u8 = undefined;
+    const on = v.readPositionalAll(testing.io, &out, 0) catch unreachable;
+    try testing.expect(std.mem.startsWith(u8, out[0..on], "/opt/nb/"));
+    try testing.expect(std.mem.indexOf(u8, out[0..on], "@@HOMEBREW") == null);
 }
 
 test "byte-pass - CELLAR placeholder pads with slashes" {

@@ -98,3 +98,26 @@ pub fn rewriteAllInPlace(data: []u8, needle: []const u8, replacement: []const u8
         i = hit + needle.len;
     }
 }
+
+/// Bottled payload sometimes ships without the owner-write bit (perl: 0555
+/// bin/perl and libperl.dylib), so an eager read-write open fails EACCES and
+/// the byte pass would silently skip exactly the files it must rewrite
+/// (#347). fchmod on a read-only handle works for the owning user regardless
+/// of mode, so lift the write bit for the duration of the pass. Returns true
+/// when the caller must restore the original mode afterwards. Mirrors
+/// platform/placeholder.zig's read-only text-file handling.
+pub fn liftOwnerWrite(io: std.Io, path: []const u8, orig_mode: anytype) bool {
+    if ((orig_mode & 0o200) != 0) return false;
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer f.close(io);
+    return std.c.fchmod(f.handle, @intCast(orig_mode | 0o200)) == 0;
+}
+
+/// Undo liftOwnerWrite by path — the read-write handle may already be closed
+/// by restore time (the install_name_tool / patchelf fallbacks rename fresh
+/// files into place, so a handle's inode can be stale).
+pub fn restoreMode(io: std.Io, path: []const u8, orig_mode: anytype) void {
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+    defer f.close(io);
+    _ = std.c.fchmod(f.handle, @intCast(orig_mode));
+}
