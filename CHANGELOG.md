@@ -4,6 +4,11 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
+## [0.1.205] - 2026-07-21
+
+### Fixed
+- **Read-only bottle payload now relocates**: perl's bottle ships `bin/perl` (0555) and `libperl.dylib` (0444) without the owner-write bit, and both relocators opened files read-write eagerly, took `EACCES`, and silently skipped them, so a fresh perl install died in dyld (`Symbol not found: _PL_csighandlerp`) with its `@@HOMEBREW_PREFIX@@` load command intact; the ELF relocator had the identical silent skip on Linux. Both now probe read-only (stat + magic), lift the owner-write bit via `fchmod` for confirmed binaries only, and restore the original mode after the pass (before `install_name_tool` in the Mach-O fallback so the renamed file inherits it, after `patchelf` on the ELF side). Verified: fresh perl runs `use strict` with a fully relocated `@INC` and keeps its 0555/0444 modes. Caught by the CI perl smoke test. This supersedes v0.1.204, which shipped the byte pass with this regression and is marked as a prerelease. (#347)
+
 ## [0.1.204] - 2026-07-21
 
 ### Fixed
