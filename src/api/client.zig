@@ -263,7 +263,14 @@ fn fetchFormulaWithClientAndUpstreamRegistryOptions(
                 upstreamFreshnessEnabled())
             {
                 if (fetchFormulaLive(alloc, client, name) catch null) |live| {
-                    if (formulaMetadataIsNewer(live, upstream_formula)) {
+                    // A pin can also go stale on its dependency edges alone:
+                    // Homebrew may drop a `depends_on` without bumping version,
+                    // revision, or rebuild, and the resurrected edge can pair
+                    // with live-fetched edges in the same resolve pass to form
+                    // a cycle that no longer exists upstream (#359, #362).
+                    if (formulaMetadataIsNewer(live, upstream_formula) or
+                        upstreamHasRemovedDependency(live, upstream_formula))
+                    {
                         upstream_formula.deinit(alloc);
                         return live;
                     }
@@ -382,6 +389,23 @@ fn formulaMetadataIsNewer(candidate: Formula, current: Formula) bool {
     const current_version = current.effectiveVersion(&current_buf);
     return version_cmp.isNewer(candidate_version, current_version) or
         (std.mem.eql(u8, candidate_version, current_version) and candidate.rebuild > current.rebuild);
+}
+
+/// True when the pinned upstream record lists a dependency the live formula no
+/// longer has at all — Homebrew removed a `depends_on` edge without a version,
+/// revision, or rebuild bump, so `formulaMetadataIsNewer` alone would keep the
+/// stale pin (webp still pinning libtiff, #359/#362). One-directional on
+/// purpose: on macOS `parseFormulaJson` merges `uses_from_macos` into live
+/// dependencies while the registry pin stores only Homebrew's raw list, so
+/// live legitimately carries extra entries — extras must never read as stale.
+fn upstreamHasRemovedDependency(live: Formula, upstream: Formula) bool {
+    outer: for (upstream.dependencies) |pinned_dep| {
+        for (live.dependencies) |live_dep| {
+            if (std.mem.eql(u8, pinned_dep, live_dep)) continue :outer;
+        }
+        return true;
+    }
+    return false;
 }
 
 /// Whether to cross-check verified-upstream pins against the live Homebrew API.
@@ -1186,6 +1210,45 @@ test "formulaMetadataIsNewer detects a newer bottle rebuild at one Cellar versio
     const original = Formula{ .name = "tool", .version = "1.0", .revision = 1, .rebuild = 1 };
     try testing.expect(formulaMetadataIsNewer(rebuilt, original));
     try testing.expect(!formulaMetadataIsNewer(original, rebuilt));
+}
+
+test "upstreamHasRemovedDependency detects a pinned dep live no longer has (webp/libtiff false cycle)" {
+    // Homebrew dropped webp's libtiff dep without bumping version/revision/
+    // rebuild, so the metadata check alone cannot see the stale pin (#359).
+    const pinned_webp = Formula{
+        .name = "webp",
+        .version = "1.6.0",
+        .dependencies = &.{ "giflib", "jpeg-turbo", "libpng", "libtiff" },
+    };
+    const live_webp = Formula{
+        .name = "webp",
+        .version = "1.6.0",
+        .dependencies = &.{ "giflib", "jpeg-turbo", "libpng" },
+    };
+    try testing.expect(!formulaMetadataIsNewer(live_webp, pinned_webp));
+    try testing.expect(upstreamHasRemovedDependency(live_webp, pinned_webp));
+}
+
+test "upstreamHasRemovedDependency ignores live-only extras from uses_from_macos merging" {
+    const pinned_git = Formula{
+        .name = "git",
+        .version = "2.51.0",
+        .dependencies = &.{ "gettext", "pcre2" },
+    };
+    const live_git_macos = Formula{
+        .name = "git",
+        .version = "2.51.0",
+        .dependencies = &.{ "gettext", "pcre2", "curl", "expat" },
+    };
+    try testing.expect(!upstreamHasRemovedDependency(live_git_macos, pinned_git));
+}
+
+test "upstreamHasRemovedDependency treats identical and empty dependency lists as fresh" {
+    const bare_pin = Formula{ .name = "leaf", .version = "1.0" };
+    const bare_live = Formula{ .name = "leaf", .version = "1.0" };
+    try testing.expect(!upstreamHasRemovedDependency(bare_live, bare_pin));
+    const with_dep = Formula{ .name = "tool", .version = "1.0", .dependencies = &.{"dep"} };
+    try testing.expect(!upstreamHasRemovedDependency(with_dep, with_dep));
 }
 
 test "parseFormulaJson - parses complete formula" {
