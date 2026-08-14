@@ -4,6 +4,11 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
+## [0.1.206] - 2026-08-15
+
+### Fixed
+- **False `circular dependency detected` from a stale verified-upstream pin**: Homebrew can drop a formula's `depends_on` edge without bumping version, revision, or rebuild (webp 1.6.0 dropped libtiff this way), and the registry freshness gate only compared those three fields, so the stale pinned `webp -> libtiff` edge survived every resolve and paired with the live `libtiff -> webp` edge into a two-node cycle that doesn't exist upstream. The resolver then skipped installs and upgrades for anything transitively touching the edge (mpv, libtiff, libheif, poppler, imagemagick, openjdk, tesseract, emscripten, ...). The freshness gate now also defers to live metadata when the pin lists a dependency the live formula no longer has at all. The check is deliberately one-directional: `uses_from_macos`-merged live extras never demote a verified pin. (#359, #362)
+
 ## [0.1.205] - 2026-07-21
 
 ### Fixed
