@@ -24,6 +24,8 @@ comptime {
         _ = @import("deb/extract.zig");
     } else if (std.mem.eql(u8, step, "test-deb-distro")) {
         _ = @import("deb/distro.zig");
+    } else if (std.mem.eql(u8, step, "test-deb-sources")) {
+        _ = @import("deb/sources.zig");
     } else if (std.mem.eql(u8, step, "test-version")) {
         _ = @import("version.zig");
     } else if (std.mem.eql(u8, step, "test-upstream-registry")) {
