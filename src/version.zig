@@ -66,6 +66,21 @@ pub fn isNewer(a: []const u8, b: []const u8) bool {
     return compareVersions(a, b) == .gt;
 }
 
+/// Trim whitespace and a single leading release-tag `v`/`V` prefix.
+pub fn normalizeVersion(v: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, v, " \t\r\n");
+    if (trimmed.len > 0 and (trimmed[0] == 'v' or trimmed[0] == 'V')) return trimmed[1..];
+    return trimmed;
+}
+
+/// Returns true only when `latest` is strictly newer than `current`.
+pub fn isUpdateAvailable(current: []const u8, latest: []const u8) bool {
+    const current_norm = normalizeVersion(current);
+    const latest_norm = normalizeVersion(latest);
+    if (current_norm.len == 0 or latest_norm.len == 0) return false;
+    return isNewer(latest_norm, current_norm);
+}
+
 fn parseNumeric(s: []const u8) ?u64 {
     if (s.len == 0) return 0;
     return std.fmt.parseInt(u64, s, 10) catch null;
@@ -147,4 +162,15 @@ test "isNewer: convenience function" {
     try std.testing.expect(isNewer("2.0", "1.99"));
     try std.testing.expect(!isNewer("1.0", "1.0"));
     try std.testing.expect(!isNewer("1.0", "2.0"));
+}
+
+test "isUpdateAvailable rejects downgrades and equal versions" {
+    try std.testing.expect(!isUpdateAvailable("0.1.192", "0.1.191"));
+    try std.testing.expect(!isUpdateAvailable("0.1.192", "0.1.192"));
+    try std.testing.expect(isUpdateAvailable("0.1.191", "0.1.192"));
+}
+
+test "isUpdateAvailable normalizes release tag prefixes and whitespace" {
+    try std.testing.expect(isUpdateAvailable("0.1.191", " v0.1.192\n"));
+    try std.testing.expect(!isUpdateAvailable("v0.1.192", "0.1.191"));
 }

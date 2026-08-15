@@ -294,17 +294,91 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
     defer deps.deinit(alloc);
     var build_deps: std.ArrayList([]const u8) = .empty;
     defer build_deps.deinit(alloc);
+    // Binaries declared via `def install / bin.install "name"`. Tap formulas
+    // that ship prebuilt tarballs rely on Homebrew's Ruby install DSL to move
+    // the executable from the tarball root into `bin/`. nanobrew does not
+    // execute Ruby, so without this extraction the binary lands in the keg
+    // root and is never symlinked into `prefix/bin`. See #286.
+    var install_bins: std.ArrayList([]const u8) = .empty;
+    defer install_bins.deinit(alloc);
+    // Set when any bin.install/sbin.install argument is not a plain string
+    // literal. Partial capture is worse than none: source.zig only runs the
+    // generic whole-payload copy when install_binaries is empty.
+    var bin_install_unparseable: bool = false;
+    // `bin.install Dir["<glob>"].first => "<dest>"` captures (#361).
+    var bin_renames: std.ArrayList(Formula.BinRename) = .empty;
+    defer {
+        for (bin_renames.items) |r| {
+            alloc.free(r.pattern);
+            alloc.free(r.dest);
+        }
+        bin_renames.deinit(alloc);
+    }
+    // `url ..., using: :nounzip` — raw file download, no extraction (#361).
+    var source_nounzip: bool = false;
 
-    // Track block nesting for on_macos/on_linux/bottle
+    // Track block nesting for on_macos/on_linux/bottle/test
     var in_bottle: bool = false;
     var platform_skip: bool = false;
     var block_depth: u32 = 0;
     var platform_depth: u32 = 0;
+    // `test do ... end` blocks contain arbitrary Ruby (assert_match,
+    // shell_output, etc.) and must not be parsed as formula metadata.
+    // See the extractQuotedAfter docs for the concrete failure mode.
+    var test_depth: u32 = 0;
+    // `def install ... end` is a Ruby method, not a `do` block — track its
+    // own nesting so a nested `do ... end` inside the body doesn't confuse
+    // the outer block_depth counter.
+    var in_install_method: bool = false;
+    var install_inner_depth: u32 = 0;
 
     var line_iter = std.mem.splitScalar(u8, src, '\n');
     while (line_iter.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
+
+        // --- def install body: capture bin.install targets, skip everything else ---
+        if (in_install_method) {
+            if (endsWith(line, " do") or std.mem.eql(u8, line, "do")) {
+                install_inner_depth += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, line, "end")) {
+                if (install_inner_depth > 0) {
+                    install_inner_depth -= 1;
+                } else {
+                    in_install_method = false;
+                }
+                continue;
+            }
+            if (isBinInstallLine(line)) {
+                switch (extractBinInstallNames(line)) {
+                    .names => |names| for (names) |maybe_name| {
+                        const bin_name = maybe_name orelse break;
+                        try install_bins.append(alloc, try alloc.dupe(u8, bin_name));
+                    },
+                    .glob_rename => |gr| try bin_renames.append(alloc, .{
+                        .pattern = try alloc.dupe(u8, gr.pattern),
+                        .dest = try alloc.dupe(u8, gr.dest),
+                    }),
+                    .unparseable => bin_install_unparseable = true,
+                    .none => {},
+                }
+            }
+            continue;
+        }
+
+        // Detect opening of a `def install` method — Ruby methods don't use
+        // `do`, so the existing block_depth counter doesn't cover them.
+        if (startsWith(line, "def install")) {
+            const after = line["def install".len..];
+            const is_method = after.len == 0 or after[0] == ' ' or after[0] == '\t' or after[0] == '(';
+            if (is_method) {
+                in_install_method = true;
+                install_inner_depth = 0;
+                continue;
+            }
+        }
 
         // Handle Ruby if/else/end for Hardware::CPU conditionals (#68)
         if (startsWith(line, "if Hardware::CPU.intel?")) {
@@ -358,6 +432,12 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
                 in_bottle = true;
                 continue;
             }
+
+            // Detect test block — skip its contents wholesale.
+            if (startsWith(line, "test")) {
+                test_depth = block_depth;
+                continue;
+            }
         }
 
         if (std.mem.eql(u8, line, "end")) {
@@ -368,9 +448,17 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
             if (in_bottle and block_depth > 0) {
                 in_bottle = false;
             }
+            if (test_depth > 0 and block_depth == test_depth) {
+                test_depth = 0;
+            }
             if (block_depth > 0) block_depth -= 1;
             continue;
         }
+
+        // Skip lines inside test blocks — they contain arbitrary Ruby
+        // (shell_output, assert_match, etc.) that must not be scanned
+        // for `version`/`url`/`sha256`/`depends_on`.
+        if (test_depth > 0) continue;
 
         // Skip lines inside wrong-platform blocks
         if (platform_skip) continue;
@@ -421,6 +509,28 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
                 }
             }
         }
+
+        // bin.install / sbin.install
+        if (isBinInstallLine(line)) {
+            switch (extractBinInstallNames(line)) {
+                .names => |names| for (names) |maybe_name| {
+                    const bin_name = maybe_name orelse break;
+                    try install_bins.append(alloc, try alloc.dupe(u8, bin_name));
+                },
+                .glob_rename => |gr| try bin_renames.append(alloc, .{
+                    .pattern = try alloc.dupe(u8, gr.pattern),
+                    .dest = try alloc.dupe(u8, gr.dest),
+                }),
+                .unparseable => bin_install_unparseable = true,
+                .none => {},
+            }
+        }
+
+        // `using: :nounzip` marks the source url as a raw file (#361). It can
+        // sit on the url line itself or on a continuation line right below it.
+        if (std.mem.indexOf(u8, line, "using: :nounzip") != null) {
+            source_nounzip = true;
+        }
     }
 
     // Extract version from URL if not found explicitly
@@ -454,16 +564,29 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
     else
         try alloc.dupe(u8, "");
 
+    if (bin_install_unparseable) {
+        for (install_bins.items) |b| alloc.free(b);
+        install_bins.clearRetainingCapacity();
+        for (bin_renames.items) |r| {
+            alloc.free(r.pattern);
+            alloc.free(r.dest);
+        }
+        bin_renames.clearRetainingCapacity();
+    }
+
     return .{
         .name = try alloc.dupe(u8, name),
         .version = try alloc.dupe(u8, ver),
         .desc = try alloc.dupe(u8, desc orelse ""),
         .source_url = resolved_url,
         .source_sha256 = resolved_sha,
+        .source_nounzip = source_nounzip,
         .bottle_url = b_url,
         .bottle_sha256 = b_sha,
         .dependencies = try deps.toOwnedSlice(alloc),
         .build_deps = try build_deps.toOwnedSlice(alloc),
+        .install_binaries = try install_bins.toOwnedSlice(alloc),
+        .install_bin_renames = try bin_renames.toOwnedSlice(alloc),
     };
 }
 
@@ -503,7 +626,13 @@ fn interpolateVersion(alloc: std.mem.Allocator, s: []const u8, version: []const 
     return result.toOwnedSlice(alloc);
 }
 
-/// Extract quoted string after a keyword, e.g. `version "1.0"` -> "1.0"
+/// Extract quoted string after a keyword, e.g. `version "1.0"` -> "1.0".
+/// NOTE: This intentionally matches the keyword anywhere in the line —
+/// callers like `parseRubyCask` rely on it to read mid-line `target:` /
+/// `as: "..."` etc. parameters. The cost is that it would also match
+/// the substring `version` inside `--version` flags within Ruby `test do`
+/// blocks; those are handled at the caller level by skipping
+/// `test do … end` block contents (see #279 / formula version bug).
 fn extractQuotedAfter(line: []const u8, keyword: []const u8) ?[]const u8 {
     const idx = std.mem.indexOf(u8, line, keyword) orelse return null;
     const after = line[idx + keyword.len ..];
@@ -513,6 +642,125 @@ fn extractQuotedAfter(line: []const u8, keyword: []const u8) ?[]const u8 {
     // Find closing quote
     const q2 = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
     return rest[0..q2];
+}
+
+/// True for a `bin.install` / `sbin.install` directive. The boundary check
+/// matters: a bare prefix match also catches `bin.install_symlink`, whose
+/// argument is keg-rooted (e.g. `libexec/"tool"`), not a payload-rooted file —
+/// capturing it would make source.zig skip the generic whole-payload copy and
+/// then fail (or install a launcher without its payload).
+fn isBinInstallLine(line: []const u8) bool {
+    for ([_][]const u8{ "bin.install", "sbin.install" }) |kw| {
+        if (startsWith(line, kw)) {
+            if (line.len == kw.len) return false; // no arguments
+            const c = line[kw.len];
+            return c == ' ' or c == '\t' or c == '(';
+        }
+    }
+    return false;
+}
+
+const BinInstallParse = union(enum) {
+    /// No binary names on the line.
+    none,
+    /// Plain string-literal names, in order; trailing entries are null.
+    names: [8]?[]const u8,
+    /// `bin.install Dir["<glob>"].first => "<dest>"` — a payload-rooted glob
+    /// whose first match is installed under a new name (#361). Resolved at
+    /// source-install time against the staged files.
+    glob_rename: struct {
+        pattern: []const u8,
+        dest: []const u8,
+    },
+    /// The directive has arguments we cannot resolve statically
+    /// (`#{version}` interpolation, unsupported `Dir[...]` shapes, keg-path
+    /// prefixes like `libexec/"x"`). The caller must NOT trust any partial
+    /// capture — the safe behavior is to drop all declared binaries for the
+    /// formula so the source-build path keeps its generic whole-payload copy.
+    unparseable,
+};
+
+/// Extract binary names from `bin.install` / `sbin.install` Ruby directives.
+/// Handles: `bin.install "a"`, `bin.install "a", "b"`, `bin.install "src" => "dst"`,
+/// `bin.install("tool")`. For rename syntax, only the source name is returned.
+/// Strict: every argument must be a plain string literal — anything else
+/// (Ruby expressions, interpolation, globs) yields `.unparseable`.
+fn extractBinInstallNames(line: []const u8) BinInstallParse {
+    const install_idx = std.mem.indexOf(u8, line, ".install") orelse return .none;
+    var rest = std.mem.trimStart(u8, line[install_idx + ".install".len ..], " \t");
+    if (rest.len > 0 and rest[0] == '(') rest = std.mem.trimStart(u8, rest[1..], " \t");
+
+    // `bin.install Dir["<glob>"].first => "<dest>"` (#361): raw-asset tap
+    // formulas rename the single downloaded file. Only this exact shape is
+    // resolved; any other Dir[...] expression stays unparseable.
+    if (std.mem.startsWith(u8, rest, "Dir[")) {
+        var r = rest["Dir[".len..];
+        if (r.len == 0 or (r[0] != '"' and r[0] != '\'')) return .unparseable;
+        const gq = r[0];
+        const gclose = std.mem.indexOfScalar(u8, r[1..], gq) orelse return .unparseable;
+        const pattern = r[1 .. 1 + gclose];
+        if (pattern.len == 0 or std.mem.indexOf(u8, pattern, "#{") != null) return .unparseable;
+        r = std.mem.trimStart(u8, r[1 + gclose + 1 ..], " \t");
+        if (!std.mem.startsWith(u8, r, "]")) return .unparseable;
+        r = std.mem.trimStart(u8, r[1..], " \t");
+        if (!std.mem.startsWith(u8, r, ".first")) return .unparseable;
+        r = std.mem.trimStart(u8, r[".first".len..], " \t");
+        if (!std.mem.startsWith(u8, r, "=>")) return .unparseable;
+        r = std.mem.trimStart(u8, r[2..], " \t");
+        if (r.len == 0 or (r[0] != '"' and r[0] != '\'')) return .unparseable;
+        const dq = r[0];
+        const dclose = std.mem.indexOfScalar(u8, r[1..], dq) orelse return .unparseable;
+        const dest = r[1 .. 1 + dclose];
+        if (dest.len == 0 or std.mem.indexOf(u8, dest, "#{") != null) return .unparseable;
+        if (std.mem.indexOfScalar(u8, dest, '*') != null) return .unparseable;
+        r = std.mem.trimStart(u8, r[1 + dclose + 1 ..], " \t");
+        if (r.len > 0 and r[0] == ')') r = std.mem.trimStart(u8, r[1..], " \t");
+        if (r.len > 0 and r[0] != '#') return .unparseable;
+        return .{ .glob_rename = .{ .pattern = pattern, .dest = dest } };
+    }
+
+    var result: [8]?[]const u8 = @splat(null);
+    var count: usize = 0;
+
+    while (rest.len > 0) {
+        if (rest[0] == '#') break; // trailing Ruby comment
+        const quote_char = rest[0];
+        if (quote_char != '"' and quote_char != '\'') return .unparseable;
+        const close = std.mem.indexOfScalar(u8, rest[1..], quote_char) orelse return .unparseable;
+        const name = rest[1 .. 1 + close];
+        if (name.len == 0) return .unparseable;
+        if (std.mem.indexOf(u8, name, "#{") != null) return .unparseable; // interpolation
+        if (std.mem.indexOfScalar(u8, name, '*') != null) return .unparseable; // glob
+        if (count >= result.len) return .unparseable; // don't truncate silently
+        result[count] = name;
+        count += 1;
+        rest = std.mem.trimStart(u8, rest[1 + close + 1 ..], " \t");
+
+        // Rename syntax: `"src" => "dst"` — keep src, require dst be a literal.
+        if (std.mem.startsWith(u8, rest, "=>")) {
+            rest = std.mem.trimStart(u8, rest[2..], " \t");
+            if (rest.len == 0 or (rest[0] != '"' and rest[0] != '\'')) return .unparseable;
+            const tq = rest[0];
+            const tclose = std.mem.indexOfScalar(u8, rest[1..], tq) orelse return .unparseable;
+            rest = std.mem.trimStart(u8, rest[1 + tclose + 1 ..], " \t");
+        }
+
+        if (rest.len == 0) break;
+        if (rest[0] == ')') {
+            rest = std.mem.trimStart(u8, rest[1..], " \t");
+            continue;
+        }
+        if (rest[0] == ',') {
+            rest = std.mem.trimStart(u8, rest[1..], " \t");
+            if (rest.len == 0) return .unparseable; // dangling comma
+            continue;
+        }
+        if (rest[0] == '#') break;
+        return .unparseable;
+    }
+
+    if (count == 0) return .none;
+    return .{ .names = result };
 }
 
 /// Find bottle sha256 matching our platform tag.
@@ -769,6 +1017,74 @@ test "parseRubyFormula - simple formula with version and url" {
     try testing.expectEqualStrings("Command-line ElevenLabs TTS", f.desc);
     try testing.expectEqualStrings("https://github.com/steipete/sag/releases/download/v0.2.2/sag.tar.gz", f.source_url);
     try testing.expectEqualStrings("abc123", f.source_sha256);
+    // Regression: tap formulas with a custom `def install / bin.install`
+    // must surface the binary name so source_builder.installDeclaredBinaries
+    // can place it under keg/bin/. See #286.
+    try testing.expectEqual(@as(usize, 1), f.install_binaries.len);
+    try testing.expectEqualStrings("sag", f.install_binaries[0]);
+}
+
+test "parseRubyFormula - def install bin.install populates install_binaries (#286)" {
+    // Shape mirrors neurosnap/tap/zmx — prebuilt tarball with on_macos/on_arm
+    // platform blocks and a custom `def install` containing `bin.install`.
+    const src =
+        \\class Zmx < Formula
+        \\  desc "Session persistence for terminal processes"
+        \\  version "0.5.0"
+        \\  on_macos do
+        \\    on_arm do
+        \\      url "https://zmx.sh/a/zmx-0.5.0-macos-aarch64.tar.gz"
+        \\      sha256 "deadbeef"
+        \\    end
+        \\  end
+        \\  def install
+        \\    bin.install "zmx"
+        \\    generate_completions_from_executable(bin/"zmx", "completions")
+        \\  end
+        \\  test do
+        \\    assert_match "Usage: zmx", shell_output("#{bin}/zmx help")
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "zmx", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqualStrings("zmx", f.name);
+    try testing.expectEqualStrings("0.5.0", f.version);
+    try testing.expectEqual(@as(usize, 1), f.install_binaries.len);
+    try testing.expectEqualStrings("zmx", f.install_binaries[0]);
+}
+
+test "parseRubyFormula - bin.install with multiple binaries" {
+    const src =
+        \\class Multi < Formula
+        \\  version "1.0"
+        \\  url "https://example.com/multi.tar.gz"
+        \\  sha256 "abc"
+        \\  def install
+        \\    bin.install "foo", "bar", "baz"
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "multi", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), f.install_binaries.len);
+    try testing.expectEqualStrings("foo", f.install_binaries[0]);
+    try testing.expectEqualStrings("bar", f.install_binaries[1]);
+    try testing.expectEqualStrings("baz", f.install_binaries[2]);
+}
+
+test "parseRubyFormula - def install absent yields empty install_binaries" {
+    // Bottle-style formula that never lists explicit binaries.
+    const src =
+        \\class Hello < Formula
+        \\  version "2.12.1"
+        \\  url "https://example.com/hello.tar.gz"
+        \\  sha256 "abc"
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "hello", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), f.install_binaries.len);
 }
 
 test "parseRubyFormula - version interpolation in url" {
@@ -806,6 +1122,8 @@ test "parseRubyFormula - dependencies" {
 }
 
 test "parseRubyFormula - bottle block with root_url" {
+    // Carry a sha for every CI platform so findBottleSha256 resolves the
+    // current BOTTLE_TAG on macOS and Linux alike.
     const src =
         \\class Bpb < Formula
         \\  version "1.3.0"
@@ -814,6 +1132,8 @@ test "parseRubyFormula - bottle block with root_url" {
         \\  bottle do
         \\    root_url "https://github.com/indirect/homebrew-tap/releases/download/bpb-v1.3.0"
         \\    sha256 cellar: :any_skip_relocation, arm64_sonoma: "32aab73b"
+        \\    sha256 cellar: :any_skip_relocation, x86_64_linux: "32aab73b"
+        \\    sha256 cellar: :any_skip_relocation, aarch64_linux: "32aab73b"
         \\  end
         \\end
     ;
@@ -848,6 +1168,56 @@ test "parseRubyFormula - no version returns error" {
         \\end
     ;
     try testing.expectError(error.FormulaNotFound, parseRubyFormula(testing.allocator, "bad", src));
+}
+
+test "parseRubyFormula - test do block does not pollute version (#279)" {
+    // Regression: a `test do` block whose `shell_output(...)` argument
+    // contains the substring "version" (e.g. `--version`) used to leak
+    // into the formula's version field. The corrupted state seen in
+    // #279 had version = `#{bin}/sag --version` because the parser
+    // matched the substring `version` inside `--version` and grabbed
+    // the next quoted span.
+    const src =
+        \\class Sag < Formula
+        \\  desc "sag"
+        \\  url "https://example.com/sag-1.0.tar.gz"
+        \\  version "1.0"
+        \\  sha256 "deadbeef"
+        \\
+        \\  def install
+        \\    bin.install "sag"
+        \\  end
+        \\
+        \\  test do
+        \\    assert_match "1.0", shell_output("#{bin}/sag --version")
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "sag", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqualStrings("1.0", f.version);
+    try testing.expectEqualStrings("sag", f.name);
+}
+
+test "parseRubyFormula - test do block before version line still finds version" {
+    // If the `test do` block were not properly closed, subsequent
+    // top-level lines (including a real `version "..."`) would be
+    // skipped. Confirm `end` correctly exits the test scope.
+    const src =
+        \\class Foo < Formula
+        \\  url "https://example.com/foo.tar.gz"
+        \\  sha256 "aa"
+        \\
+        \\  test do
+        \\    assert_match "v0.0.1", shell_output("#{bin}/foo --version")
+        \\  end
+        \\
+        \\  version "9.9.9"
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "foo", src);
+    defer f.deinit(testing.allocator);
+    try testing.expectEqualStrings("9.9.9", f.version);
 }
 
 test "extractQuotedAfter - basic" {
@@ -886,4 +1256,162 @@ test "findBottleSha256 - matching tag" {
     if (is_macos and builtin.cpu.arch == .aarch64) {
         try testing.expectEqualStrings("abcdef", sha.?);
     }
+}
+
+test "extractBinInstallNames - single binary" {
+    const result = extractBinInstallNames("bin.install \"crush\"").names;
+    try testing.expectEqualStrings("crush", result[0].?);
+    try testing.expect(result[1] == null);
+}
+
+test "extractBinInstallNames - multiple binaries" {
+    const result = extractBinInstallNames("bin.install \"a\", \"b\", \"c\"").names;
+    try testing.expectEqualStrings("a", result[0].?);
+    try testing.expectEqualStrings("b", result[1].?);
+    try testing.expectEqualStrings("c", result[2].?);
+    try testing.expect(result[3] == null);
+}
+
+test "extractBinInstallNames - rename syntax" {
+    const result = extractBinInstallNames("bin.install \"crush\" => \"crush-cli\"").names;
+    try testing.expectEqualStrings("crush", result[0].?);
+    try testing.expect(result[1] == null);
+}
+
+test "extractBinInstallNames - sbin" {
+    const result = extractBinInstallNames("sbin.install \"daemon\"").names;
+    try testing.expectEqualStrings("daemon", result[0].?);
+}
+
+test "extractBinInstallNames - parenthesized call" {
+    const result = extractBinInstallNames("bin.install(\"tool\")").names;
+    try testing.expectEqualStrings("tool", result[0].?);
+}
+
+test "isBinInstallLine - rejects bin.install_symlink (review follow-up)" {
+    try testing.expect(isBinInstallLine("bin.install \"x\""));
+    try testing.expect(isBinInstallLine("sbin.install(\"d\")"));
+    try testing.expect(!isBinInstallLine("bin.install_symlink libexec/\"tool/bin/tool\""));
+    try testing.expect(!isBinInstallLine("sbin.install_symlink \"x\""));
+    try testing.expect(!isBinInstallLine("generate_completions_from_executable(bin/\"zmx\")"));
+}
+
+test "extractBinInstallNames - non-literal args are unparseable, not partially captured" {
+    // Ruby interpolation
+    try testing.expect(extractBinInstallNames("bin.install \"tool-#{version}\"") == .unparseable);
+    // glob
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"scripts/*\"]") == .unparseable);
+    // keg-path-rooted argument
+    try testing.expect(extractBinInstallNames("bin.install libexec/\"x\"") == .unparseable);
+    // bare expression
+    try testing.expect(extractBinInstallNames("bin.install some_var") == .unparseable);
+}
+
+test "extractBinInstallNames - Dir glob rename resolves statically (#361)" {
+    const r = extractBinInstallNames("bin.install Dir[\"omp-*\"].first => \"omp\"");
+    try testing.expect(r == .glob_rename);
+    try testing.expectEqualStrings("omp-*", r.glob_rename.pattern);
+    try testing.expectEqualStrings("omp", r.glob_rename.dest);
+}
+
+test "extractBinInstallNames - Dir glob without .first rename stays unparseable (#361)" {
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"omp-*\"]") == .unparseable);
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"omp-*\"].first") == .unparseable);
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"omp-#{version}-*\"].first => \"omp\"") == .unparseable);
+}
+
+test "parseRubyFormula - using: :nounzip with Dir glob rename (#361)" {
+    const src =
+        \\class Omp < Formula
+        \\  desc "Oh My Posh fork"
+        \\  version "17.1.6"
+        \\  url "https://github.com/can1357/oh-my-pi/releases/download/v#{version}/omp-darwin-arm64",
+        \\      using: :nounzip
+        \\  sha256 "6c0c45af6c8c566ce28370c8570d9a709713277fad5420b44161e26a3d07be5d"
+        \\
+        \\  def install
+        \\    bin.install Dir["omp-*"].first => "omp"
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "omp", src);
+    defer f.deinit(testing.allocator);
+    try testing.expect(f.source_nounzip);
+    try testing.expectEqualStrings(
+        "https://github.com/can1357/oh-my-pi/releases/download/v17.1.6/omp-darwin-arm64",
+        f.source_url,
+    );
+    try testing.expectEqual(@as(usize, 0), f.install_binaries.len);
+    try testing.expectEqual(@as(usize, 1), f.install_bin_renames.len);
+    try testing.expectEqualStrings("omp-*", f.install_bin_renames[0].pattern);
+    try testing.expectEqualStrings("omp", f.install_bin_renames[0].dest);
+}
+
+test "parseRubyFormula - archive formulas keep source_nounzip false" {
+    const src =
+        \\class Plain < Formula
+        \\  version "1.0"
+        \\  url "https://example.com/plain-1.0.tar.gz"
+        \\  sha256 "abc"
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "plain", src);
+    defer f.deinit(testing.allocator);
+    try testing.expect(!f.source_nounzip);
+    try testing.expectEqual(@as(usize, 0), f.install_bin_renames.len);
+}
+
+test "parseRubyFormula - unparseable bin.install clears install_binaries so generic copy runs" {
+    const src =
+        \\class Mixed < Formula
+        \\  version "1.0"
+        \\  url "https://example.com/mixed.tar.gz"
+        \\  sha256 "abc"
+        \\  def install
+        \\    bin.install "good"
+        \\    bin.install "tool-#{version}"
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "mixed", src);
+    defer f.deinit(testing.allocator);
+    // Partial capture ("good" without the interpolated one) would break the
+    // install — the whole list must be dropped.
+    try testing.expectEqual(@as(usize, 0), f.install_binaries.len);
+}
+
+test "parseRubyFormula - extracts install_binaries" {
+    const src =
+        \\class Zmx < Formula
+        \\  version "0.5.0"
+        \\  url "https://example.com/zmx-0.5.0.tar.gz"
+        \\  sha256 "abc123"
+        \\  def install
+        \\    bin.install "zmx"
+        \\  end
+        \\end
+    ;
+    const formula = try parseRubyFormula(testing.allocator, "zmx", src);
+    defer formula.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), formula.install_binaries.len);
+    try testing.expectEqualStrings("zmx", formula.install_binaries[0]);
+}
+
+test "parseRubyFormula - extracts install_binaries with rename" {
+    const src =
+        \\class Crush < Formula
+        \\  version "1.0.0"
+        \\  url "https://example.com/crush-1.0.0.tar.gz"
+        \\  sha256 "def456"
+        \\  def install
+        \\    bin.install "crush" => "crush-cli"
+        \\    sbin.install "crushd"
+        \\  end
+        \\end
+    ;
+    const formula = try parseRubyFormula(testing.allocator, "crush", src);
+    defer formula.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), formula.install_binaries.len);
+    try testing.expectEqualStrings("crush", formula.install_binaries[0]);
+    try testing.expectEqualStrings("crushd", formula.install_binaries[1]);
 }

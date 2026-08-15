@@ -78,7 +78,7 @@ pub const DownloadEvent = struct {
 };
 
 pub fn fileSize(path: []const u8) ?u64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = paths.safe_io;
     var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer file.close(io);
     const stat = file.stat(io) catch return null;
@@ -94,7 +94,7 @@ pub fn settingPath() []const u8 {
 }
 
 pub fn setEnabled(value: bool) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = paths.safe_io;
     std.Io.Dir.createDirAbsolute(io, paths.CONFIG_DIR, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -124,7 +124,7 @@ fn envValueEnabled(value_or_null: ?[]const u8) bool {
 }
 
 fn readStoredEnabled() ?bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = paths.safe_io;
     var file = std.Io.Dir.openFileAbsolute(io, CONFIG_PATH, .{}) catch return null;
     defer file.close(io);
 
@@ -196,7 +196,7 @@ fn sendPayload(payload: Payload) !void {
     const uri = std.Uri.parse(endpoint()) catch return error.TelemetrySendFailed;
     var client: std.http.Client = .{
         .allocator = alloc,
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = paths.safe_io,
     };
     defer client.deinit();
 

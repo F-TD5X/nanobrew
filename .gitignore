@@ -7,3 +7,10 @@ posts/twitter-thread*.md
 tweet*.md
 .DS_Store
 registry/upstream-release-db.json
+.wrangler/
+nb-linux-fresh
+dist/
+__pycache__/
+.bench-bin/
+.graff/
+.harness/

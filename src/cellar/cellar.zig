@@ -9,10 +9,10 @@
 const std = @import("std");
 const paths = @import("../platform/paths.zig");
 const copy = @import("../platform/copy.zig");
+const purge = @import("../platform/purge.zig");
 
 /// Materialize a keg from the store into the Cellar.
-pub fn materialize(sha256: []const u8, name: []const u8, version: []const u8) !void {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+pub fn materialize(io: std.Io, sha256: []const u8, name: []const u8, version: []const u8) !void {
     var name_dir_buf: [512]u8 = undefined;
     const name_dir = std.fmt.bufPrint(&name_dir_buf, "{s}/{s}/{s}", .{ paths.STORE_DIR, sha256, name }) catch return error.PathTooLong;
 
@@ -28,10 +28,10 @@ pub fn materialize(sha256: []const u8, name: []const u8, version: []const u8) !v
     // Ensure parent dir exists
     var parent_buf: [512]u8 = undefined;
     const parent_dir = std.fmt.bufPrint(&parent_buf, "{s}/{s}", .{ paths.CELLAR_DIR, name }) catch return error.PathTooLong;
-    std.Io.Dir.createDirAbsolute(lib_io, parent_dir, .default_dir) catch {};
+    std.Io.Dir.createDirAbsolute(io, parent_dir, .default_dir) catch {};
 
     // Remove existing keg if present
-    std.Io.Dir.cwd().deleteTree(lib_io, dest_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(io, dest_dir) catch {};
 
     // Try COW clone first (macOS clonefile / Linux: always false -> fallback)
     var src_z: [512:0]u8 = undefined;
@@ -44,8 +44,11 @@ pub fn materialize(sha256: []const u8, name: []const u8, version: []const u8) !v
 
     if (copy.cloneTree(&src_z, &dst_z)) return;
 
-    // Fallback: cp (--reflink=auto on Linux, plain -R on macOS)
-    try copy.cpFallback(lib_io, src_dir, dest_dir);
+    // Fallback: cp (--reflink=auto on Linux, plain -R on macOS).
+    // The caller's io must be used here; std.Io.Threaded.global_single_threaded
+    // cannot be passed to std.process.run under Zig 0.16 (vtable mismatch
+    // surfaces as error.CopyFailed). See issue #276.
+    try copy.cpFallback(io, src_dir, dest_dir);
 }
 
 /// Find the actual installed version for a keg in the Cellar.
@@ -57,10 +60,12 @@ pub fn detectKegVersion(name: []const u8, version: []const u8, result_buf: *[256
 
 /// Remove a keg from the Cellar.
 pub fn remove(name: []const u8, version: []const u8) !void {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    const lib_io = paths.safe_io;
     var buf: [512]u8 = undefined;
     const keg_dir = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ paths.CELLAR_DIR, name, version }) catch return error.PathTooLong;
-    std.Io.Dir.cwd().deleteTree(lib_io, keg_dir) catch {};
+    if (std.Io.Dir.accessAbsolute(lib_io, keg_dir, .{})) |_| {
+        purge.deferTreeRemoval(lib_io, keg_dir);
+    } else |_| {}
 
     var parent_buf: [512]u8 = undefined;
     const parent_dir = std.fmt.bufPrint(&parent_buf, "{s}/{s}", .{ paths.CELLAR_DIR, name }) catch return;
@@ -76,7 +81,7 @@ pub fn remove(name: []const u8, version: []const u8) !void {
 }
 
 fn detectStoreVersion(name_dir: []const u8, version: []const u8, result_buf: *[256]u8) ?[]const u8 {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    const lib_io = paths.safe_io;
     var exact_buf: [512]u8 = undefined;
     const exact = std.fmt.bufPrint(&exact_buf, "{s}/{s}", .{ name_dir, version }) catch return null;
     if (std.Io.Dir.openDirAbsolute(lib_io, exact, .{})) |d| {

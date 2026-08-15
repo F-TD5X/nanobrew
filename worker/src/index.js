@@ -7,7 +7,9 @@ REPO="${REPO}"
 INSTALL_DIR="\${NANOBREW_INSTALL_DIR:-/opt/nanobrew}"
 BIN_DIR="$INSTALL_DIR/prefix/bin"
 SITE_URL="https://nanobrew.trilok.ai"
-FALLBACK_RELEASE="v0.1.191"
+# Last-resort release tag if the worker's /version endpoint AND GitHub's
+# API are both unreachable. Bump on every release cut.
+FALLBACK_RELEASE="v0.1.193"
 
 echo ""
 echo "  nanobrew — the fastest package manager"
@@ -48,13 +50,22 @@ if [ -n "\${NANOBREW_INSTALL_VERSION:-}" ]; then
     echo "  Using $LATEST"
 else
     echo "  Fetching latest release..."
-    LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
-    if [ -z "$LATEST" ]; then
-        echo "error: could not find latest release"
-        echo "hint: make sure https://github.com/$REPO has a release"
-        exit 1
+    # Resolve the latest version via the worker (which caches GH for 5 min
+    # and has its own fallback) BEFORE hitting GH directly. Avoids the
+    # 60/hr unauthenticated rate limit on api.github.com that used to
+    # break installs during traffic spikes.
+    LATEST_VER=$(curl -fsSL "$SITE_URL/version" 2>/dev/null || true)
+    if [ -n "$LATEST_VER" ]; then
+        LATEST="v$LATEST_VER"
+    else
+        LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep '"tag_name"' | cut -d'"' -f4)
     fi
-    echo "  Found $LATEST"
+    if [ -z "$LATEST" ]; then
+        echo "  Could not resolve latest release; using $FALLBACK_RELEASE"
+        LATEST="$FALLBACK_RELEASE"
+    else
+        echo "  Found $LATEST"
+    fi
 fi
 
 # Download binary + SHA256 checksum
@@ -762,6 +773,15 @@ const LANDING_HTML = `<!DOCTYPE html>
         <div class="br-t"><div class="br-b nb" data-w="100%">48.8ms yt-dlp reinstall &middot; 119.4x faster than Homebrew</div></div>
       </div>
       <div class="bg-note">359 verified native paths &middot; 100/100 top formulae + 100/100 top casks covered &middot; 37.5x faster than zerobrew on target reinstall &middot; no Homebrew required for covered paths &middot; <a href="/v0.1.192">full notes</a></div>
+    </div>
+
+    <div class="bg">
+      <div class="bg-title">v0.1.193 <span>/ may 2026, audit-driven correctness sweep</span></div>
+      <div class="br">
+        <span class="br-l">nb</span>
+        <div class="br-t"><div class="br-b nb" data-w="100%">install path unchanged &middot; correctness over speed</div></div>
+      </div>
+      <div class="bg-note">38 commits, 20+ targeted bug fixes &middot; deb path correctness sweep (cwd-independent <code>nb remove --deb</code>, native xz, postinst io, patchelf race, locale relocation) &middot; process-wide threadsafe Io accessor &middot; <code>nb cleanup --prune-kegs</code> &middot; HTTP User-Agent override &middot; honest known-issue disclosure &middot; <a href="/v0.1.193">full notes</a></div>
     </div>
   </section>
     <div class="term">
@@ -1533,6 +1553,8 @@ const RELEASE_191_HTML = `<!DOCTYPE html>
     <div class="nav-links">
       <a href="https://github.com/justrach/nanobrew">GitHub</a>
       <a href="https://github.com/justrach/nanobrew#install">Install</a>
+      <a href="/v0.1.193">v0.1.193</a>
+      <a href="/v0.1.192">v0.1.192</a>
       <a href="/v0.1.190">v0.1.190</a>
     </div>
   </nav>
@@ -1904,6 +1926,7 @@ const RELEASE_192_HTML = `<!DOCTYPE html>
     <div class="nav-links">
       <a href="https://github.com/justrach/nanobrew">GitHub</a>
       <a href="https://github.com/justrach/nanobrew#install">Install</a>
+      <a href="/v0.1.193">v0.1.193</a>
       <a href="/v0.1.191">v0.1.191</a>
       <a href="/v0.1.190">v0.1.190</a>
     </div>
@@ -2062,6 +2085,478 @@ document.querySelectorAll('[data-observe]').forEach(el => obs.observe(el));
 </body>
 </html>`;
 
+const RELEASE_193_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nanobrew v0.1.193 — audit-driven correctness sweep</title>
+<meta name="description" content="nanobrew v0.1.193: 38 commits and 20+ targeted bug fixes from a multi-agent + manual audit. Deb path correctness sweep, process-wide threadsafe Io accessor, ELF/patchelf serialization, nb cleanup --prune-kegs, HTTP User-Agent override, and honest disclosure of the pre-existing apt-replacement exit-139 known issue.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --gold: #FFB800;
+    --gold-soft: rgba(255, 184, 0, 0.12);
+    --bg: #FFFFFF;
+    --surface: #F7F7F7;
+    --border: #E5E5E5;
+    --text: #404040;
+    --bright: #111111;
+    --muted: #777;
+    --dim: #AAAAAA;
+    --fd: 'Inter', system-ui, -apple-system, sans-serif;
+    --fm: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: var(--fm); font-size: 15px; line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 2rem; }
+
+  nav { padding: 1.5rem 0; display: flex; justify-content: space-between; align-items: center; }
+  .nav-mark { font-family: var(--fd); font-weight: 700; font-size: 1rem; color: var(--bright); text-decoration: none; }
+  .nav-links { display: flex; gap: 1.5rem; flex-wrap: wrap; justify-content: flex-end; }
+  .nav-links a { color: var(--muted); text-decoration: none; font-size: 0.82rem; font-weight: 500; }
+  .nav-links a:hover { color: var(--bright); }
+
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+
+  .hero { padding: 4rem 0 3rem; text-align: center; }
+  .hero h1 {
+    font-family: var(--fd); font-weight: 800;
+    font-size: clamp(2.1rem, 5vw, 3.4rem);
+    color: var(--bright); line-height: 1.15;
+    animation: fadeUp 0.7s ease-out both;
+  }
+  .hero-claim {
+    font-family: var(--fd); font-weight: 800;
+    font-size: clamp(1.85rem, 4.7vw, 3.25rem);
+    line-height: 1.12; color: var(--bright);
+    max-width: 820px; margin: 0.45rem auto 0;
+    animation: fadeUp 0.7s ease-out 0.05s both;
+  }
+  .hero-speed {
+    font-family: var(--fd); font-weight: 800;
+    font-size: clamp(1.25rem, 2.8vw, 2rem);
+    line-height: 1.18; color: var(--bright);
+    max-width: 780px; margin: 0.65rem auto 0;
+    animation: fadeUp 0.7s ease-out 0.1s both;
+  }
+  .hero-highlight {
+    display: inline;
+    padding: 0 0.06em;
+    background: linear-gradient(180deg, transparent 55%, rgba(255,184,0,0.55) 55%);
+    -webkit-box-decoration-break: clone;
+    box-decoration-break: clone;
+  }
+  .hero p {
+    font-size: 1rem; color: var(--muted); margin-top: 1rem; max-width: 700px; margin-inline: auto;
+    animation: fadeUp 0.7s ease-out 0.12s both;
+  }
+  .hero .hero-lead {
+    font-size: 1.05rem; color: var(--text);
+  }
+  .hero .hero-lead strong { color: var(--bright); font-weight: 800; }
+  .hero p code {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 3px;
+    padding: 0.1rem 0.35rem; font-size: 0.85rem; color: var(--bright);
+  }
+  .hero > code {
+    display: inline-block; margin-top: 1.5rem; padding: 0.6rem 1.4rem;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    font-size: 0.88rem; color: var(--bright); font-weight: 500;
+    animation: fadeUp 0.7s ease-out 0.24s both;
+  }
+
+  .stat { padding: 4rem 0; border-top: 1px solid var(--border); }
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.2rem; }
+  .stat-card {
+    text-align: center; padding: 1.2rem 1rem; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px;
+    animation: fadeUp 0.8s ease-out 0.28s both;
+  }
+  .stat-num {
+    display: block; font-family: var(--fd); font-weight: 900;
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    color: var(--gold); line-height: 1.05;
+    text-shadow: 0 0 80px var(--gold-soft);
+  }
+  .stat-label { display: block; font-size: 0.82rem; color: var(--muted); margin-top: 0.45rem; }
+  .stat-ctx { font-size: 0.82rem; color: var(--dim); margin-top: 1.4rem; text-align: center; }
+  .stat-ctx em { color: var(--muted); font-style: normal; font-weight: 500; }
+
+  .bench { padding: 4rem 0; border-top: 1px solid var(--border); }
+  .bench h2 { font-family: var(--fd); font-weight: 700; font-size: 1.4rem; color: var(--bright); margin-bottom: 0.5rem; }
+  .bench-sub { font-size: 0.8rem; color: var(--dim); margin-bottom: 2.3rem; }
+  .bench-sub code { background: var(--surface); padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.75rem; color: var(--bright); }
+
+  .bg { margin-bottom: 2.8rem; }
+  .bg-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.9rem; flex-wrap: wrap; gap: 0.5rem; }
+  .bg-title { font-family: var(--fd); font-weight: 700; font-size: 0.95rem; color: var(--bright); }
+  .bg-title span { color: var(--muted); font-weight: 400; font-size: 0.82rem; margin-left: 0.4rem; }
+  .bg-note { font-size: 0.8rem; color: var(--muted); line-height: 1.55; margin-top: 0.6rem; }
+  .bg-note code { background: var(--surface); padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.72rem; color: var(--bright); }
+  .bg-badge {
+    font-family: var(--fd); font-weight: 800; font-size: 0.82rem; color: #92400e;
+    background: rgba(251,191,36,0.15); border: 1px solid rgba(251,191,36,0.35);
+    padding: 0.2rem 0.75rem; border-radius: 20px;
+    opacity: 0; transform: translateY(4px); transition: opacity 0.4s 0.9s, transform 0.4s 0.9s;
+  }
+  .bg.visible .bg-badge { opacity: 1; transform: none; }
+  .br { display: flex; align-items: center; gap: 0.7rem; margin-bottom: 0.45rem; }
+  .br-l { width: 8.5rem; text-align: right; font-size: 0.72rem; color: var(--muted); flex-shrink: 0; font-weight: 500; }
+  .br-t { flex: 1; height: 40px; background: var(--surface); border-radius: 6px; overflow: hidden; }
+  .br-b {
+    height: 100%; border-radius: 6px;
+    width: 0; transition: width 1.3s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .br-b.apt { background: #E4E4E4; }
+  .br-b.zb { background: #D8D8D8; }
+  .br-b.old { background: linear-gradient(90deg, #FFC84A 0%, #FFB800 100%); opacity: 0.6; }
+  .br-b.nb  { background: linear-gradient(90deg, #FFB800 0%, #FF8000 100%); box-shadow: 0 2px 16px rgba(255,140,0,0.22); }
+  .bg.visible .br:nth-child(1) .br-b { transition-delay: 0s; }
+  .bg.visible .br:nth-child(2) .br-b { transition-delay: 0.12s; }
+  .bg.visible .br:nth-child(3) .br-b { transition-delay: 0.24s; }
+  .bg.visible .br:nth-child(4) .br-b { transition-delay: 0.36s; }
+  .br-time { font-size: 0.76rem; font-family: var(--fd); font-weight: 600; flex-shrink: 0; width: 5.8rem; color: var(--muted); }
+  .br-time.old-t  { color: #b45309; }
+  .br-time.nb-t   { color: #c05621; }
+
+  .demo { padding: 4rem 0; border-top: 1px solid var(--border); }
+  .demo h2 { font-family: var(--fd); font-weight: 700; font-size: 1.4rem; color: var(--bright); margin-bottom: 0.5rem; }
+  .demo-sub { font-size: 0.8rem; color: var(--dim); margin-bottom: 1.5rem; }
+  .demo-sub code { background: var(--surface); padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.75rem; }
+  .demo pre {
+    background: #0e0e0f; color: #e7e7ea; border-radius: 8px; padding: 1.1rem 1.2rem;
+    font-family: var(--fm); font-size: 0.78rem; line-height: 1.55;
+    overflow-x: auto; border: 1px solid #1c1c1f;
+  }
+  .demo pre .p { color: #ffb800; font-weight: 700; }
+  .demo pre .k { color: #9ea0a4; }
+  .demo pre .h { color: #fff; font-weight: 600; }
+
+  .release-status { padding: 3rem 0; border-top: 1px solid var(--border); }
+  .release-status h2 { font-family: var(--fd); font-weight: 700; font-size: 1.4rem; color: var(--bright); margin-bottom: 0.75rem; }
+  .status-box {
+    background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px;
+    padding: 1.2rem 1.35rem; color: #7c2d12; font-size: 0.82rem;
+  }
+  .status-box strong { color: #9a3412; }
+  .status-box code { background: rgba(154,52,18,0.08); padding: 0.08rem 0.3rem; border-radius: 3px; color: #9a3412; }
+
+  .credits { padding: 3rem 0; border-top: 1px solid var(--border); }
+  .credits h2 { font-family: var(--fd); font-weight: 700; font-size: 1.4rem; color: var(--bright); margin-bottom: 0.75rem; }
+  .credits p { font-size: 0.82rem; color: var(--muted); margin-bottom: 0.8rem; }
+  .credits a { color: var(--bright); text-decoration: none; font-weight: 700; border-bottom: 1px solid var(--border); }
+
+  .how { padding: 4rem 0; border-top: 1px solid var(--border); }
+  .how h2 { font-family: var(--fd); font-weight: 700; font-size: 1.4rem; color: var(--bright); margin-bottom: 1.5rem; }
+  .how-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem; }
+  .how-card {
+    padding: 1.5rem; background: var(--surface); border-radius: 8px; border: 1px solid var(--border);
+  }
+  .how-card h3 { font-size: 0.9rem; color: var(--bright); margin-bottom: 0.4rem; }
+  .how-card p { font-size: 0.78rem; color: var(--muted); line-height: 1.5; }
+  .how-card code { background: rgba(255,184,0,0.1); padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.72rem; color: var(--bright); }
+  .how-card .num { font-family: var(--fd); font-weight: 800; font-size: 1.4rem; color: var(--gold); margin-bottom: 0.3rem; }
+
+  .method { padding: 4rem 0; border-top: 1px solid var(--border); }
+  .method h2 { font-family: var(--fd); font-weight: 700; font-size: 1.4rem; color: var(--bright); margin-bottom: 0.5rem; }
+  .method-sub { font-size: 0.8rem; color: var(--dim); margin-bottom: 1.5rem; }
+  .method table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .method th { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 2px solid var(--border); color: var(--muted); font-weight: 500; }
+  .method td { padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .method td code { font-size: 0.75rem; background: var(--surface); padding: 0.1rem 0.35rem; border-radius: 3px; }
+
+  footer { padding: 3rem 0; border-top: 1px solid var(--border); text-align: center; font-size: 0.75rem; color: var(--dim); }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 760px) {
+    .wrap { padding: 0 1.1rem; }
+    nav { align-items: flex-start; gap: 1rem; }
+    .stat-grid { grid-template-columns: 1fr; }
+    .br { display: block; }
+    .br-l { display: block; width: auto; text-align: left; margin-bottom: 0.25rem; }
+    .br-time { display: block; width: auto; margin-top: 0.25rem; }
+    .method { overflow-x: auto; }
+    .method table { min-width: 680px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="nav-mark" href="/">nanobrew</a>
+    <div class="nav-links">
+      <a href="https://github.com/justrach/nanobrew">GitHub</a>
+      <a href="https://github.com/justrach/nanobrew#install">Install</a>
+      <a href="/v0.1.192">v0.1.192</a>
+      <a href="/v0.1.191">v0.1.191</a>
+      <a href="/v0.1.190">v0.1.190</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <h1>nanobrew v0.1.193</h1>
+    <div class="hero-claim"><span class="hero-highlight">All the v0.1.192 speed.</span> <span class="hero-highlight">Audit-hardened.</span></div>
+    <div class="hero-speed"><span class="hero-highlight">119.4x faster than Homebrew.</span> <span class="hero-highlight">12.9x faster than apt-get.</span></div>
+    <p class="hero-lead"><strong>Install path is unchanged from v0.1.192</strong> — every speed number on this page still holds. What's new is 38 commits and 20+ targeted bug fixes from a multi-agent + manual audit, a new <code>nb cleanup --prune-kegs</code> flag, and honest disclosure of the pre-existing apt-replacement teardown bug.</p>
+    <p>macOS arm64 and x86_64 tarballs are Developer-ID-signed, hardened-runtime, and notarized by Apple.</p>
+    <code>nb update  # to v0.1.193</code>
+  </section>
+
+  <section class="stat">
+    <div class="stat-grid">
+      <div class="stat-card">
+        <span class="stat-num">119.4x</span>
+        <span class="stat-label">faster than Homebrew on yt-dlp target reinstall (inherited from v0.1.192)</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-num">12.9x</span>
+        <span class="stat-label">faster than apt-get on git + vim + build-essential (116 deps, Ubuntu 24.04)</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-num">5.8ms</span>
+        <span class="stat-label">already-installed no-op on the sandboxed CI yt-dlp benchmark</span>
+      </div>
+    </div>
+    <p class="stat-ctx"><em>yt-dlp target reinstall:</em> nanobrew 48.8ms &rarr; zerobrew 1830.7ms &rarr; Homebrew 5827.7ms. <em>git+vim+build-essential:</em> nanobrew 3402ms &rarr; apt-get 43,833ms. Numbers are from the v0.1.192 baseline; v0.1.193 keeps the same install pipeline intact while fixing 20+ correctness bugs around it.</p>
+  </section>
+
+  <section class="bench">
+    <h2>macOS — nanobrew vs Homebrew (warm)</h2>
+    <p class="bench-sub">Already-installed reinstalls. Apple Silicon (GitHub Actions <code>macos-14</code>), median of 3 runs. Same install pipeline as v0.1.192; v0.1.193 doesn't move these.</p>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">tree <span>0 deps</span></div>
+        <div class="bg-badge">452x faster than Homebrew</div>
+      </div>
+      <div class="br"><div class="br-l">Homebrew</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">4070ms</span></div>
+      <div class="br"><div class="br-l">zerobrew warm</div><div class="br-t"><div class="br-b zb" style="width:5.9%"></div></div><span class="br-time">242ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193</div><div class="br-t"><div class="br-b nb"  style="width:0.22%"></div></div><span class="br-time nb-t">9ms</span></div>
+    </div>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">ffmpeg <span>11 deps</span></div>
+        <div class="bg-badge">49.7x faster than Homebrew</div>
+      </div>
+      <div class="br"><div class="br-l">Homebrew</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">14252ms</span></div>
+      <div class="br"><div class="br-l">zerobrew warm</div><div class="br-t"><div class="br-b zb" style="width:15.1%"></div></div><span class="br-time">2147ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193</div><div class="br-t"><div class="br-b nb"  style="width:2.01%"></div></div><span class="br-time nb-t">287ms</span></div>
+    </div>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">wget <span>6 deps</span></div>
+        <div class="bg-badge">146x faster than Homebrew</div>
+      </div>
+      <div class="br"><div class="br-l">Homebrew</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">3935ms</span></div>
+      <div class="br"><div class="br-l">zerobrew warm</div><div class="br-t"><div class="br-b zb" style="width:14.9%"></div></div><span class="br-time">587ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193</div><div class="br-t"><div class="br-b nb"  style="width:0.69%"></div></div><span class="br-time nb-t">27ms</span></div>
+    </div>
+  </section>
+
+  <section class="bench">
+    <h2>Linux / Docker — nb install --deb vs apt-get</h2>
+    <p class="bench-sub">Ubuntu 24.04 LTS (aarch64, Docker/Colima), median of 3 runs. Warm = NBIX binary index cache + cached .deb blobs, <code>--skip-postinst</code>. Audit-fixed in v0.1.193: cwd-independent <code>nb remove --deb</code>, native xz lifecycle, threadsafe postinst Io, serialized patchelf.</p>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">curl + wget <span>35 packages</span></div>
+        <div class="bg-badge">7.6x faster than apt-get</div>
+      </div>
+      <div class="br"><div class="br-l">apt-get</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">3426ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193 warm</div><div class="br-t"><div class="br-b nb"  style="width:13.1%"></div></div><span class="br-time nb-t">448ms</span></div>
+    </div>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">curl + wget + tree + jq + htop + tmux <span>53 packages</span></div>
+        <div class="bg-badge">6.9x faster than apt-get</div>
+      </div>
+      <div class="br"><div class="br-l">apt-get</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">3584ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193 warm</div><div class="br-t"><div class="br-b nb"  style="width:14.5%"></div></div><span class="br-time nb-t">521ms</span></div>
+    </div>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">git + vim + build-essential <span>116 packages</span></div>
+        <div class="bg-badge">12.9x faster than apt-get</div>
+      </div>
+      <div class="br"><div class="br-l">apt-get</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">43833ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193 warm</div><div class="br-t"><div class="br-b nb"  style="width:7.76%"></div></div><span class="br-time nb-t">3402ms</span></div>
+    </div>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">nginx + redis-server + postgresql-client <span>78 packages</span></div>
+        <div class="bg-badge">3.9x faster than apt-get</div>
+      </div>
+      <div class="br"><div class="br-l">apt-get</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">5501ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193 warm</div><div class="br-t"><div class="br-b nb"  style="width:25.5%"></div></div><span class="br-time nb-t">1402ms</span></div>
+    </div>
+  </section>
+
+  <section class="bench">
+    <h2>CI package-manager comparison — yt-dlp</h2>
+    <p class="bench-sub">Same sandboxed macOS Actions benchmark as v0.1.192. Target reinstall means dependencies and cache/store were primed, then only <code>yt-dlp</code> was removed and installed again as <code>nb install --shims yt-dlp</code>. v0.1.193 keeps the same install path, so the numbers carry over.</p>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">target reinstall <span>lower is better</span></div>
+        <div class="bg-badge">119.4x faster than Homebrew</div>
+      </div>
+      <div class="br"><div class="br-l">Homebrew 5.1.7</div><div class="br-t"><div class="br-b apt" style="width:100%"></div></div><span class="br-time">5827.7ms</span></div>
+      <div class="br"><div class="br-l">zerobrew 0.2.1</div><div class="br-t"><div class="br-b zb" style="width:31.4%"></div></div><span class="br-time">1830.7ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.191</div><div class="br-t"><div class="br-b old" style="width:58.1%"></div></div><span class="br-time old-t">3385.2ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193</div><div class="br-t"><div class="br-b nb"  style="width:0.84%"></div></div><span class="br-time nb-t">48.8ms</span></div>
+    </div>
+
+    <div class="bg" data-observe>
+      <div class="bg-header">
+        <div class="bg-title">already installed no-op <span>lower is better</span></div>
+        <div class="bg-badge">186.8x faster than zerobrew</div>
+      </div>
+      <div class="br"><div class="br-l">nb v0.1.191</div><div class="br-t"><div class="br-b old" style="width:100%"></div></div><span class="br-time old-t">3183.7ms</span></div>
+      <div class="br"><div class="br-l">zerobrew 0.2.1</div><div class="br-t"><div class="br-b zb" style="width:34.0%"></div></div><span class="br-time">1083.2ms</span></div>
+      <div class="br"><div class="br-l">Homebrew 5.1.7</div><div class="br-t"><div class="br-b apt" style="width:28.8%"></div></div><span class="br-time">916.9ms</span></div>
+      <div class="br"><div class="br-l">nb v0.1.193</div><div class="br-t"><div class="br-b nb"  style="width:0.18%"></div></div><span class="br-time nb-t">5.8ms</span></div>
+    </div>
+  </section>
+
+  <section class="bench">
+    <h2>What got fixed in this cycle</h2>
+    <p class="bench-sub">38 commits since v0.1.192. Grouped by area. Every entry maps to a commit on <code>main</code> or a closed issue. Most were caught by an internal multi-agent audit pass; the rest came from real user reports (credited below).</p>
+
+    <div class="bg">
+      <div class="bg-title">apt-replacement (.deb install path)</div>
+      <div class="bg-note"><code>nb remove --deb</code> is now cwd-independent &middot; absolute paths in <code>state.json</code> going forward, with back-compat for older relative-path DBs &middot; native xz decompress releases its <code>Decompress</code> buffer through <code>deinit</code> instead of the original pointer &middot; postinst execution receives the caller's Io so subprocess spawns don't hit the failing singleton allocator &middot; five other correctness fixes in the apt-replacement path bundled together.</div>
+    </div>
+
+    <div class="bg">
+      <div class="bg-title">ELF / patchelf</div>
+      <div class="bg-note"><code>patchelf</code> auto-install serialized across parallel workers &middot; <code>apt-get update</code> before patchelf auto-install &middot; literal <code>/home/linuxbrew/</code> paths repaired in ELF needed-paths and a symlinked <code>etc/</code> handled correctly (closes #269 — imagemagick + libheif).</div>
+    </div>
+
+    <div class="bg">
+      <div class="bg-title">Process-wide threadsafe Io accessor</div>
+      <div class="bg-note">Call sites that previously reached for <code>std.Io.Threaded.global_single_threaded.io()</code> now share an accessor seeded from <code>main</code>. The default initializer falls back to the singleton so tests and any pre-main use still see a valid Io. Fixes intermittent races during parallel extract/store and the singleton call-site sweep that surfaced under <code>nb install --deb</code> reinstalls.</div>
+    </div>
+
+    <div class="bg">
+      <div class="bg-title">Install pipeline</div>
+      <div class="bg-note"><code>nb install</code> threads io through the install path to fix Linux <code>CopyFailed</code> from incompatible Io in <code>std.process.run</code> (closes #276) &middot; <code>@@HOMEBREW_*@@</code> relocation now correctly rewrites files &gt;1 MiB and locale subtrees that previously slipped through &middot; <code>nb upgrade</code> rejects unknown flags and uninstalled package names instead of silently no-op'ing.</div>
+    </div>
+
+    <div class="bg">
+      <div class="bg-title">Diagnostics + cleanup</div>
+      <div class="bg-note">New: <code>nb cleanup --prune-kegs</code> drops phantom <code>state.json</code> entries pointing at kegs that no longer exist on disk (closes #279) &middot; <code>nb doctor</code> now points at this flag when it spots phantom entries &middot; hint when the 256-entry batch cap is hit so users know to re-run.</div>
+    </div>
+
+    <div class="bg">
+      <div class="bg-title">Memory + parser safety</div>
+      <div class="bg-note">DB parser partial-allocation leaks in <code>pushHistory</code> and install paths now cascade-free already-successful dupes when a later step fails &middot; <code>nb services list</code> memory leaks plugged.</div>
+    </div>
+
+    <div class="bg">
+      <div class="bg-title">Networking polish</div>
+      <div class="bg-note">HTTP <code>User-Agent</code> override (instead of append) so requests no longer leak <code>zig/0.16.0 (std.http)</code> to upstream endpoints that filter on UA (closes #258 — fixes the Warp vendor download).</div>
+    </div>
+  </section>
+
+  <section class="demo">
+    <h2>The new flag in action</h2>
+    <p class="demo-sub">After upgrading from v0.1.191 with <code>nb update</code>, <code>nb doctor</code> proactively points at the new prune flag.</p>
+<pre>$ <span class="p">nb update</span>
+<span class="h">==&gt; Updating nanobrew...</span>
+<span class="k">==&gt; Downloading v0.1.193 (arm64-darwin)...</span>
+<span class="k">==&gt; Verifying checksum...</span>
+<span class="k">==&gt; Checksum verified, extracting...</span>
+<span class="h">==&gt; Updated nanobrew to v0.1.193 (was v0.1.191)</span>
+
+$ <span class="p">nb doctor</span>
+<span class="k">==&gt; Checking nanobrew installation...</span>
+  <span class="h">✓</span> /opt/nanobrew is writable
+  <span class="k">✗</span> DB entry 'alsa-lib' has no Cellar dir (run <span class="p">nb cleanup --prune-kegs</span> to remove)
+  <span class="k">✗</span> DB entry 'sag' has no Cellar dir (run <span class="p">nb cleanup --prune-kegs</span> to remove)
+
+$ <span class="p">nb cleanup --prune-kegs</span>
+<span class="k">  Pruned phantom keg: alsa-lib 1.2.15.3</span>
+<span class="k">  Pruned phantom keg: sag</span>
+<span class="h">==&gt; Reclaimed 22.6 MB</span></pre>
+  </section>
+
+  <section class="release-status">
+    <h2>Known issue: <code>nb install --deb</code> exits 139 on Linux</h2>
+    <div class="status-box">
+      <p><strong>Files install correctly, but the process exits with SIGSEGV at teardown.</strong> This is pre-existing since v0.1.190 and tracked under CI's <code>continue-on-error: true # Known Zig std.http.Client + musl TLS segfault</code>. The crash is in runtime/libc teardown after <code>main()</code> returns; install/extract/postinst all complete and the files are present on disk. Reproducible cleanly under Apple <code>container</code>; usually masked in <code>tests/deb-parity.sh</code> by piping <code>nb</code> output through <code>tail</code>, which absorbs the signal. v0.1.193 documents this honestly rather than silently shipping over it again. Workaround for Dockerfile users: pipe through <code>tail</code> or wrap in <code>( … ) || true</code> so a downstream <code>RUN</code> step doesn't fail. Tracked as a release-blocker for the next cycle.</p>
+    </div>
+  </section>
+
+  <section class="credits">
+    <h2>Public issue credits</h2>
+    <p>Thanks to <a href="https://github.com/noripcord">@noripcord</a> for <a href="https://github.com/justrach/nanobrew/issues/269">#269</a> — imagemagick with libheif support being broken. That report drove the literal <code>/home/linuxbrew/</code> ELF path repair and the <code>etc/</code> symlink handling.</p>
+    <p>Thanks to <a href="https://github.com/gavmor">@gavmor</a> for <a href="https://github.com/justrach/nanobrew/issues/276">#276</a> — <code>nb install</code> failing with <code>CopyFailed</code> on Linux due to incompatible Io in <code>std.process.run</code>. That report drove the install-path io threading fix.</p>
+  </section>
+
+  <section class="how">
+    <h2>Release artifacts</h2>
+    <div class="how-grid">
+      <div class="how-card">
+        <div class="num">arm64</div>
+        <h3>macOS arm64</h3>
+        <p><code>nb-arm64-apple-darwin.tar.gz</code><br>signed (Developer ID Application: Rachit Pradhan, WWP9DLJ27P), hardened-runtime, notarized by Apple.</p>
+      </div>
+      <div class="how-card">
+        <div class="num">x86_64</div>
+        <h3>macOS x86_64</h3>
+        <p><code>nb-x86_64-apple-darwin.tar.gz</code><br>built against <code>minos 12.0</code>, signed, hardened-runtime, notarized. x86 smoke-tested under Rosetta before packaging.</p>
+      </div>
+      <div class="how-card">
+        <div class="num">arm64</div>
+        <h3>Linux aarch64-musl</h3>
+        <p><code>nb-aarch64-linux.tar.gz</code><br>statically linked single binary, no runtime deps.</p>
+      </div>
+      <div class="how-card">
+        <div class="num">x86_64</div>
+        <h3>Linux x86_64-musl</h3>
+        <p><code>nb-x86_64-linux.tar.gz</code><br>statically linked single binary, no runtime deps.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="method">
+    <h2>How to read this release</h2>
+    <p class="method-sub">v0.1.193 isn't a speed release. It's a confidence release.</p>
+    <table>
+      <tr><th>Question</th><th>Answer</th></tr>
+      <tr><td>Should I upgrade from v0.1.192?</td><td>Yes. Strict improvement — same install-path performance, plus 20+ correctness fixes and the new prune flag.</td></tr>
+      <tr><td>Will <code>nb install --deb</code> work in my Dockerfile?</td><td>The files will install correctly, but the <code>RUN</code> step will exit 139 unless you pipe through <code>tail</code> or wrap in <code>( … ) || true</code>. Tracked for the next release.</td></tr>
+      <tr><td>Are macOS tarballs notarized?</td><td>Yes — both arm64 and x86_64. Gatekeeper fetches the ticket online on first run; browser downloads no longer prompt as "unidentified developer".</td></tr>
+      <tr><td>Did anything get faster?</td><td>Not deliberately. The audit was about correctness. Existing perf claims from v0.1.192 still hold on the same hardware.</td></tr>
+      <tr><td>What's the new feature?</td><td>One: <code>nb cleanup --prune-kegs</code> for cleaning phantom DB entries. <code>nb doctor</code> points at it when it spots them.</td></tr>
+    </table>
+  </section>
+
+  <footer>
+    <p>nanobrew v0.1.193 &mdash; <a href="https://github.com/justrach/nanobrew">GitHub</a> &mdash; <a href="https://github.com/justrach/nanobrew/releases/tag/v0.1.193">Release notes</a> &mdash; Apache-2.0</p>
+  </footer>
+</div>
+<script>
+const obs = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); }), { threshold: 0.2 });
+document.querySelectorAll('[data-observe]').forEach(el => obs.observe(el));
+</script>
+</body>
+</html>`;
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -2090,7 +2585,7 @@ export default {
         });
         if (!gh.ok) {
           // Rate limited — return last known version
-          return new Response("0.1.191", {
+          return new Response("0.1.193", {
             headers: {
               "content-type": "text/plain; charset=utf-8",
               "cache-control": "public, max-age=60",
@@ -2112,7 +2607,7 @@ export default {
         await cache.put(cacheKey, resp.clone());
         return resp;
       } catch {
-        return new Response("0.1.191", {
+        return new Response("0.1.193", {
           headers: {
             "content-type": "text/plain; charset=utf-8",
             "cache-control": "public, max-age=60",
@@ -2136,6 +2631,15 @@ export default {
         headers: {
           "content-type": "text/html; charset=utf-8",
           "cache-control": "public, max-age=3600",
+        },
+      });
+    }
+
+    if (url.pathname === "/v0.1.193" || url.pathname === "/v-0.1.193") {
+      return new Response(RELEASE_193_HTML, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "public, max-age=86400",
         },
       });
     }

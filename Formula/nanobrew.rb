@@ -2,14 +2,14 @@ class Nanobrew < Formula
   desc "The fastest macOS package manager. Written in Zig."
   homepage "https://github.com/justrach/nanobrew"
   license "Apache-2.0"
-  version "0.1.083"
+  version "0.1.207"
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/justrach/nanobrew/releases/download/v0.1.083/nb-arm64-apple-darwin.tar.gz"
-      sha256 "00da0837346514726742574930c44cefb5dea2d44ba33624d7f8a2bccbc1c4a4"
+      url "https://github.com/justrach/nanobrew/releases/download/v0.1.207/nb-arm64-apple-darwin.tar.gz"
+      sha256 "0efab604af5d0e2fa18bbbcfe34e4f09cf9dd866b061288f6139f65248195ba7"
     else
-      url "https://github.com/justrach/nanobrew/releases/download/v0.1.083/nb-x86_64-apple-darwin.tar.gz"
-      sha256 "4aa4e3e7844c953a8226a1fd3fe49916ca84e78daf90990e4cf44d3434fdc2eb"
+      url "https://github.com/justrach/nanobrew/releases/download/v0.1.207/nb-x86_64-apple-darwin.tar.gz"
+      sha256 "3d3be86c9eaa05751f03326c65f4f4be8e3202d229933a7ec7d6fe70fa3f1e14"
     end
   end
 

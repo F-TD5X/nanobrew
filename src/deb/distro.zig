@@ -4,6 +4,7 @@
 // Used to select the correct APT mirror and release codename.
 
 const std = @import("std");
+const paths = @import("../platform/paths.zig");
 const builtin = @import("builtin");
 
 pub const DistroInfo = struct {
@@ -33,22 +34,45 @@ pub fn detect(alloc: std.mem.Allocator) DistroInfo {
     defer alloc.free(data);
 
     var id: []const u8 = DEFAULT_ID;
+    var id_like: []const u8 = "";
     var codename: []const u8 = DEFAULT_CODENAME;
 
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
         if (parseField(line, "ID=")) |v| {
             id = alloc.dupe(u8, stripQuotes(v)) catch DEFAULT_ID;
+        } else if (parseField(line, "ID_LIKE=")) |v| {
+            id_like = alloc.dupe(u8, stripQuotes(v)) catch "";
         } else if (parseField(line, "VERSION_CODENAME=")) |v| {
             codename = alloc.dupe(u8, stripQuotes(v)) catch DEFAULT_CODENAME;
         }
     }
 
+    // If `ID=` is something we don't recognize (Mint, Pop!_OS, Kali, elementary,
+    // etc.), fall back to the first recognized family in `ID_LIKE=` so we route
+    // to the correct upstream archive instead of always defaulting to Ubuntu.
+    const family = canonicalFamily(id, id_like);
+
     return .{
-        .id = id,
+        .id = family,
         .codename = codename,
-        .mirror = getMirror(id),
+        .mirror = getMirror(family),
     };
+}
+
+/// Resolve the upstream archive family for an /etc/os-release pair.
+///
+/// Recognized `ID=` values pass through unchanged. Anything else scans the
+/// whitespace-separated `ID_LIKE=` list for the first recognized family.
+/// Falls back to the default if neither yields a hit.
+fn canonicalFamily(id: []const u8, id_like: []const u8) []const u8 {
+    if (std.mem.eql(u8, id, "ubuntu") or std.mem.eql(u8, id, "debian")) return id;
+    var it = std.mem.tokenizeAny(u8, id_like, " \t");
+    while (it.next()) |fam| {
+        if (std.mem.eql(u8, fam, "ubuntu")) return "ubuntu";
+        if (std.mem.eql(u8, fam, "debian")) return "debian";
+    }
+    return DEFAULT_ID;
 }
 
 /// Get the default APT mirror for a distribution.
@@ -74,7 +98,7 @@ pub fn getComponents(id: []const u8) []const []const u8 {
 }
 
 fn readOsRelease(alloc: std.mem.Allocator) ?[]u8 {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    const lib_io = paths.safe_io;
     const file = std.Io.Dir.openFileAbsolute(lib_io, "/etc/os-release", .{}) catch return null;
     defer file.close(lib_io);
     var buf: [4096]u8 = undefined;

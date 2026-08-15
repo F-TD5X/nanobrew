@@ -8,15 +8,16 @@
 
 # nanobrew
 
-A fast package manager for macOS and Linux. Written in Zig. Uses Homebrew's bottles and formulas under the hood, plus native .deb support for Docker containers.
+A fast package manager for macOS and Linux. Written in Zig. Native install pipeline for the top 100 Homebrew formulae and top 100 casks (no `brew`, no Ruby), with verified Homebrew fallback for everything else and native `.deb` support for Linux/Docker.
 
 ## Why nanobrew?
 
-- **Fast warm installs** — packages already in the local store reinstall in ~3.5ms
+- **Fast warm installs** — already-installed no-ops return in milliseconds (5.8ms on the v0.1.192 sandboxed `yt-dlp` benchmark)
 - **Parallel downloads** — all dependencies download and extract at the same time
 - **No Ruby runtime** — single static binary, instant startup
 - **No auto-update** — `nb install` just installs; self-update is explicit via `nb update`
 - **No quarantine** — cask installs skip `com.apple.quarantine`, so apps open without Gatekeeper prompts
+- **Native installs** — top 100 formulae and top 100 casks install without Homebrew, Ruby, or `brew` subprocess (v0.1.192)
 - **Third-party taps** — `nb install user/tap/formula` just works. The only fast Homebrew client with tap support
 - **Drop-in Homebrew replacement** — same formulas, same bottles, same casks
 - **Linux + Docker** — native .deb support, **up to 13x faster** than apt-get on warm installs
@@ -39,7 +40,7 @@ If you rely on `post_install` hooks, build-from-source options, or Mac App Store
 |---------|----------|-----------------|-----------------|-----------------|-----------------|
 | **tree** (0 deps) | 4.070s | 1.254s | 0.242s | **0.507s** | **0.009s** |
 | **ffmpeg** (11 deps) | 14.252s | 3.986s | 2.147s | **1.624s** | **0.287s** |
-| **wget** (6 deps) | 3.935s | 5.502s | 0.587s | **3.211s** | **0.027s** | 3.801s | 7.911s | 0.825s | **3.822s** | **0.043s** | 4.184s | 6.080s | 0.572s | **3.484s** | **0.024s** | 4.329s | 6.427s | 0.493s | **2.329s** | **0.023s** | 5.672s | 8.485s | 0.755s | **4.356s** | **0.043s** | 5.849s | 9.364s | 1.056s | **3.090s** | **0.033s** |
+| **wget** (6 deps) | 3.935s | 5.502s | 0.587s | **3.211s** | **0.027s** |
 
 > Benchmarks on Apple Silicon (GitHub Actions macos-14), 2026-03-23. Auto-updated weekly.
 
@@ -78,7 +79,7 @@ curl -fsSL https://nanobrew.trilok.ai/install | bash
 brew tap justrach/nanobrew https://github.com/justrach/nanobrew
 brew install nanobrew
 
-# Or build from source (needs Zig 0.15+)
+# Or build from source (needs Zig 0.16.0+)
 git clone https://github.com/justrach/nanobrew.git
 cd nanobrew && ./install.sh
 ```
@@ -86,14 +87,22 @@ cd nanobrew && ./install.sh
 ### Upgrading
 
 ```bash
-# v0.1.191 and later: self-update works in one call
+# v0.1.193 and later: self-update works in one call
 nb update
-
-# v0.1.190 exactly: has a file-naming bug in the extract step that
-# prevents it from self-upgrading to v0.1.191. Re-run the installer
-# once to get unstuck, then `nb update` works for future releases:
-curl -fsSL https://nanobrew.trilok.ai | bash
 ```
+
+If you're on **v0.1.192 or older** and `nb update` errors with
+`could not download SHA256 checksum`, the self-updater on your installed
+binary can't reach past a redirect-chain bug in its native HTTP client
+(fixed in v0.1.193). Re-run the installer once to get unstuck, then
+`nb update` will work for all future releases:
+
+```bash
+curl -fsSL https://nanobrew.trilok.ai/install | bash
+```
+
+The same bug also affected exactly v0.1.190 via a different code path
+(file-naming bug in the extract step); the same one-liner unsticks it.
 
 ## Usage
 
@@ -107,6 +116,49 @@ nb remove tree                # uninstall
 nb list                       # see what's installed
 nb info jq                    # show package details
 nb search ripgrep             # search formulas and casks
+```
+
+### Installing a specific version
+
+Pin any Homebrew formula to an exact version with `name@version`:
+
+```bash
+nb install hexyl@0.17.0       # install exactly hexyl 0.17.0
+nb install wget@1.21.3        # install exactly wget 1.21.3
+```
+
+nanobrew resolves the requested version from the bottles Homebrew keeps in its
+container registry. Versioned installs are **auto-pinned** so a later
+`nb upgrade` won't replace your chosen version — run `nb unpin <pkg>` to allow
+upgrades again.
+
+Notes and limitations:
+
+- Works for **Homebrew formulae** (macOS + Linux bottles). Casks (`--cask`) and
+  deb packages (`--deb`) don't support version pinning yet.
+- If the exact version isn't available as a bottle for your platform (old
+  bottles can be garbage-collected), nb lists the available versions and points
+  you at the latest instead of guessing.
+- Dependencies are resolved against the **latest** formula, not the historical
+  one — fine for typical CLI tools; see
+  [`docs/design/versioned-install.md`](docs/design/versioned-install.md) for
+  details.
+
+Homebrew's **versioned formulae** (separate packages whose name contains `@`)
+also work as before, and take precedence over version pinning:
+
+```bash
+nb install python@3.11        # the python@3.11 formula (distinct from python)
+nb install node@22            # the node@22 formula
+nb install openssl@3          # the openssl@3 formula
+```
+
+Related version controls once a package is installed:
+
+```bash
+nb pin tree                   # hold tree at its current version (skip upgrades)
+nb unpin tree                 # allow upgrades again
+nb rollback tree              # revert to the previously installed version
 ```
 
 ### Shimmed Installs
@@ -134,10 +186,12 @@ nb remove --cask firefox      # uninstall it
 nb upgrade --cask             # upgrade all casks
 ```
 
+As of v0.1.192, the top 100 casks install through nanobrew's native pipeline — no `brew` subprocess, no Homebrew prefix, no Ruby. Native cask support covers apps, `.pkg`, fonts, binaries, suites, copied artifacts, installer scripts, `.tar.xz`, and extensionless vendor URLs. Casks outside the top 100 still fall back to the verified Homebrew path.
+
 ### Linux / Docker (deb packages)
 
 ```bash
-nb install --deb curl wget git    # install from Ubuntu/Debian repos (2.8x faster than apt-get)
+nb install --deb curl wget git    # install from Ubuntu/Debian repos
 nb remove --deb curl              # remove a deb package
 nb upgrade --deb                  # upgrade all installed deb packages
 nb list                           # shows deb packages alongside brew packages
@@ -156,6 +210,7 @@ RUN nb init && nb install --deb curl wget git
 - Runs `postinst` scripts and `ldconfig` so shared libraries work out of the box
 - Tracks installed files in `state.json` for clean removal
 - Content-addressable cache — warm installs are instant
+
 ### Keep packages up to date
 
 ```bash
@@ -373,11 +428,9 @@ Packages installed by nanobrew live in `/opt/nanobrew/prefix/Cellar/` — they d
 **Experimental** — works well for common packages. If something breaks, [open an issue](https://github.com/justrach/nanobrew/issues).
 
 License: [Apache 2.0](./LICENSE)
-License: [Apache 2.0](./LICENSE)
 
 ## All commands
-| `nb info --cask <app>` | | Show cask details |
-| `nb migrate` | | Import packages from Homebrew |
+
 | Command | Short | What it does |
 |---------|-------|-------------|
 | `nb install <pkg>` | `nb i` | Install packages |
@@ -386,8 +439,11 @@ License: [Apache 2.0](./LICENSE)
 | `nb install user/tap/formula` | | Install from a third-party tap |
 | `nb remove <pkg>` | `nb ui` | Uninstall packages |
 | `nb remove --deb <pkg>` | | Remove a .deb package (Linux/Docker) |
-| `nb list` | `nb ls` | List installed packages (brew + deb) |
+| `nb list [--versions\|--names]` | `nb ls` | List installed packages, version history, or names-only output |
+| `nb leaves [--tree]` | | List installed formulae with no dependents |
+| `nb where <pattern>` | `nb wh` | Show installed kegs, prefix files, and index hits matching pattern |
 | `nb info <pkg>` | | Show package details |
+| `nb info --cask <app>` | | Show cask details |
 | `nb search <query>` | `nb s` | Search formulas and casks |
 | `nb upgrade [pkg]` | | Upgrade packages |
 | `nb upgrade --deb` | | Upgrade all installed .deb packages |
@@ -402,6 +458,9 @@ License: [Apache 2.0](./LICENSE)
 | `nb deps [--tree] <pkg>` | | Show dependencies |
 | `nb services` | | Manage services (launchctl/systemd) |
 | `nb completions <shell>` | | Print shell completions |
+| `nb telemetry [status\|on\|off]` | | View or change telemetry opt-in |
+| `nb nuke` | | Remove all of nanobrew's state |
+| `nb migrate` | | Import packages from Homebrew |
 | `nb update` | | Self-update nanobrew |
 | `nb init` | | Create directory structure |
 | `nb help` | | Show help |

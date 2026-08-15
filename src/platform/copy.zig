@@ -16,16 +16,6 @@ pub fn cloneTree(src: [*:0]const u8, dst: [*:0]const u8) bool {
     return clonefile(src, dst, CLONE_NOFOLLOW | CLONE_NOOWNERCOPY) == 0;
 }
 
-/// Build the cp fallback args for the current platform.
-/// macOS: cp -R src dst
-/// Linux: cp --reflink=auto -R src dst (enables COW on btrfs/xfs)
-pub fn cpFallbackArgs(src: []const u8, dst: []const u8) [4][]const u8 {
-    if (comptime builtin.os.tag == .linux) {
-        return .{ "cp", "--reflink=auto", "-R", src };
-    } else {
-        return .{ "cp", "-R", src, dst };
-    }
-}
 
 /// Materialize `src` into `dst` (full directory tree).
 ///
@@ -73,14 +63,4 @@ test "cpFallback returns error on bad source path" {
     // Both the native walker and the cp fallback should fail.
     const err = cpFallback(testing.io, "/nonexistent/source/path", "/tmp/dst");
     try testing.expectError(error.CopyFailed, err);
-}
-
-test "cpFallbackArgs returns correct platform args" {
-    const args = cpFallbackArgs("/src", "/dst");
-    try testing.expectEqualStrings("cp", args[0]);
-    if (comptime builtin.os.tag == .linux) {
-        try testing.expectEqualStrings("--reflink=auto", args[1]);
-    } else {
-        try testing.expectEqualStrings("-R", args[1]);
-    }
 }

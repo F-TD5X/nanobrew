@@ -16,7 +16,7 @@ const paths = @import("../platform/paths.zig");
 const telemetry = @import("../telemetry/client.zig");
 
 fn milliTimestamp() i64 {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    const lib_io = paths.safe_io;
     const ts = std.Io.Timestamp.now(lib_io, .real);
     return @as(i64, @truncate(@divTrunc(ts.nanoseconds, std.time.ns_per_ms)));
 }
@@ -77,7 +77,7 @@ pub const ParallelDownloader = struct {
         // One TLS client per worker — reused across all items this worker handles.
         // std.http.Client pools connections; successive requests to the same host
         // reuse the existing TLS session instead of a full handshake each time.
-        var client: std.http.Client = .{ .allocator = ctx.gpa, .io = std.Io.Threaded.global_single_threaded.io() };
+        var client: std.http.Client = .{ .allocator = ctx.gpa, .io = paths.safe_io };
         defer client.deinit();
 
         // Per-download arena: zero GPA mutex calls per allocation; single deinit at exit.
@@ -289,26 +289,37 @@ fn downloadAndExtractOne(
 
 const TOKEN_CACHE_DIR = paths.TOKEN_CACHE_DIR;
 
-fn fetchGhcrToken(alloc: std.mem.Allocator, client: *std.http.Client, url: []const u8) !?[]const u8 {
+/// Public so the install pipeline can pre-fetch one GHCR bearer token at the
+/// start of a batch and share it read-only with every worker. Without this,
+/// each worker pays at least a disk-cache hit (and at most an HTTP RTT)
+/// before its bottle download starts.
+pub fn fetchGhcrToken(alloc: std.mem.Allocator, client: *std.http.Client, url: []const u8) !?[]const u8 {
     const ghcr_prefix = "https://ghcr.io/v2/";
     if (!std.mem.startsWith(u8, url, ghcr_prefix)) return null;
 
     const after_prefix = url[ghcr_prefix.len..];
     const blobs_idx = std.mem.indexOf(u8, after_prefix, "/blobs/") orelse return null;
     const repo = after_prefix[0..blobs_idx];
+    return cachedRepoToken(alloc, client, repo);
+}
 
-    // Check token cache (4 min TTL)
+/// Anonymous GHCR pull token for `repo` (e.g. "homebrew/core/wget"), disk-cached
+/// with a 4-minute TTL. Shared across the bottle-download and version-resolve
+/// (api/ghcr.zig) paths so a `pkg@version` install fetches the token once
+/// instead of three times. Returns an owned slice; caller frees.
+pub fn cachedRepoToken(alloc: std.mem.Allocator, client: *std.http.Client, repo: []const u8) ?[]const u8 {
     var cache_name_buf: [256]u8 = undefined;
-    const cache_name = scopeToCacheName(repo, &cache_name_buf) orelse return fetchGhcrTokenUncached(alloc, client, repo);
+    const cache_name = scopeToCacheName(repo, &cache_name_buf) orelse
+        return (fetchGhcrTokenUncached(alloc, client, repo) catch null);
     var cache_path_buf: [512]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/{s}", .{ TOKEN_CACHE_DIR, cache_name }) catch
-        return fetchGhcrTokenUncached(alloc, client, repo);
+        return (fetchGhcrTokenUncached(alloc, client, repo) catch null);
 
     if (readCachedToken(alloc, cache_path)) |cached| return cached;
 
-    const token = try fetchGhcrTokenUncached(alloc, client, repo);
+    const token = fetchGhcrTokenUncached(alloc, client, repo) catch null;
     if (token) |t| {
-        const _lio = std.Io.Threaded.global_single_threaded.io();
+        const _lio = paths.safe_io;
         std.Io.Dir.createDirAbsolute(_lio, TOKEN_CACHE_DIR, .default_dir) catch {};
         if (std.Io.Dir.createFileAbsolute(_lio, cache_path, .{})) |file| {
             file.writeStreamingAll(_lio, t) catch {};
@@ -346,14 +357,23 @@ fn fetchGhcrTokenUncached(alloc: std.mem.Allocator, client: *std.http.Client, re
 }
 
 fn readCachedToken(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
-    const _lio = std.Io.Threaded.global_single_threaded.io();
+    const _lio = paths.safe_io;
     const file = std.Io.Dir.openFileAbsolute(_lio, path, .{}) catch return null;
-    const stat = file.stat(_lio) catch { file.close(_lio); return null; };
+    const stat = file.stat(_lio) catch {
+        file.close(_lio);
+        return null;
+    };
     const now_ns = std.Io.Timestamp.now(_lio, .real).nanoseconds;
     const age_ns = now_ns - stat.mtime.nanoseconds;
-    if (age_ns > 240 * std.time.ns_per_s) { file.close(_lio); return null; }
+    if (age_ns > 240 * std.time.ns_per_s) {
+        file.close(_lio);
+        return null;
+    }
     var tmp_buf: [4096]u8 = undefined;
-    const n = file.readPositionalAll(_lio, &tmp_buf, 0) catch { file.close(_lio); return null; };
+    const n = file.readPositionalAll(_lio, &tmp_buf, 0) catch {
+        file.close(_lio);
+        return null;
+    };
     file.close(_lio);
     if (n == 0) return null;
     const result = alloc.dupe(u8, tmp_buf[0..n]) catch return null;
@@ -369,9 +389,70 @@ fn scopeToCacheName(repo: []const u8, buf: *[256]u8) ?[]const u8 {
     return buf[0..repo.len];
 }
 
-/// Internal: download using an existing HTTP client and optional pre-fetched token.
-/// `preauth_token` is a read-only slice owned by the caller — not freed here.
-fn downloadOneWithClient(
+/// Returns true for errors worth retrying (transient network/server
+/// conditions, rate limits, or a failed GHCR token fetch — the token is
+/// re-fetched on the next attempt). Everything else is deterministic:
+/// permanent HTTP failures (404, auth-with-token), a full-body checksum
+/// mismatch (the bytes were wrong/stale, not truncated — truncation surfaces
+/// as a stream error, i.e. DownloadFailed), and local failures (OOM,
+/// PathTooLong, rename AccessDenied) that two more attempts plus 750ms of
+/// backoff can never fix. The explicit whitelist replaces an `else => true`
+/// that retried all of those (#314).
+fn isRetryable(err: anyerror) bool {
+    return switch (err) {
+        error.DownloadFailed, error.RateLimited, error.TokenUnavailable => true,
+        else => false,
+    };
+}
+
+/// Download with bounded retries. Transient failures (network blips, 5xx, 429)
+/// are retried with a short linear backoff so a single flaky connection no
+/// longer aborts an otherwise-healthy parallel batch (#311). Telemetry is
+/// recorded once per logical download here (not per attempt) so retries don't
+/// inflate the failure count.
+///
+/// Public so the install pipeline can route every bottle download through a
+/// single batch-scoped `std.http.Client` — the connection pool then hangs onto
+/// open TLS sessions and successive downloads avoid a fresh handshake.
+/// `preauth_token` is a read-only slice owned by the caller (shared across
+/// workers, replaces N per-download token lookups with one) — not freed here.
+pub fn downloadOneWithClient(
+    alloc: std.mem.Allocator,
+    client: *std.http.Client,
+    req: DownloadRequest,
+    preauth_token: ?[]const u8,
+) !void {
+    var telemetry_event = telemetry.DownloadEvent.start(req.target_kind, req.target_name);
+    errdefer telemetry_event.fail();
+
+    const max_attempts: usize = 3;
+    var attempt: usize = 0;
+    while (true) {
+        attempt += 1;
+        downloadAttempt(alloc, client, req, preauth_token) catch |err| {
+            if (attempt >= max_attempts or !isRetryable(err)) return err;
+            // Linear backoff: 250ms, 500ms. Keeps a flaky download from
+            // hammering the server while still recovering quickly.
+            std.Io.sleep(paths.safe_io, .fromMilliseconds(@as(i64, @intCast(attempt)) * 250), .awake) catch {};
+            continue;
+        };
+        break;
+    }
+
+    var dest_path_buf: [512]u8 = undefined;
+    // The download itself succeeded by this point — a path-format failure may
+    // only cost us the size lookup, never the started telemetry event (#314).
+    const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch {
+        telemetry_event.succeed(0);
+        return;
+    };
+    telemetry_event.succeed(telemetry.fileSize(dest_path));
+}
+
+/// Internal: single download attempt using an existing HTTP client and optional
+/// pre-fetched token. `preauth_token` is a read-only slice owned by the caller —
+/// not freed here.
+fn downloadAttempt(
     alloc: std.mem.Allocator,
     client: *std.http.Client,
     req: DownloadRequest,
@@ -381,8 +462,6 @@ fn downloadOneWithClient(
     const t_dl = if (bench) milliTimestamp() else @as(i64, 0);
     var dest_path_buf: [512]u8 = undefined;
     const dest_path = std.fmt.bufPrint(&dest_path_buf, "{s}/{s}", .{ BLOBS_DIR, req.expected_sha256 }) catch return error.PathTooLong;
-    var telemetry_event = telemetry.DownloadEvent.start(req.target_kind, req.target_name);
-    errdefer telemetry_event.fail();
 
     // Rewrite bottle URL if NANOBREW_BOTTLE_DOMAIN or HOMEBREW_BOTTLE_DOMAIN is set (#74)
     const bottle_domain: ?[]const u8 = blk: {
@@ -408,16 +487,15 @@ fn downloadOneWithClient(
 
     // Determine auth token:
     //   1. preauth_token if URL is ghcr.io (caller pre-fetched for the batch)
-    //   2. null if custom bottle domain that is not ghcr.io (no auth required)
-    //   3. fresh fetch (disk-cached with 4-min TTL) otherwise
-    const is_ghcr = std.mem.startsWith(u8, effective_url, "https://ghcr.io");
-    const skip_auth = bottle_domain != null and !is_ghcr;
-    const fresh_token: ?[]const u8 = if (!skip_auth and preauth_token == null)
+    //   2. fresh fetch (disk-cached with 4-min TTL) for ghcr.io without preauth
+    //   3. null for custom bottle domains or other third-party bottle hosts
+    const is_ghcr = isGhcrUrl(effective_url);
+    const fresh_token: ?[]const u8 = if (is_ghcr and preauth_token == null)
         try fetchGhcrToken(alloc, client, effective_url)
     else
         null;
     defer if (fresh_token) |t| alloc.free(t);
-    const token: ?[]const u8 = if (skip_auth) null else (preauth_token orelse fresh_token);
+    const token: ?[]const u8 = if (is_ghcr) (preauth_token orelse fresh_token) else null;
 
     // Build auth header
     var auth_buf: [4096]u8 = undefined;
@@ -439,14 +517,33 @@ fn downloadOneWithClient(
 
     var redirect_buf: [32768]u8 = undefined;
     var response = http_req.receiveHead(&redirect_buf) catch return error.DownloadFailed;
-    if (response.head.status != .ok) return error.DownloadFailed;
+    if (response.head.status != .ok) {
+        // Map status to a specific error so callers (and retry logic) can tell a
+        // permanent failure (404/auth) from a transient one (5xx/429). (#311)
+        return switch (response.head.status) {
+            .not_found, .gone => error.BottleNotFound,
+            // A ghcr 401 with no token means the token *fetch* failed this
+            // attempt (it's swallowed to null inside fetchGhcrToken) — that's
+            // the transient case, and a retry re-fetches the token. With a
+            // token present the rejection is genuine and permanent. (#314)
+            .unauthorized, .forbidden => if (is_ghcr and token == null) error.TokenUnavailable else error.AuthFailed,
+            .too_many_requests => error.RateLimited,
+            else => error.DownloadFailed,
+        };
+    }
 
-    // Stream body to tmp file with SHA256 hashing in single pass
+    // Stream body to tmp file with SHA256 hashing in single pass. The tmp
+    // path carries a pid+tid suffix: two parallel workers fetching the same
+    // sha must not interleave writes into one shared file — that corrupted
+    // the blob and surfaced as a hard ChecksumMismatch now that mismatches
+    // aren't retried (#314). The rename below stays atomic; first one wins.
     var tmp_path_buf: [512]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}/{s}.dl", .{ TMP_DIR, req.expected_sha256 }) catch return error.PathTooLong;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}/{s}.{d}-{d}.dl", .{
+        TMP_DIR, req.expected_sha256, std.c.getpid(), std.Thread.getCurrentId(),
+    }) catch return error.PathTooLong;
 
     {
-        const _lio_dl = std.Io.Threaded.global_single_threaded.io();
+        const _lio_dl = paths.safe_io;
         var file = std.Io.Dir.createFileAbsolute(_lio_dl, tmp_path, .{}) catch return error.DownloadFailed;
         var file_writer_buf: [65536]u8 = undefined;
         var file_writer = file.writer(_lio_dl, &file_writer_buf);
@@ -482,14 +579,15 @@ fn downloadOneWithClient(
         }
     }
 
-    // Atomic rename to final path
-    std.Io.Dir.renameAbsolute(tmp_path, dest_path, std.Io.Threaded.global_single_threaded.io()) catch |err| {
+    // Atomic rename to final path. On any failure delete the tmp file —
+    // per-worker tmp names mean nothing else will ever reuse or clean it.
+    std.Io.Dir.renameAbsolute(tmp_path, dest_path, paths.safe_io) catch |err| {
+        std.Io.Dir.deleteFileAbsolute(paths.safe_io, tmp_path) catch {};
         if (err == error.PathAlreadyExists) {
             if (bench) {
                 const sha = req.expected_sha256;
                 std.debug.print("[nb-bench] dl {s}…: {d}ms (cached blob)\n", .{ sha[0..@min(8, sha.len)], milliTimestamp() - t_dl });
             }
-            telemetry_event.succeed(telemetry.fileSize(dest_path));
             return;
         }
         return err;
@@ -498,22 +596,25 @@ fn downloadOneWithClient(
         const sha = req.expected_sha256;
         std.debug.print("[nb-bench] dl {s}…: {d}ms\n", .{ sha[0..@min(8, sha.len)], milliTimestamp() - t_dl });
     }
-    telemetry_event.succeed(telemetry.fileSize(dest_path));
 }
 
 /// Public single-download entry point for callers without a persistent client.
 /// Workers should call downloadOneWithClient directly for connection reuse.
 pub fn downloadOne(alloc: std.mem.Allocator, req: DownloadRequest) !void {
-    var client: std.http.Client = .{ .allocator = alloc, .io = std.Io.Threaded.global_single_threaded.io() };
+    var client: std.http.Client = .{ .allocator = alloc, .io = paths.safe_io };
     defer client.deinit();
     return downloadOneWithClient(alloc, &client, req, null);
 }
 
 fn fileExists(path: []const u8) bool {
-    const _lio_fe = std.Io.Threaded.global_single_threaded.io();
+    const _lio_fe = paths.safe_io;
     const f = std.Io.Dir.openFileAbsolute(_lio_fe, path, .{}) catch return false;
     f.close(_lio_fe);
     return true;
+}
+
+fn isGhcrUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "https://ghcr.io/");
 }
 
 const testing = std.testing;
@@ -524,6 +625,13 @@ test "scopeToCacheName - replaces slashes with underscores" {
     try testing.expectEqualStrings("homebrew_core_ffmpeg", name);
 }
 
+test "isGhcrUrl only matches the ghcr.io HTTPS host" {
+    try testing.expect(isGhcrUrl("https://ghcr.io/v2/homebrew/core/hello/blobs/sha256:abc"));
+    try testing.expect(!isGhcrUrl("https://github.com/owner/repo/releases/download/v1/pkg.tar.gz"));
+    try testing.expect(!isGhcrUrl("https://ghcr.io.evil.example/v2/homebrew/core/hello"));
+    try testing.expect(!isGhcrUrl("http://ghcr.io/v2/homebrew/core/hello"));
+}
+
 test "scopeToCacheName - single segment unchanged" {
     var buf: [256]u8 = undefined;
     const name = scopeToCacheName("homebrew", &buf).?;
@@ -532,6 +640,22 @@ test "scopeToCacheName - single segment unchanged" {
 
 test "scopeToCacheName - repo too long returns null" {
     var buf: [256]u8 = undefined;
-    const long = "a" ** 257;
+    const long: [257]u8 = @splat('a');
     try testing.expectEqual(@as(?[]const u8, null), scopeToCacheName(long, &buf));
+}
+
+test "isRetryable whitelists transient failures only" {
+    // Transient: network/5xx, rate limits, and a failed token fetch
+    // (re-fetched on the next attempt).
+    try testing.expect(isRetryable(error.DownloadFailed));
+    try testing.expect(isRetryable(error.RateLimited));
+    try testing.expect(isRetryable(error.TokenUnavailable));
+    // Deterministic: permanent HTTP failures, checksum mismatch, and local
+    // errors that used to slip through the old `else => true`.
+    try testing.expect(!isRetryable(error.BottleNotFound));
+    try testing.expect(!isRetryable(error.AuthFailed));
+    try testing.expect(!isRetryable(error.ChecksumMismatch));
+    try testing.expect(!isRetryable(error.PathTooLong));
+    try testing.expect(!isRetryable(error.OutOfMemory));
+    try testing.expect(!isRetryable(error.AccessDenied));
 }

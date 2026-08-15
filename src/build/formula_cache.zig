@@ -62,18 +62,18 @@ pub fn getVerifiedFormula(alloc: std.mem.Allocator, name: []const u8, version: [
     // Try to download fresh content
     const fresh_content = fetch.get(alloc, url) catch |err| {
         // Network failure: try cached content with hash verification
-        const cached = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), cache_path, alloc, .limited(10 * 1024 * 1024)) catch {
+        const cached = std.Io.Dir.cwd().readFileAlloc(paths.safe_io, cache_path, alloc, .limited(10 * 1024 * 1024)) catch {
             return err;
         };
 
         // Verify cached content against stored hash pin
         var stored_hash: [64]u8 = undefined;
-        const hash_file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), hash_path, .{}) catch {
+        const hash_file = std.Io.Dir.openFileAbsolute(paths.safe_io, hash_path, .{}) catch {
             alloc.free(cached);
             return err;
         };
-        defer hash_file.close(std.Io.Threaded.global_single_threaded.io());
-        const n = hash_file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &stored_hash, 0) catch {
+        defer hash_file.close(paths.safe_io);
+        const n = hash_file.readPositionalAll(paths.safe_io, &stored_hash, 0) catch {
             alloc.free(cached);
             return err;
         };
@@ -84,12 +84,12 @@ pub fn getVerifiedFormula(alloc: std.mem.Allocator, name: []const u8, version: [
         var cached_hex: [64]u8 = undefined;
         computeSha256Hex(cached, &cached_hex);
         if (!std.mem.eql(u8, &cached_hex, &stored_hash)) {
-            ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: WARNING: cached formula for {s} has been tampered with\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), _tmp) catch {}; });
+            ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: WARNING: cached formula for {s} has been tampered with\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(paths.safe_io, _tmp) catch {}; });
             alloc.free(cached);
             return error.FormulaSourceChanged;
         }
 
-        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: warning: network fetch failed for {s}, using cached formula\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), _tmp) catch {}; });
+        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: warning: network fetch failed for {s}, using cached formula\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(paths.safe_io, _tmp) catch {}; });
         return cached;
     };
 
@@ -99,7 +99,7 @@ pub fn getVerifiedFormula(alloc: std.mem.Allocator, name: []const u8, version: [
 
     // Check for existing pinned hash
     var existing_hash: [64]u8 = undefined;
-    if (std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), hash_path, alloc, .limited(64))) |pinned| {
+    if (std.Io.Dir.cwd().readFileAlloc(paths.safe_io, hash_path, alloc, .limited(64))) |pinned| {
         defer alloc.free(pinned);
         if (pinned.len >= 64) {
             @memcpy(&existing_hash, pinned[0..64]);
@@ -108,9 +108,9 @@ pub fn getVerifiedFormula(alloc: std.mem.Allocator, name: []const u8, version: [
                 return fresh_content;
             } else {
                 // Hash mismatch — possible supply-chain tampering
-                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: WARNING: formula source hash changed for {s}\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), _tmp) catch {}; });
-                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "    pinned:  {s}\n", .{&existing_hash}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), _tmp) catch {}; });
-                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "    current: {s}\n", .{&fresh_hex}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), _tmp) catch {}; });
+                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: WARNING: formula source hash changed for {s}\n", .{name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(paths.safe_io, _tmp) catch {}; });
+                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "    pinned:  {s}\n", .{&existing_hash}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(paths.safe_io, _tmp) catch {}; });
+                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "    current: {s}\n", .{&fresh_hex}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(paths.safe_io, _tmp) catch {}; });
                 alloc.free(fresh_content);
                 return error.FormulaSourceChanged;
             }
@@ -120,29 +120,29 @@ pub fn getVerifiedFormula(alloc: std.mem.Allocator, name: []const u8, version: [
     // First fetch: create cache directory, write content and hash.
     // Fail closed: if we cannot persist the hash pin, do not return content —
     // otherwise we have trust-on-first-use with no persisted hash to verify later.
-    std.Io.Dir.createDirAbsolute(std.Io.Threaded.global_single_threaded.io(), FORMULA_CACHE_DIR, .default_dir) catch {};
+    std.Io.Dir.createDirAbsolute(paths.safe_io, FORMULA_CACHE_DIR, .default_dir) catch {};
 
-    const cache_file = std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), cache_path, .{}) catch {
+    const cache_file = std.Io.Dir.createFileAbsolute(paths.safe_io, cache_path, .{}) catch {
         alloc.free(fresh_content);
         return error.CacheWriteFailed;
     };
-    cache_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), fresh_content) catch {
-        cache_file.close(std.Io.Threaded.global_single_threaded.io());
+    cache_file.writeStreamingAll(paths.safe_io, fresh_content) catch {
+        cache_file.close(paths.safe_io);
         alloc.free(fresh_content);
         return error.CacheWriteFailed;
     };
-    cache_file.close(std.Io.Threaded.global_single_threaded.io());
+    cache_file.close(paths.safe_io);
 
-    const pin_file = std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), hash_path, .{}) catch {
+    const pin_file = std.Io.Dir.createFileAbsolute(paths.safe_io, hash_path, .{}) catch {
         alloc.free(fresh_content);
         return error.CacheWriteFailed;
     };
-    pin_file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &fresh_hex) catch {
-        pin_file.close(std.Io.Threaded.global_single_threaded.io());
+    pin_file.writeStreamingAll(paths.safe_io, &fresh_hex) catch {
+        pin_file.close(paths.safe_io);
         alloc.free(fresh_content);
         return error.CacheWriteFailed;
     };
-    pin_file.close(std.Io.Threaded.global_single_threaded.io());
+    pin_file.close(paths.safe_io);
 
     return fresh_content;
 }

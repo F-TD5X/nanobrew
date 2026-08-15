@@ -2,9 +2,193 @@
 
 All notable changes to nanobrew are documented here.
 
-## Unreleased
+## [Unreleased]
+
+## [0.1.207] - 2026-08-15
+
+### Fixed
+- **Revision double-counted in keg version for pre-suffixed registry pins** (`nb install rustup` failed with `materialize failed: error.CopyFailed`): six registry records (rustup, mysql, lcov, aria2, httpie, poetry) baked the revision into `resolved.version` while also carrying `revision > 0`, and `effectiveVersion` appended `_<revision>` again, producing keg paths like `1.29.0_2_2` that the bottle does not contain. `effectiveVersion` is now idempotent and both the repo and embedded registries are normalized to base version + revision field. Verified: `nb install rustup` materializes and links `1.29.0_2`. (#354)
+- **`@@HOMEBREW_JAVA@@` is now relocated** (Maven ran only with a caller-supplied `JAVA_HOME`): the text placeholder pass resolves the token per keg to the formula's `openjdk`/`openjdk@N` dependency's JDK home (plain `openjdk` fallback for rollback/switch re-pours without a dependency list). Supplementary text passes without formula context leave the token alone so the deps-aware pass cannot be pre-empted with a wrong default. Probed binaries are also scanned for any unreplaced `@@HOMEBREW_*@@` token. (#358)
+- **Tap formulas with `using: :nounzip` no longer fed raw executables to tar** (`can1357/tap/omp`): the parser captures `using: :nounzip` and the `bin.install Dir["<glob>"].first => "<dest>"` install shape; the source pipeline stages raw assets under their upstream basename and installs the first glob match as `bin/<dest>` with the executable bit set. `nb install` also exits nonzero when any package in the pipeline fails instead of reporting failure text with exit 0. (#361)
+- **Static `.a` archives are relocated**: ar archives were excluded from both the Mach-O relocator and the text walker, so their members kept Homebrew compile-time paths (openssl@3's `OPENSSLDIR`, engine/module dirs, ...) and statically linked programs inherited `/opt/homebrew`. The length-preserving `/opt/nb` byte pass now runs inside archives (no member offset or symbol-table entry shifts; nothing to re-sign), and `nb doctor --probe` flags archives that still carry a foreign prefix as repairable by reinstall. (#357)
+- **Known-incomplete relocation fails the install instead of warning and continuing**: when `/opt/nb` is unavailable, files that keep foreign runtime paths (`.rodata` fallback, skipped archives, patchelf-only ELF fixes) are counted, the affected package fails with a `sudo nb init` remediation, the partial keg is removed, and nothing is snapshot-cached — a keg that silently borrows Homebrew's modules (perl loading Brew's `Config.pm` and XS bundles) can no longer be reported as installed. (#355)
+- **Relocated-snapshot cache is versioned and validated**: `store-relocated` entries now carry a relocation schema marker; marker-less or old-schema snapshots (including poisoned pre-v0.1.204 ones) are treated as absent and replaced on the next save, so reinstalling after `sudo nb init` repairs instead of perpetuating foreign-prefix kegs. Cached-reinstall fast paths run the post-install probe. (#356)
+- **Post-install probe false positives** (`git`, `perl`): each executable now gets its own 2s slice under a 10s package cap (exhaustion skips instead of failing), restricted login shells like `git-shell` are skipped, and in discovery mode unresponsive extras (perl's interactive `cpan`, `instmodsh`) are informational — the verdict fails on an unresponsive primary or declared binary, or when nothing answers. Verified: `nb doctor --probe git perl` both pass. (#317 field notes)
+- **llama.cpp on macOS**: not reproducible after the relocation fixes above — fresh install registers the Metal and Accelerate backends and runs inference end to end; the reported `no backends are loaded` failure matches the cross-prefix contamination class fixed by #355/#356/#357. Upgrade, then `nb reinstall llama.cpp ggml` to repair an affected install. (#360)
+
+## [0.1.206] - 2026-08-15
+
+### Fixed
+- **False `circular dependency detected` from a stale verified-upstream pin**: Homebrew can drop a formula's `depends_on` edge without bumping version, revision, or rebuild (webp 1.6.0 dropped libtiff this way), and the registry freshness gate only compared those three fields, so the stale pinned `webp -> libtiff` edge survived every resolve and paired with the live `libtiff -> webp` edge into a two-node cycle that doesn't exist upstream. The resolver then skipped installs and upgrades for anything transitively touching the edge (mpv, libtiff, libheif, poppler, imagemagick, openjdk, tesseract, emscripten, ...). The freshness gate now also defers to live metadata when the pin lists a dependency the live formula no longer has at all. The check is deliberately one-directional: `uses_from_macos`-merged live extras never demote a verified pin. (#359, #362)
+
+## [0.1.205] - 2026-07-21
+
+### Fixed
+- **Read-only bottle payload now relocates**: perl's bottle ships `bin/perl` (0555) and `libperl.dylib` (0444) without the owner-write bit, and both relocators opened files read-write eagerly, took `EACCES`, and silently skipped them, so a fresh perl install died in dyld (`Symbol not found: _PL_csighandlerp`) with its `@@HOMEBREW_PREFIX@@` load command intact; the ELF relocator had the identical silent skip on Linux. Both now probe read-only (stat + magic), lift the owner-write bit via `fchmod` for confirmed binaries only, and restore the original mode after the pass (before `install_name_tool` in the Mach-O fallback so the renamed file inherits it, after `patchelf` on the ELF side). Verified: fresh perl runs `use strict` with a fully relocated `@INC` and keeps its 0555/0444 modes. Caught by the CI perl smoke test. This supersedes v0.1.204, which shipped the byte pass with this regression and is marked as a prerelease. (#347)
+
+## [0.1.204] - 2026-07-21
+
+### Fixed
+- **Mach-O relocation rewrites compile-time paths, not just load commands**: Homebrew bottles bake literal `/opt/homebrew/...` defaults into `.rodata` (OpenSSL `OPENSSLDIR`/`ENGINESDIR`/`MODULESDIR`, git `--html-path`/`--man-path`, `GIT_CONFIG_SYSTEM`/`GIT_ATTR_SYSTEM`), and the old macOS pass only rewrote load commands via `install_name_tool`, so installed packages kept reporting non-existent Homebrew runtime paths. Relocation now mirrors the ELF relocator's native-first design: one whole-file byte pass rewrites `@@HOMEBREW_*@@` placeholders plus literal `/opt/homebrew/`, `/usr/local/Cellar/`, and `/usr/local/opt/` prefixes to the strictly-shorter, slash-padded `/opt/nb` form across `.rodata`, load-command dylib IDs/rpaths, and every fat slice, followed by a batch re-sign; `nb init` creates the `/opt/nb` symlink on macOS as well now. Verified end to end on fresh pours: `openssl version -a` reports the nanobrew `OPENSSLDIR`, node's default OpenSSL CA store serves HTTPS without `NODE_EXTRA_CA_CERTS`, git's html/man/system-config paths resolve under the nanobrew prefix, and whole-keg sweeps of openssl@3, node, and git find no `/opt/homebrew` bytes left in any loadable file. (#347)
+- **Bottle `.bottle/etc` payloads are linked into the shared prefix**: bottles stage mutable runtime config (`openssl.cnf`, `gitconfig`, fontconfig's `fonts.conf`, openldap schemas, ...) under `<keg>/.bottle/etc/` rather than the keg root, and the keg linker never processed that prefix, so directories like `prefix/etc/openssl@3` were missing entirely after install. The linker now maps `<keg>/.bottle/etc` into `<prefix>/etc` through the existing bucket logic on both fast and slow link paths (a graceful no-op for kegs without the payload), and unlink stays target-checked so postinstall-added non-keg symlinks such as `etc/openssl@3/cert.pem -> ca-certificates` survive unlink/relink. `git config --system` reads the bottle-shipped `gitconfig` instead of dying on a missing Homebrew path. (#347)
+
+## [0.1.203] - 2026-07-19
+
+### Performance
+- **Big-keg install/remove/link are 1.4–2.4x faster** — on a 7,616-file keg (`openssl@3`), measured interleaved medians on a loaded M-series machine: `nb link` 355 ms → 179 ms (**2.0x**), `nb remove` 608 ms → 258 ms (**2.4x**), warm `nb install` 390 ms → 278 ms (**1.4x**); small packages are unchanged (tree warm install 19 ms → 19 ms). Three changes in `src/linker/linker.zig` + `src/platform/purge.zig`: (1) the keg link walk now scans the tree once, creates destination dirs serially, and runs the per-file `readlink probe + unlink + symlink` work on a 4-worker pool with a dirfd per work chunk (basename-only `*at` syscalls instead of deep absolute paths); leaf work is symlink-first so clean installs pay one syscall per file, with the EEXIST probe preserving the exact conflict/`etc`-preserve/clobber semantics of the serial walker. (2) `unlinkKeg` mirrors only keg-shaped destination dirs instead of scanning the whole shared prefix tree. (3) `nb remove` and the reinstall path no longer pay a serial `deleteTree` per keg: the tree is atomically renamed into `Cellar/.purge/` and a detached reaper empties it after the command returns (same model as the background DMG detach). Worker count is tunable via `NB_LINK_WORKERS` (default min(4, cores)); `NB_BENCH=1` now reports materialize/link/postinstall timings on the relocated-snapshot fast path as well.
+- **Large installed-package inventories stay in the low single-digit milliseconds** — on a real 207-package macOS state, warm `nb outdated` dropped from 221.8 ms to 3.4 ms (**64.8x**) and `nb leaves` from 227.8 ms to 3.3 ms (**68.9x**). Both commands use one validated, atomically written bulk sidecar; targeted version maps retain only installed names, and the formula sidecar carries platform-aware dependency lists so `leaves` no longer parses hundreds of per-package JSON files. Verified-upstream-only misses no longer pay a redundant live Homebrew request, while an unavailable or invalid index still preserves the normal freshness check.
+- **`nb info` is read-only and evidence-driven** — it no longer launches every installed executable to recompute trust on each invocation. Exact version/checksum/platform/probe-schema results are persisted by installs or explicit `nb doctor --probe`; `info` performs cheap current artifact/link-ownership checks. A matching 43-binary `ffmpeg` case with a recorded failed probe fell from 3.271 s to 4.2 ms (**773x faster**), while three-name metadata lookup improved from ~14 ms to ~5 ms by sharing one registry, database snapshot, and HTTP client.
+- **Output-only commands never run the unrelated daily update request** — help, info, search, where, doctor, deps, completions, and other local/read-only paths now exit immediately after their requested work.
+- **`nb list --versions` ~2.2x faster on long upgrade histories** — per-row switchability checks used to pay one `access(2)`/`readdir` syscall per history row (~900 rows on a real 207-package state). The store's blob names are now read into a set once, each keg's version dirs are read once (not once per row), and the checks run on a small worker pool with output order unchanged: 8.3 ms → 3.5 ms.
+- **Upstream-registry lookups are O(1) per process** — every per-formula registry lookup used to open + read + needle-scan the ~650KB registry snapshot, and tokens absent from the registry (most formulae) re-paid that miss path in every process. A process-wide memo now shares one snapshot plus a token→record-range map, backed by a small validated on-disk sidecar index so later processes skip the structural pass entirely. `nb doctor`'s revoked-pin sweep parses only records that actually carry a revocation instead of the whole registry.
+- **Index sidecar reads skip the writer lock and validate in SIMD** — `nb search`/`where`/`outdated`/`leaves` no longer take an exclusive file lock on the read path (sidecars are published by atomic rename and re-validated per read), and sidecar validation is two `std.mem.count` passes instead of a per-line loop. Repeated per-name formula lookups in one process share one memoized index read with O(1) entry lookups.
+- **`nb doctor` broken-link scan is parallel and single-syscall** — 800+ symlinks in `prefix/bin` now take one `access(2)` each on a worker pool (`readlink` only runs for the links that are actually broken), instead of serial `readlink`+`access` per link.
+
+### Fixed
+- **Shell completion on an empty installation** — generated ZSH completion no longer raises `bad substitution`, and ZSH/Bash/Fish now consume `nb list --names` so the human-readable empty-state message is never offered as a package name. (#340)
+- **Version-scoped local trust evidence** — `nb info` only reports `install-verified` when canonical identity, effective version/revision, artifact checksum, platform, probe schema, and current artifact/link structure all match recorded evidence. Active probes execute the exact Cellar/Caskroom-owned target rather than a replaceable public link, enforce one absolute two-second process budget, and cannot claim executable evidence when no executable or signed app was checked. Cask state preserves requested aliases and canonical identities; third-party tap Caskroom paths consistently use the filesystem token basename. (#317)
+- **Correct Homebrew Cellar version identity** — formula revisions now append the `_N` Cellar suffix, while bottle rebuild numbers identify bottle artifacts without changing the installed version or Cellar path. Install/no-op checks, verified-upstream freshness, search, `outdated`, and `upgrade` are revision-aware; revoked fallbacks retain their own historical revision/rebuild identity. The upgrade coordinator no longer overwrites `runInstall`'s freshly recorded artifact SHA/evidence with an old, stale database snapshot.
+- **Concurrent database updates fail safely** — state writes use process-unique temporary files and an optimistic mtime guard, so a long explicit probe or another command cannot silently replace package state that changed after its snapshot was opened.
+
+## [0.1.202] - 2026-07-11
+
+### Performance
+- Read-only inventory commands no longer wait on unrelated update checks, multi-root dependency resolution is batched, dependency frontier membership is O(1), and Linux relocation probes ELF magic before reading full files.
+- Zig 0.17.0-dev builds improve measured `nb list` latency by about 7% on macOS and 10% on Linux while retaining Zig 0.16 test compatibility.
+
+### Fixed
+- Formula upgrades verify and persist the installed version; cask upgrades preserve the working installation until atomic replacement is available. (#348, #349)
+- `nb leaves`, `nb list`, and `nb outdated` exit without a trailing remote update wait. (#350)
+- Homebrew migration ignores `.metadata`, Intel cask update checks use architecture-aware metadata, failed source builds remove empty staged kegs, autotools configure launchers regain executable mode, and pkg-backed casks report actionable elevation and installer errors. (#341, #342, #343, #344, #345, #346)
+- Empty ZSH installed-package completion sets no longer raise an error.
+
+### Build
+- Migrated source and build tooling to Zig 0.17.0-dev.813 while retaining the Zig 0.16 validation path and macOS/Linux/Windows cross-target builds.
+
+## [0.1.201] - 2026-06-26
 
 ### Added
+- **Windows registry is now data-driven and has `nb info` metadata lookup** — the Windows build embeds and validates `registry/windows.json` at build/runtime instead of carrying a duplicated hardcoded package table in Zig source.
+- **Windows native package set now includes `uv`, `yq`, `just`, `hyperfine`, `fzf`, `starship`, `eza`, `delta`, `dust`, `bottom`, `zoxide`, `sd`, `hexyl`, `dua`, `procs`, `bun`, `deno`, `gh`, `watchexec`, `pastel`, `xsv`, `yazi`, `oh-my-posh`, `kubectl`, `terraform`, `helm`, `k9s`, `lazygit`, `lazydocker`, `rclone`, `age`, `sops`, `hugo`, and `neovim`** — each downloads verified upstream x86_64 Windows portable assets and links executables into `%LOCALAPPDATA%\nanobrew\bin`.
+- **Windows UX polish** — `nb search` reports no-match results clearly and `nb doctor` now tells users whether nanobrew's `bin` directory is on the current PATH.
+
+### Fixed
+- **macOS ImageMagick/libheif and Lima compatibility** — ImageMagick wrappers now export the correct module/config paths for HEIC support, and Mach-O relocation no longer re-signs untouched skip-relocation binaries so upstream entitlements are preserved.
+- **Local trust probes** — `nb doctor --probe` executes linked formula binaries, probes cask app/binary payloads, and surfaces cask local trust evidence in `nb info`.
+
+## [0.1.200] - 2026-06-25
+
+### Added
+- **Native Windows portable package manager** — the Windows build now owns `%LOCALAPPDATA%\nanobrew` with a Cellar, cache, db, and bin directory. It downloads verified upstream portable assets directly, extracts/copies them into Cellar, and links executables into `bin` without WinGet/Scoop/Chocolatey. Initial registry: `ripgrep`, `fd`, `bat`, and `jq`. Supports `init`, `search`, `install`, `upgrade`, `remove`, `list`, `doctor`, and `version`. (#336)
+- **`zig build windows`** convenience target for producing the x86_64 Windows executable. (#336)
+
+## [0.1.199] - 2026-06-25
+
+### Security
+- **Bumped the pinned GitHub CLI (`gh`) registry entry to 2.93.0** with official upstream checksums, clearing the weekly bottle scan finding against 2.91.0. (#334)
+- **Bottle scans now fail with actionable evidence instead of empty issues**: per-record scan crashes are captured as gated `SCAN-ERROR` findings so the issue body tells maintainers what failed. (#334)
+
+### Fixed
+- **Finished the #314 update hardening follow-ups**: POST redirect handling no longer leaks synthetic form `Content-Type` after POST→GET redirects, 307/308 POST redirects get a distinct unsupported error, self-update accepts only expected release binary names, extracted update binaries are checked for Mach-O/ELF magic before replacement, and `update-registry` now reports cache write failures. (#314)
+- **Native Linux builds link libc explicitly**, matching the test and cross-build modules.
+- **Cask recovery and fonts**: font cask artifacts are parsed, and interrupted cask installs can be recovered from their real on-disk Caskroom payload version.
+
+### Added
+- **Local trust probe slice**: `nb doctor --probe [pkg...]` probes installed formula kegs, installs run a warning-only local probe after post-install, and `nb info` surfaces a local trust tier (`checksum-verified`, `source-verified`, or `install-verified`). (#317)
+
+## [0.1.198] - 2026-06-12
+
+### Security
+- **Bottle vulnerability scanning + CVE revocation with version fallback** — `nb_bottles.py scan` extracts each pinned bottle (all four platforms), SBOMs it with syft, matches with grype, and exits non-zero at/above `--gate` (default high); the first full run caught a real finding (gh 2.91.0 ships Go 1.26.2 stdlib HIGH CVEs). `revoke`/`unrevoke` mark a CVE'd pin revoked and record the previous known-good version as `resolved.fallback`. The `nb` resolver installs a revoked pin's fallback with a warning naming the advisory (revoked without fallback fails closed); the live-API freshness override is disabled for fallbacks so it can't silently undo the deliberate downgrade. Revocations propagate via the remote registry (6h TTL) — no binary release needed. `push-evidence` attaches SBOM + scan report to the bottle's GHCR manifest as OCI referrer artifacts, and `bottles.yml` rescans every pinned bottle weekly against fresh CVE data, auto-opening a security-labeled issue on a gate hit.
+- **`nb doctor` flags installed revoked versions** — kegs whose registry pin has since been revoked are reported with the advisory and the exact fix (remove + reinstall lands on the safe fallback), covering machines that installed before the revocation. Verified live against CVE-2026-33814 on gh 2.91.0.
+- **Immutable version tags on the bottle registry** — `push_manifest` refuses to re-tag a different blob under an existing version tag (same-digest re-pushes stay idempotent); version tags are what humans audit, so bumps are new tags.
+- **`nb_bottles.py attest` verifies provenance of pinned upstream assets** — ranks each release asset by the strongest upstream vouching available (`github-attestation` via sigstore/gh CLI > `checksum-file` > `pin-only`), dies on any disagreement between our pin and upstream's published checksums, and `--require` gates CI on a minimum level.
+
+### Performance
+
+| Operation | Before | After | Speedup |
+|---|---:|---:|---:|
+| ELF relocate phase (Linux) | 4,777 ms | 6 ms | **~800x** |
+| Cached-bottle reinstall (macOS) | 534 ms | 4 ms | **~130x** |
+| Warm `nb install` resolve | 147 ms | 1.8 ms | **~80x** |
+| Linux cold install, fresh machine (hexyl) | 5,876 ms | 1,110 ms | **~5x** |
+
+- **Linux cold installs ~5x faster on fresh machines (hexyl 5,876 ms → 1,110 ms; relocate phase 4,777 ms → 6 ms)** — ELF relocation is now native and in-place instead of shelling out to patchelf. A `/opt/nb → <prefix>` short symlink (created by `nb init` and lazily by the relocator) makes every `@@HOMEBREW_*@@` replacement strictly shorter than its placeholder, so RPATH/RUNPATH, DT_NEEDED, PT_INTERP, and `.rodata` strings are all rewritten in one read+write pass with '/' padding at the path boundary (valid for C-string and length-delimited consumers alike — perl bakes @INC entries with compile-time lengths, so NUL padding would corrupt them) — no section resizing, no subprocesses, and no `apt-get install patchelf` bootstrap (which alone cost ~4.8 s on every fresh machine and made installs *fail* where no package manager was available). PT_INTERP repair (missing glibc keg → system loader) is also native. patchelf remains only as a fallback when `/opt/nb` can't be created (non-root upgrades of old installs), bootstrapped lazily on first need. Also fixes a latent bug where only the first of several placeholders inside one colon-separated rpath string was rewritten.
+- **Warm `nb install` ~80x faster (147 ms → 1.8 ms)** — resolving any package that isn't in the verified-upstream registry (the vast majority) re-downloaded the ~650 KB registry from GitHub on every resolve. Two fixes in `loadRecordWithOptions`: a fresh registry cache is now authoritative for misses too (no remote refetch inside the 6h TTL), and a fetched remote registry is cached even when the requested token isn't in it — previously the cache was only written on a token hit, so after TTL expiry every resolve of a non-registry token re-paid the remote fetch forever. Multi-dependency cold installs save one ~650 KB round trip per dep token.
+- **Cached-bottle reinstalls no longer pay a GHCR token round trip (macOS reinstall 534 ms → 4 ms)** — the batch-shared bearer token was fetched whenever any package had a ghcr.io bottle URL, even when every blob was already in the local cache; it's now fetched only when at least one bottle actually needs downloading.
+- `NB_BENCH=1` now reports per-phase timings (extract / materialize / relocate / placeholders+seal / snapshot / link / postinstall) for each package, not just download.
+
+### Fixed
+- **TLS works out of the box for brewed openssl/gnutls (Linux especially)** — Homebrew wires `<prefix>/etc/ca-certificates/cert.pem` (the path baked into openssl@3's OPENSSLDIR, curl's `--with-ca-bundle`, and gnutls' default trust store) in Ruby `post_install` blocks that nanobrew's heuristic script parser couldn't execute, so the file never existed and anything linking brewed TLS failed certificate verification on fresh machines. A native post-install step (`src/build/certs.zig`) now creates the symlinks itself: `etc/ca-certificates/cert.pem` → the ca-certificates keg's `cacert.pem` (or the system CA bundle when the keg isn't installed), and `etc/openssl@N|gnutls|libressl/cert.pem` → that shared store. Idempotent and converging — a later ca-certificates install repoints the store at the keg bundle; a user-placed regular `cert.pem` is never overwritten.
+- **`@@HOMEBREW_PERL@@` shebangs are now relocated** — autoconf (and any formula whose scripts run under brewed perl) installed with a literal `#!@@HOMEBREW_PERL@@` interpreter line, which made the binary fail with "bad interpreter". The placeholder now maps to `<prefix>/opt/perl/bin/perl` in both text relocation passes. Known limitation surfaced while testing: on Macs with a real Homebrew install at `/opt/homebrew`, baked `.rodata` paths (e.g. perl's `@INC`) resolve into the real Homebrew because the compat symlink can't exist — fixing that needs the `/opt/nb` short-prefix rewrite on macOS plus re-codesigning, tracked as follow-up work.
+- **Download retry classification hardened (#314)** — a transient failure during the GHCR token fetch no longer turns into a permanent `AuthFailed` (the 401-with-no-token case is now retried, re-fetching the token each attempt); `isRetryable` switched from `else => true` to an explicit transient whitelist, so deterministic failures (OOM, bad paths, rename `AccessDenied`, checksum mismatch) stop wasting 2 retries + 750 ms of backoff; a path-format failure after a successful download no longer drops the started telemetry event.
+- **Parallel downloads of the same blob no longer corrupt each other (#314)** — two workers fetching the same sha shared one tmp path (`<sha>.dl`) and interleaved writes surfaced as a hard `ChecksumMismatch`; tmp files now carry a per-worker pid+tid suffix with the same atomic rename (first writer wins), and failed renames clean up their tmp file.
+- **Env-shim kegs no longer relink on every install (#314)** — kegs linked through wrapper shims in global mode (e.g. git, whose wrapper sets `GIT_EXEC_PATH`) permanently failed `needsLinkRepair`'s check because the link targets `.nb-wrappers/…`, not the keg binary, so every `nb install` run relinked the whole keg. The repair check now mirrors the linker's env-shim detection and compares against the wrapper target it actually creates.
+
+### Added
+- **`scripts/bottles/nb_bottles.py` + `manage.md` + `bottles.yml` workflow** — nanobrew's own GHCR bottle registry (`ghcr.io/justrach/nb-bottles/<name>`): Tier-1 digest-preserving mirror of the pinned `homebrew_bottle` registry entries (instant OCI cross-repo mounts), Tier-2 repackaging of `github_release` binaries into bottles, publish/verify/record management verbs, and a weekly CI mirror cron. Consumed via `NANOBREW_BOTTLE_DOMAIN` or per-package registry records; verified end-to-end (anonymous pulls, digest match with Homebrew's pins, real `nb install` from the mirror).
+- **37 new verified-upstream packages with pinned bottle digests for all four platforms** — bash, zsh, nginx, qemu, colima, postgresql@14/16/18, mysql, node@24, rustup, gradle, poetry, fastlane, tailscale, mkcert, sops, gitleaks, httpie, eza, btop, direnv, aria2, rsync, telnet, automake, expat, lcov, composer, ghostscript, hexyl, kubeconform, xclogparser, xcresultparser, flyctl, whisper-cpp, and summarize — mirrored into the embedded default registry.
+
+## [0.1.197] - 2026-06-12
+
+### Performance
+- **`nb outdated` ~1,170x faster (3,640 ms → 3.1 ms), `nb leaves` ~1,140x faster (4,690 ms → 4.1 ms), `nb search` ~30x faster (93 ms → 3.1 ms)** — a TSV index sidecar (`name`, `version`, `desc`, plus entry byte offsets) is built once per bulk-list cache refresh (1h TTL) and replaces both the per-installed-package API round trips (`outdated`/`upgrade` checks, `leaves`) and the 46 MB JSON re-scan per `search`. Packages outside the bulk lists (taps, upstream-only) still use the parallel per-name fetch fallback.
+- **Cold dependency resolution ~7x faster (1,077 ms → 150 ms for ffmpeg's graph)** — formula and cask metadata fetches slice the package's full API object out of the fresh bulk cache via one `pread` (using the sidecar's byte offsets) instead of a network round trip, then warm the per-name cache. `nb install` resolve, `nb info`, and the upstream freshness checks all ride this path; outputs verified byte-identical to network fetches.
+
+### Added
+- **`nb switch <pkg>@<version>`** — reactivate a previously-installed version. Instant when the keg is still in the Cellar (switch keeps the outgoing version on disk, unlike `rollback`); otherwise re-materializes from the content-addressed store, and suggests `nb install pkg@version` when the payload is gone. `nb list --versions` shows each package's install history with the switchable versions marked.
+
+### Fixed
+- **Failed installs no longer leave phantom DB entries, and downloads retry transient failures** — a package whose download/extract failed used to be recorded in the database at its declared version, tripping `nb doctor` and blocking reinstalls. Installs now only record kegs that actually landed in the Cellar, bottle downloads retry network blips/5xx/429 with linear backoff (checksum mismatches and 404/auth are not retried), and the install summary prints *why* each package failed instead of a bare ✗. (#311)
+- **Intel casks read `version` from the same arch `variations` block as `url`/`sha256`** — previously the root (arm64) version leaked into artifact paths on Intel, breaking Caskroom paths and symlinks for casks like `gcc-arm-embedded`; the root version baked into artifact paths is rewritten (token-bounded) to the arch version. (#307)
+- **Casks with `using: :post` download correctly** — `url_specs` (`data:`, `referer:`, `user_agent:`, `cookies:`, `header:`) are parsed and replayed, so license-gated casks like `segger-jlink` get the real payload instead of an HTML page that fails the checksum. (#305)
+- **Stale verified-upstream pins no longer downgrade installs** — the registry pin is cross-checked against the live Homebrew API and the newer version wins (falling back to the pin offline); `python3` resolves 3.14.5 instead of the embedded 3.14.4, `claude-code` resolves latest instead of 2.1.109. Opt out with `NANOBREW_DISABLE_UPSTREAM_FRESHNESS=1`. The registry itself is refreshable via `nb update` / `nb update-registry`. (#308, #310)
+- **`bin.install` parsing is strict** — `bin.install_symlink` is no longer mistaken for `bin.install`, and non-literal arguments (`#{version}` interpolation, `Dir[...]` globs, keg-rooted paths) drop the declared-binaries list so the source build keeps its generic whole-payload copy instead of failing.
+- **Interrupted cask installs are only re-adopted at the exact on-disk version** — adoption no longer records the API's current version for a payload installed at an older one, which froze `nb upgrade` on a stale app. (#302 follow-up)
+
+### CI
+- **`zig build test` now actually runs `search.zig`'s tests** — the root test aggregation was silently skipping them; they're included, and the search/bulk-index tests run in CI.
+
+## [0.1.196] - 2026-06-02
+
+### Performance
+- **Cask DMG mount ~23x faster on cold mounts** — `hdiutil attach` now runs with `-noverify -noautofsck -readonly`. The download path already SHA256-verifies the DMG bytes, so hdiutil's per-attach checksum was duplicate work that dominated cold-mount time on large DMGs (the deficits called out in #259: `bruno` -2123 ms, `raycast` -1858 ms, `orbstack` -691 ms). Measured on a 350 MB DMG: cold mount went 4983 ms → 215 ms. `hdiutil detach` also gets `-force` so a stuck handle on the mount can't hang cleanup. Refs #259.
+- **DMG detach no longer blocks install return** — `hdiutil detach` is now spawned in the background and not awaited. The volume unmounts while `nb` is already returning to the user; the kernel reaps the still-running child on `nb` exit. Eliminates a 200–500 ms stall from the `cleanup` phase on every DMG cask.
+- **Quarantine clear uses `removexattr(2)` directly on the non-recursive path** — the .dmg and .pkg quarantine-removal paths used to fork+exec `/usr/bin/xattr -p` to probe and then `/usr/bin/xattr -d` to remove, a 2-subprocess pattern that fired up to four times per cask. Replaced with a direct `removexattr` syscall, with the recursive .app path keeping the subprocess but dropping the redundant probe. Cuts ~40–60 ms per DMG cask off the `mount_dmg` and `artifacts` phases.
+- **Batch installs share one HTTP client and GHCR token** — install workers now borrow a batch-wide `std.http.Client` (one TLS connection pool, no per-package handshake) and a single anonymous GHCR pull token fetched once per batch. The 16-slot install window also reclaims any finished worker slot instead of always joining the oldest, so a long source build scheduled first no longer stalls the pipeline. (#36)
+
+### Fixed
+- **Tap formulas with `def install / bin.install` now symlink correctly** — `parseRubyFormula` now extracts binaries named in a Ruby `def install` block and surfaces them via `Formula.install_binaries`. Previously, prebuilt-tarball tap formulas (e.g. `neurosnap/tap/zmx`, `steipete/tap/sag`) installed into the keg root with no `prefix/bin` symlink, so the binary was missing from `PATH`. Source-build now feeds these names through `installDeclaredBinaries` into `keg/bin/`, where the existing linker picks them up. (#286)
+- **Casks installed via `nb bundle install` were missing from `nb list`** — the install now persists the database after each cask, and a cask whose payload is already on disk (e.g. from an interrupted run) is re-adopted into the database instead of silently skipped, so `nb list`, `nb bundle dump`, and `nb upgrade` stay in sync with the Caskroom. (#302)
+- **Casks delivered via a `suite`/`artifact` stanza (e.g. KiCad) now install correctly** — the cask parser handles `suite` and `artifact` artifacts (previously dropped), `/Applications` payloads are copied and de-quarantined like `app` artifacts, and a `binary` symlink is no longer created when its source is absent — so a failed cask reports an error instead of falsely succeeding with broken symlinks. (#303)
+
+## [0.1.195] - 2026-06-02
+
+### Added
+- **`nb install <pkg>@<version>`** — versioned installs resolved from GHCR/OCI bottle tags, with automatic pinning and an "offer latest" fallback when the requested version has no bottle for the current platform. (#300)
+
+### Fixed
+- **Post-install SIGSEGV on versioned install** — the daily update check now runs on a dedicated single-threaded HTTP client and `nb` exits cleanly, eliminating the crash during runtime teardown. (#298)
+- **Relocate literal Homebrew paths in Mach-O binaries** — embedded `/opt/homebrew` and `/usr/local` paths are rewritten so relocated kegs work outside the default prefix, fixing packages such as imagemagick and libheif. (#297)
+- **Misnamed binary inside release tarballs** — the notarize/packaging step stages the binary as `nb`, and the install / `nb update` paths fall back to an `nb-<arch>` entry when present. (#293, #296)
+- **Linker shim promotion** — kegs that ship `libexec/git-core` are auto-promoted to a shim wrapper.
+
+### Performance
+- **GHCR pull token fetched once per versioned install** — a single anonymous pull token is reused across tag listing, manifest, and blob download, removing two cold round-trips per versioned install.
+
+### Docs
+- Documented the package-manager CLI policy in the upstream registry docs. (#253)
+
+## [0.1.194] - 2026-05-25
+
+### Fixed
+- Tap symlink creation, the update banner, the `git` shim, and Linux CI. (#292)
+- `nb update` now falls back to curl/wget for the SHA256 download when the primary fetch fails.
+
+## [0.1.193] - 2026-05-11
+
+### Added
+- **`nb cleanup --prune-kegs`** — new flag that drops phantom DB entries pointing at kegs that no longer exist on disk, with a hint when the 256-entry batch cap is hit so users know to re-run. (#279)
 - **Verified upstream speed registry path** — nanobrew can now resolve selected formulae and casks from a curated verified upstream registry before falling back to Homebrew metadata. GitHub Release formulae install through the native source-archive path with declared binary artifacts, Homebrew bottle formula locks install through the native bottle path, and GitHub/vendor casks reuse the native cask install pipeline. The registry is loaded from a local cache, then the hosted registry, then the embedded fallback.
 - **Seeded upstream coverage** — embedded registry now includes 256 formula records (GitHub Release binaries, resolved vendor binaries, and generated Homebrew bottle locks) and 103 cask records. The current registry covers 100/100 Homebrew top formulae and 100/100 top casks for the April 25, 2026 analytics snapshot.
 - **Programmatic upstream seeding tools** — added seeders for popular formulae and casks using Homebrew analytics, Homebrew bottle URL/SHA locks, dependency lists, optional formula dependency-closure seeding, GitHub release assets, pinned vendor URLs, direct binary downloads, checksums, platform matching, binary-only cask handling, Caskroom-relative binary normalization, cask binary target preservation, and artifact inference.
@@ -38,6 +222,21 @@ All notable changes to nanobrew are documented here.
 - **Formula seeder no longer misses single-file release archives** — release assets containing one top-level binary, such as `starship`, are preserved instead of being mistaken for a common root directory. The seeder also avoids auto-promoting platform-suffixed single binaries such as `yq_darwin_arm64` until formula artifact target names are supported.
 - **Already-installed formula installs avoid full relocation work** — no-op `nb install` runs now check whether public links need repair before relinking, instead of rerunning relocation, text placeholder scans, framework sealing, and link writes for every installed dependency.
 - **Relocated-store reinstalls preserve actual bottle revision directories** — fast reinstalls now detect the real version directory from the raw store entry before cloning a relocated snapshot, fixing packages whose formula version differs from the bottle directory, such as `yt-dlp` `2026.3.17_1`.
+- **`nb remove --deb` is now cwd-independent** — deb removal stores absolute paths in `state.json`, and tolerates older databases that recorded relative paths by prepending `/` when reading. Previously, removing from a directory other than `/` would silently no-op.
+- **Process-wide threadsafe Io accessor** — call sites that previously reached for `std.Io.Threaded.global_single_threaded.io()` now share a process-wide threadsafe accessor seeded from `main`, fixing intermittent races during parallel extract/store operations. The default initializer falls back to the singleton so tests and pre-`main` use still see a valid Io.
+- **Five correctness fixes in the apt-replacement path**, including: native xz decompression that releases its `Decompress` buffer through `deinit` rather than the original pointer; threading the caller's `Io` into postinst execution so subprocess spawns use the initialized IO instead of the failing global allocator; serialized `patchelf` auto-install across parallel workers; an `apt-get update` before patchelf auto-install; and repair of literal `/home/linuxbrew/` paths plus a symlinked `etc/` for #269.
+- **DB parser partial-allocation leaks** — `pushHistory`, the DB parser, and several install paths now cascade-free already-successful dupes when a later step fails, preventing slow leaks during retries.
+- **`@@HOMEBREW_*@@` relocation for files >1 MiB and locale directories** — the placeholder rewriter no longer skips large files or locale subtrees that previously slipped through.
+- **`nb upgrade` rejects unknown flags and uninstalled package names** instead of silently no-op'ing.
+- **`nb services list` memory leaks plugged**.
+- **`nb install` thread io through the install path** to fix Linux `CopyFailed` (#276).
+- **HTTP User-Agent override** — nanobrew now overrides Zig's default User-Agent instead of appending to it, so requests no longer leak `zig/0.16.0 (std.http)` to upstreams (#258).
+
+### Known issues
+- **`nb install --deb` exits with status 139 (SIGSEGV) on Linux even though files install correctly** — pre-existing since v0.1.190 and tracked under CI's `continue-on-error: true # Known Zig std.http.Client + musl TLS segfault`. The crash is in runtime/libc teardown after `main()` returns; install/extract/postinst all complete and files are present on disk. Reproducible cleanly under Apple `container`; usually masked in `tests/deb-parity.sh` by piping `nb` output through `tail`, which absorbs the signal. Tracked as a release-blocker for the next cycle. Workaround for Dockerfile users: pipe through `tail` or wrap in `( … ) || true` so a downstream `RUN` step doesn't fail.
+
+### Release artifacts
+- **macOS arm64 + x86_64 tarballs are signed (Developer ID Application: Rachit Pradhan, WWP9DLJ27P), hardened-runtime, and notarized via Apple's notary service.** Notary submission IDs `aa0dfb8f-47d1-4079-bff4-4907352cc116` (arm64) and `782b6fa4-03e5-4e50-8b95-2a95d75abc0c` (x86_64). Gatekeeper fetches the notarization ticket online on first run, so browser downloads no longer prompt as "unidentified developer".
 
 ### Coverage Planning
 - **Top-100 formula and cask coverage completed** — generated and curated resolved records move formulae from 11/100 to 100/100 covered and casks from 18/100 to 100/100 covered. The latest local coverage run reports 5,125,336 / 5,125,336 formula installs and 1,609,375 / 1,609,375 cask installs covered in the top-100 30-day analytics sets.
