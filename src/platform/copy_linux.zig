@@ -147,7 +147,10 @@ fn makePathAbsolute(io: std.Io, abs: []const u8) !void {
     };
 }
 
-// Smoke-tested end-to-end via tests/copy-tree-smoke.sh, which exercises
-// copyTree against real bottle layouts. Inline tests are skipped because
-// the repo's existing test harness on Linux requires libc linkage that
-// is configured per-build, not per-test.
+// Runtime-verified on Debian 13 (overlayfs root): a real `nb install` was
+// run with /usr/bin/cp removed so the subprocess fallback could not mask
+// walker failures, then each keg was diffed against its store-relocated
+// source tree (contents, permission bits, and symlink targets all
+// identical). Overlayfs rejects FICLONE, so that run exercised the
+// copyFile fallback path; FICLONE itself is a straight ioctl with the
+// kernel-stable request number above.
