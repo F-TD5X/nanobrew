@@ -311,8 +311,11 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
         } else {
             // No short prefix available (e.g. non-root upgrade of an old
             // install): PREFIX/CELLAR can't shrink in place — fall back to
-            // patchelf for rpath/needed/interp on this file.
+            // patchelf for rpath/needed/interp on this file. .rodata
+            // placeholders stay foreign either way, so record the file as
+            // incompletely relocated (#355/#356).
             needs_patchelf = true;
+            short.noteIncompleteFile();
         }
     }
 

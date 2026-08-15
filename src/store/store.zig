@@ -113,14 +113,31 @@ pub fn removeEntry(io: std.Io, sha256: []const u8) void {
 // already-processed tree into store-relocated/<sha256>/ so subsequent reinstalls
 // can skip both text-scan and install_name_tool entirely.
 
-/// Check if a post-relocation snapshot exists for this blob.
+/// Relocation schema stamped into every snapshot. Bump when the relocation
+/// pipeline changes in a way that invalidates previously saved snapshots.
+/// v2: /opt/nb whole-file byte pass required, completeness-gated saves,
+/// static-archive relocation (#355/#356/#357) — pre-v2 snapshots (no marker)
+/// may contain foreign-prefix payloads and are treated as absent, so the
+/// next reinstall re-relocates and re-snapshots.
+const RELOCATED_SCHEMA = "2";
+pub const RELOCATED_SCHEMA_FILE = ".nb-relocated-schema";
+
+/// Check if a *valid* post-relocation snapshot exists for this blob: the
+/// directory must exist and carry the current relocation schema marker.
 pub fn hasRelocatedEntry(io: std.Io, sha256: []const u8) bool {
     if (!isValidSha256(sha256)) return false;
 
-    var buf: [512]u8 = undefined;
-    const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ STORE_RELOCATED_DIR, sha256 }) catch return false;
-    std.Io.Dir.accessAbsolute(io, p, .{}) catch return false;
-    return true;
+    var buf: [600]u8 = undefined;
+    const marker = std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ STORE_RELOCATED_DIR, sha256, RELOCATED_SCHEMA_FILE }) catch return false;
+    const file = std.Io.Dir.openFileAbsolute(io, marker, .{}) catch return false;
+    var content: [16]u8 = undefined;
+    const n = file.readPositionalAll(io, &content, 0) catch {
+        file.close(io);
+        return false;
+    };
+    file.close(io);
+    const schema = std.mem.trim(u8, content[0..n], " \t\r\n");
+    return std.mem.eql(u8, schema, RELOCATED_SCHEMA);
 }
 
 /// Snapshot the already-relocated keg from Cellar into store-relocated/<sha256>/.
@@ -142,7 +159,11 @@ pub fn saveRelocatedEntry(io: std.Io, sha256: []const u8, name: []const u8, vers
 
     // Already saved (concurrent installs, or we're upgrading)
     if (std.Io.Dir.accessAbsolute(io, dest_dir, .{})) {
-        return; // already exists, nothing to do
+        // Valid current-schema snapshot: nothing to do. A marker-less or
+        // old-schema snapshot may hold foreign-prefix payload — replace it
+        // with the freshly relocated keg instead of keeping it forever (#356).
+        if (hasRelocatedEntry(io, sha256)) return;
+        std.Io.Dir.cwd().deleteTree(io, dest_dir) catch return error.StaleSnapshotRemovalFailed;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -160,6 +181,22 @@ pub fn saveRelocatedEntry(io: std.Io, sha256: []const u8, name: []const u8, vers
         // required under Zig 0.16 (see issue #276).
         try copy.cpFallback(io, src_dir, dest_dir);
     }
+
+    // Stamp the relocation schema so hasRelocatedEntry can reject snapshots
+    // produced by older/incompatible relocation pipelines (#356). A snapshot
+    // without a readable marker is worse than none, so delete it on failure.
+    writeSchemaMarker(io, dest_dir) catch |err| {
+        std.Io.Dir.cwd().deleteTree(io, dest_dir) catch {};
+        return err;
+    };
+}
+
+fn writeSchemaMarker(io: std.Io, dest_dir: []const u8) !void {
+    var marker_buf: [600]u8 = undefined;
+    const marker = std.fmt.bufPrint(&marker_buf, "{s}/{s}", .{ dest_dir, RELOCATED_SCHEMA_FILE }) catch return error.PathTooLong;
+    const file = try std.Io.Dir.createFileAbsolute(io, marker, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, RELOCATED_SCHEMA ++ "\n");
 }
 
 /// Materialize a package from store-relocated/<sha256>/ into Cellar/<name>/<version>/.
@@ -195,6 +232,12 @@ pub fn materializeFromRelocated(io: std.Io, sha256: []const u8, name: []const u8
     if (!copy.cloneTree(&src_buf, &dest_buf)) {
         try copy.cpFallback(io, src_dir, dest_dir);
     }
+
+    // The schema marker is snapshot bookkeeping — keep it out of the keg.
+    var marker_buf: [600]u8 = undefined;
+    if (std.fmt.bufPrint(&marker_buf, "{s}/{s}", .{ dest_dir, RELOCATED_SCHEMA_FILE })) |marker| {
+        std.Io.Dir.deleteFileAbsolute(io, marker) catch {};
+    } else |_| {}
 }
 
 /// Return store-relocated path for an entry.

@@ -1479,6 +1479,12 @@ fn fullInstallOne(
             nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
                 stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
             };
+            // Cached reinstalls must still produce health evidence (#356).
+            const fast_probe_passed = probeInstalledFormula(alloc, null, f.name, expected_ver, f.install_binaries, .active);
+            probe_result.* = if (fast_probe_passed) .passed else .failed;
+            if (!fast_probe_passed) {
+                stderr.print("nb: {s}: post-install probe warning: declared binaries or linked executables missing\n", .{f.name}) catch {};
+            }
             phase.store(@intFromEnum(Phase.done), .release);
             return;
         }
@@ -1577,6 +1583,14 @@ fn fullInstallOne(
             nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
                 stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
             };
+            // Cached reinstalls must still produce health evidence — a
+            // poisoned or drifted snapshot otherwise sails through with a
+            // 179ms "✓" and no probe at all (#356).
+            const fast_probe_passed = probeInstalledFormula(alloc, null, f.name, fv, f.install_binaries, .active);
+            probe_result.* = if (fast_probe_passed) .passed else .failed;
+            if (!fast_probe_passed) {
+                stderr.print("nb: {s}: post-install probe warning: declared binaries or linked executables missing\n", .{f.name}) catch {};
+            }
             if (bench) std.debug.print("[nb-bench] {s} postinstall: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
             phase.store(@intFromEnum(Phase.done), .release);
             return;
@@ -1597,6 +1611,7 @@ fn fullInstallOne(
     var ver_buf: [256]u8 = undefined;
     const actual_ver = nb.cellar.detectKegVersion(f.name, expected_ver, &ver_buf) orelse expected_ver;
     if (bench) bench_t = milliTimestamp();
+    platform.relocate.short.resetIncompleteCount();
     platform.relocate.relocateKeg(alloc, g_io, f.name, actual_ver) catch |err| {
         stderr.print("nb: {s}: relocate failed: {}\n", .{ f.name, err }) catch {};
         fail_reason.* = "relocate failed";
@@ -1604,6 +1619,22 @@ fn fullInstallOne(
         phase.store(@intFromEnum(Phase.failed), .release);
         return;
     };
+    // Known-incomplete relocation must fail the package instead of warning
+    // and continuing: a keg whose loadable files keep foreign runtime paths
+    // silently borrows Homebrew's modules when both managers are installed,
+    // or breaks outright when they aren't (#355). Failing here also keeps
+    // the keg out of the relocated-snapshot cache (#356).
+    if (platform.relocate.short.incompleteCount() > 0) {
+        stderr.print(
+            "nb: {s}: {d} file(s) kept foreign runtime paths because the /opt/nb short-prefix symlink is unavailable; run `sudo nb init`, then reinstall\n",
+            .{ f.name, platform.relocate.short.incompleteCount() },
+        ) catch {};
+        nb.cellar.remove(f.name, actual_ver) catch {};
+        fail_reason.* = "incomplete relocation (run `sudo nb init` and retry)";
+        had_error.store(true, .release);
+        phase.store(@intFromEnum(Phase.failed), .release);
+        return;
+    }
     if (bench) {
         std.debug.print("[nb-bench] {s} relocate: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
         bench_t = milliTimestamp();

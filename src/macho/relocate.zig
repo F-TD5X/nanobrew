@@ -394,6 +394,10 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     file.close(io);
     file_open = false;
     warnNoShortPrefix(io);
+    // Whatever the fallback fixes (load commands at most), the .rodata
+    // compile-time paths in this file stay foreign — record it so the
+    // install is neither snapshot-cached nor reported successful (#355/#356).
+    short.noteIncompleteFile();
     // Only the byte pass can rewrite ar members; install_name_tool cannot.
     // Without /opt/nb the archive is left as-is, like .rodata (#357).
     if (is_archive) return false;
