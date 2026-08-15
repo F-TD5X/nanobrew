@@ -989,6 +989,10 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     defer alloc.free(probe_results);
     @memset(probe_results, .not_run);
     stdout.print("==> Downloading + installing {d} packages...\n", .{pkg_count}) catch {};
+    // Remembered past the pipeline block so the process can exit nonzero when
+    // any package failed (#361: `nb install` used to report failure text but
+    // still exit 0).
+    var pipeline_failed = false;
     {
         // Allocate per-package phase tracking
         const phases = alloc.alloc(std.atomic.Value(u8), pkg_count) catch {
@@ -1116,6 +1120,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         }
 
         if (had_error.load(.acquire)) {
+            pipeline_failed = true;
             stderr.print("nb: some packages failed to install\n", .{}) catch {};
             // Re-print which packages failed so the user sees them after progress display
             for (names, 0..) |name, i| {
@@ -1211,6 +1216,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     const elapsed_ns: u64 = timer.read();
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
     stdout.print("==> Done in {d:.1}ms\n", .{elapsed_ms}) catch {};
+    if (pipeline_failed) std.process.exit(1);
 }
 
 /// Render live progress UI with spinners and checkmarks.
@@ -1612,7 +1618,7 @@ fn fullInstallOne(
         bench_t = milliTimestamp();
     }
     // Save post-relocation snapshot so future reinstalls skip steps 4/4b/4c (~1500ms → ~10ms)
-    const relocated_cache_key = if (is_source_build and f.install_binaries.len > 0 and nb.store.isValidSha256(f.source_sha256))
+    const relocated_cache_key = if (is_source_build and (f.install_binaries.len > 0 or f.install_bin_renames.len > 0) and nb.store.isValidSha256(f.source_sha256))
         f.source_sha256
     else
         f.bottle_sha256;

@@ -6,6 +6,14 @@
 const std = @import("std");
 
 pub const Formula = struct {
+    /// Static capture of `bin.install Dir["<glob>"].first => "<dest>"` tap
+    /// install lines (#361): the glob is applied to the staged payload at
+    /// source-install time and the first match lands as bin/<dest>.
+    pub const BinRename = struct {
+        pattern: []const u8,
+        dest: []const u8,
+    };
+
     name: []const u8,
     version: []const u8,
     revision: u32 = 0,
@@ -18,8 +26,13 @@ pub const Formula = struct {
     bottle_sha256: []const u8 = "",
     source_url: []const u8 = "",
     source_sha256: []const u8 = "",
+    /// Tap `url ..., using: :nounzip` (#361): the source download is a raw
+    /// file (usually a prebuilt executable), not an archive — stage it under
+    /// its upstream basename instead of extracting.
+    source_nounzip: bool = false,
     build_deps: []const []const u8 = &.{},
     install_binaries: []const []const u8 = &.{},
+    install_bin_renames: []const BinRename = &.{},
     caveats: []const u8 = "",
     post_install_defined: bool = false,
     /// True when this metadata came from a revoked registry pin's fallback
@@ -58,6 +71,11 @@ pub const Formula = struct {
         alloc.free(self.source_sha256);
         for (self.install_binaries) |bin| alloc.free(bin);
         if (self.install_binaries.len > 0) alloc.free(self.install_binaries);
+        for (self.install_bin_renames) |r| {
+            alloc.free(r.pattern);
+            alloc.free(r.dest);
+        }
+        if (self.install_bin_renames.len > 0) alloc.free(self.install_bin_renames);
         alloc.free(self.caveats);
     }
 

@@ -305,6 +305,17 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
     // literal. Partial capture is worse than none: source.zig only runs the
     // generic whole-payload copy when install_binaries is empty.
     var bin_install_unparseable: bool = false;
+    // `bin.install Dir["<glob>"].first => "<dest>"` captures (#361).
+    var bin_renames: std.ArrayList(Formula.BinRename) = .empty;
+    defer {
+        for (bin_renames.items) |r| {
+            alloc.free(r.pattern);
+            alloc.free(r.dest);
+        }
+        bin_renames.deinit(alloc);
+    }
+    // `url ..., using: :nounzip` — raw file download, no extraction (#361).
+    var source_nounzip: bool = false;
 
     // Track block nesting for on_macos/on_linux/bottle/test
     var in_bottle: bool = false;
@@ -346,6 +357,10 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
                         const bin_name = maybe_name orelse break;
                         try install_bins.append(alloc, try alloc.dupe(u8, bin_name));
                     },
+                    .glob_rename => |gr| try bin_renames.append(alloc, .{
+                        .pattern = try alloc.dupe(u8, gr.pattern),
+                        .dest = try alloc.dupe(u8, gr.dest),
+                    }),
                     .unparseable => bin_install_unparseable = true,
                     .none => {},
                 }
@@ -502,9 +517,19 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
                     const bin_name = maybe_name orelse break;
                     try install_bins.append(alloc, try alloc.dupe(u8, bin_name));
                 },
+                .glob_rename => |gr| try bin_renames.append(alloc, .{
+                    .pattern = try alloc.dupe(u8, gr.pattern),
+                    .dest = try alloc.dupe(u8, gr.dest),
+                }),
                 .unparseable => bin_install_unparseable = true,
                 .none => {},
             }
+        }
+
+        // `using: :nounzip` marks the source url as a raw file (#361). It can
+        // sit on the url line itself or on a continuation line right below it.
+        if (std.mem.indexOf(u8, line, "using: :nounzip") != null) {
+            source_nounzip = true;
         }
     }
 
@@ -542,6 +567,11 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
     if (bin_install_unparseable) {
         for (install_bins.items) |b| alloc.free(b);
         install_bins.clearRetainingCapacity();
+        for (bin_renames.items) |r| {
+            alloc.free(r.pattern);
+            alloc.free(r.dest);
+        }
+        bin_renames.clearRetainingCapacity();
     }
 
     return .{
@@ -550,11 +580,13 @@ pub fn parseRubyFormula(alloc: std.mem.Allocator, name: []const u8, src: []const
         .desc = try alloc.dupe(u8, desc orelse ""),
         .source_url = resolved_url,
         .source_sha256 = resolved_sha,
+        .source_nounzip = source_nounzip,
         .bottle_url = b_url,
         .bottle_sha256 = b_sha,
         .dependencies = try deps.toOwnedSlice(alloc),
         .build_deps = try build_deps.toOwnedSlice(alloc),
         .install_binaries = try install_bins.toOwnedSlice(alloc),
+        .install_bin_renames = try bin_renames.toOwnedSlice(alloc),
     };
 }
 
@@ -633,11 +665,18 @@ const BinInstallParse = union(enum) {
     none,
     /// Plain string-literal names, in order; trailing entries are null.
     names: [8]?[]const u8,
+    /// `bin.install Dir["<glob>"].first => "<dest>"` — a payload-rooted glob
+    /// whose first match is installed under a new name (#361). Resolved at
+    /// source-install time against the staged files.
+    glob_rename: struct {
+        pattern: []const u8,
+        dest: []const u8,
+    },
     /// The directive has arguments we cannot resolve statically
-    /// (`#{version}` interpolation, `Dir[...]` globs, keg-path prefixes like
-    /// `libexec/"x"`). The caller must NOT trust any partial capture — the
-    /// safe behavior is to drop all declared binaries for the formula so the
-    /// source-build path keeps its generic whole-payload copy.
+    /// (`#{version}` interpolation, unsupported `Dir[...]` shapes, keg-path
+    /// prefixes like `libexec/"x"`). The caller must NOT trust any partial
+    /// capture — the safe behavior is to drop all declared binaries for the
+    /// formula so the source-build path keeps its generic whole-payload copy.
     unparseable,
 };
 
@@ -650,6 +689,35 @@ fn extractBinInstallNames(line: []const u8) BinInstallParse {
     const install_idx = std.mem.indexOf(u8, line, ".install") orelse return .none;
     var rest = std.mem.trimStart(u8, line[install_idx + ".install".len ..], " \t");
     if (rest.len > 0 and rest[0] == '(') rest = std.mem.trimStart(u8, rest[1..], " \t");
+
+    // `bin.install Dir["<glob>"].first => "<dest>"` (#361): raw-asset tap
+    // formulas rename the single downloaded file. Only this exact shape is
+    // resolved; any other Dir[...] expression stays unparseable.
+    if (std.mem.startsWith(u8, rest, "Dir[")) {
+        var r = rest["Dir[".len..];
+        if (r.len == 0 or (r[0] != '"' and r[0] != '\'')) return .unparseable;
+        const gq = r[0];
+        const gclose = std.mem.indexOfScalar(u8, r[1..], gq) orelse return .unparseable;
+        const pattern = r[1 .. 1 + gclose];
+        if (pattern.len == 0 or std.mem.indexOf(u8, pattern, "#{") != null) return .unparseable;
+        r = std.mem.trimStart(u8, r[1 + gclose + 1 ..], " \t");
+        if (!std.mem.startsWith(u8, r, "]")) return .unparseable;
+        r = std.mem.trimStart(u8, r[1..], " \t");
+        if (!std.mem.startsWith(u8, r, ".first")) return .unparseable;
+        r = std.mem.trimStart(u8, r[".first".len..], " \t");
+        if (!std.mem.startsWith(u8, r, "=>")) return .unparseable;
+        r = std.mem.trimStart(u8, r[2..], " \t");
+        if (r.len == 0 or (r[0] != '"' and r[0] != '\'')) return .unparseable;
+        const dq = r[0];
+        const dclose = std.mem.indexOfScalar(u8, r[1..], dq) orelse return .unparseable;
+        const dest = r[1 .. 1 + dclose];
+        if (dest.len == 0 or std.mem.indexOf(u8, dest, "#{") != null) return .unparseable;
+        if (std.mem.indexOfScalar(u8, dest, '*') != null) return .unparseable;
+        r = std.mem.trimStart(u8, r[1 + dclose + 1 ..], " \t");
+        if (r.len > 0 and r[0] == ')') r = std.mem.trimStart(u8, r[1..], " \t");
+        if (r.len > 0 and r[0] != '#') return .unparseable;
+        return .{ .glob_rename = .{ .pattern = pattern, .dest = dest } };
+    }
 
     var result: [8]?[]const u8 = @splat(null);
     var count: usize = 0;
@@ -1237,6 +1305,60 @@ test "extractBinInstallNames - non-literal args are unparseable, not partially c
     try testing.expect(extractBinInstallNames("bin.install libexec/\"x\"") == .unparseable);
     // bare expression
     try testing.expect(extractBinInstallNames("bin.install some_var") == .unparseable);
+}
+
+test "extractBinInstallNames - Dir glob rename resolves statically (#361)" {
+    const r = extractBinInstallNames("bin.install Dir[\"omp-*\"].first => \"omp\"");
+    try testing.expect(r == .glob_rename);
+    try testing.expectEqualStrings("omp-*", r.glob_rename.pattern);
+    try testing.expectEqualStrings("omp", r.glob_rename.dest);
+}
+
+test "extractBinInstallNames - Dir glob without .first rename stays unparseable (#361)" {
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"omp-*\"]") == .unparseable);
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"omp-*\"].first") == .unparseable);
+    try testing.expect(extractBinInstallNames("bin.install Dir[\"omp-#{version}-*\"].first => \"omp\"") == .unparseable);
+}
+
+test "parseRubyFormula - using: :nounzip with Dir glob rename (#361)" {
+    const src =
+        \\class Omp < Formula
+        \\  desc "Oh My Posh fork"
+        \\  version "17.1.6"
+        \\  url "https://github.com/can1357/oh-my-pi/releases/download/v#{version}/omp-darwin-arm64",
+        \\      using: :nounzip
+        \\  sha256 "6c0c45af6c8c566ce28370c8570d9a709713277fad5420b44161e26a3d07be5d"
+        \\
+        \\  def install
+        \\    bin.install Dir["omp-*"].first => "omp"
+        \\  end
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "omp", src);
+    defer f.deinit(testing.allocator);
+    try testing.expect(f.source_nounzip);
+    try testing.expectEqualStrings(
+        "https://github.com/can1357/oh-my-pi/releases/download/v17.1.6/omp-darwin-arm64",
+        f.source_url,
+    );
+    try testing.expectEqual(@as(usize, 0), f.install_binaries.len);
+    try testing.expectEqual(@as(usize, 1), f.install_bin_renames.len);
+    try testing.expectEqualStrings("omp-*", f.install_bin_renames[0].pattern);
+    try testing.expectEqualStrings("omp", f.install_bin_renames[0].dest);
+}
+
+test "parseRubyFormula - archive formulas keep source_nounzip false" {
+    const src =
+        \\class Plain < Formula
+        \\  version "1.0"
+        \\  url "https://example.com/plain-1.0.tar.gz"
+        \\  sha256 "abc"
+        \\end
+    ;
+    const f = try parseRubyFormula(testing.allocator, "plain", src);
+    defer f.deinit(testing.allocator);
+    try testing.expect(!f.source_nounzip);
+    try testing.expectEqual(@as(usize, 0), f.install_bin_renames.len);
 }
 
 test "parseRubyFormula - unparseable bin.install clears install_binaries so generic copy runs" {
