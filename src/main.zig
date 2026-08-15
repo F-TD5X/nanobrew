@@ -2232,10 +2232,47 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb info ──
 
-fn probeExecutableCommand(alloc: std.mem.Allocator, stdout: ?StdoutWriter, owner: []const u8, path: []const u8, session: *nb.trust_probe.Session) bool {
-    if (session.executableAnswers(alloc, path)) return true;
-    if (stdout) |out| out.print("  ✗ {s}: binary did not answer within the package-wide 2s probe budget: {s}\n", .{ owner, path }) catch {};
-    return false;
+/// Package-wide active-probe budget: bounds total probe wall time per keg.
+const PROBE_PACKAGE_BUDGET: std.Io.Clock.Duration = .{
+    .raw = std.Io.Duration.fromSeconds(10),
+    .clock = .awake,
+};
+/// Per-executable slice so one interactive tool can't starve the rest (#317).
+const PROBE_BINARY_BUDGET: std.Io.Clock.Duration = .{
+    .raw = std.Io.Duration.fromSeconds(2),
+    .clock = .awake,
+};
+
+const ExecProbeOutcome = enum { answered, unresponsive, skipped };
+const ExecProbeSeverity = enum { fail, warn };
+
+fn probeExecutableCommand(
+    alloc: std.mem.Allocator,
+    stdout: ?StdoutWriter,
+    owner: []const u8,
+    path: []const u8,
+    session: *nb.trust_probe.Session,
+    severity: ExecProbeSeverity,
+) ExecProbeOutcome {
+    // Restricted login shells never answer argv probes (#317 field note).
+    if (nb.trust_probe.isInteractiveShellLike(std.fs.path.basename(path))) {
+        if (stdout) |out| out.print("  - {s}: skipped interactive shell: {s}\n", .{ owner, path }) catch {};
+        return .skipped;
+    }
+    switch (session.probe(alloc, path)) {
+        .answered => return .answered,
+        .budget_exhausted => {
+            if (stdout) |out| out.print("  - {s}: package probe budget exhausted; skipped: {s}\n", .{ owner, path }) catch {};
+            return .skipped;
+        },
+        .unresponsive => {
+            switch (severity) {
+                .fail => if (stdout) |out| out.print("  ✗ {s}: binary did not answer within its 2s probe slice: {s}\n", .{ owner, path }) catch {},
+                .warn => if (stdout) |out| out.print("  ! {s}: discovered binary did not answer (informational): {s}\n", .{ owner, path }) catch {},
+            }
+            return .unresponsive;
+        },
+    }
 }
 
 fn verifyCaskSignature(alloc: std.mem.Allocator, stdout: ?StdoutWriter, token: []const u8, app_path: []const u8, session: *nb.trust_probe.Session) bool {
@@ -2311,10 +2348,7 @@ fn probeInstalledCask(
     var ok = true;
     var active_checks: usize = 0;
     var active_session: ?nb.trust_probe.Session = if (mode == .active)
-        nb.trust_probe.Session.init(g_io, .{
-            .raw = std.Io.Duration.fromSeconds(2),
-            .clock = .awake,
-        }) catch return false
+        nb.trust_probe.Session.init(g_io, PROBE_PACKAGE_BUDGET, PROBE_BINARY_BUDGET) catch return false
     else
         null;
     defer if (active_session) |*session| session.deinit();
@@ -2375,9 +2409,15 @@ fn probeInstalledCask(
             continue;
         };
         if (mode == .active) {
-            active_checks += 1;
             if (active_session) |*session| {
-                if (!probeExecutableCommand(alloc, stdout, cask.token, target, session)) ok = false;
+                switch (probeExecutableCommand(alloc, stdout, cask.token, target, session, .fail)) {
+                    .answered => active_checks += 1,
+                    .unresponsive => {
+                        active_checks += 1;
+                        ok = false;
+                    },
+                    .skipped => {},
+                }
             } else {
                 ok = false;
             }
@@ -2405,10 +2445,7 @@ fn probeInstalledFormula(
     var ok = true;
     var active_checks: usize = 0;
     var active_session: ?nb.trust_probe.Session = if (mode == .active)
-        nb.trust_probe.Session.init(g_io, .{
-            .raw = std.Io.Duration.fromSeconds(2),
-            .clock = .awake,
-        }) catch return false
+        nb.trust_probe.Session.init(g_io, PROBE_PACKAGE_BUDGET, PROBE_BINARY_BUDGET) catch return false
     else
         null;
     defer if (active_session) |*session| session.deinit();
@@ -2430,6 +2467,12 @@ fn probeInstalledFormula(
                 if (stdout) |out| out.print("  ✗ {s}: declared binary not executable: {s}\n", .{ name, cellar_bin }) catch {};
                 ok = false;
             };
+            // Leftover @@HOMEBREW_*@@ tokens mean an unrecognized placeholder
+            // survived relocation (e.g. the pre-fix @@HOMEBREW_JAVA@@, #358).
+            if (platform.relocate.placeholder.fileContainsPlaceholder(cellar_bin)) {
+                if (stdout) |out| out.print("  ✗ {s}: unreplaced @@HOMEBREW_*@@ placeholder in {s}\n", .{ name, cellar_bin }) catch {};
+                ok = false;
+            }
             var linked_buf: [512]u8 = undefined;
             const linked = std.fmt.bufPrint(&linked_buf, "{s}/bin/{s}", .{ PREFIX, base }) catch {
                 ok = false;
@@ -2446,9 +2489,17 @@ fn probeInstalledFormula(
                 continue;
             }
             if (mode == .active) {
-                active_checks += 1;
                 if (active_session) |*session| {
-                    if (!probeExecutableCommand(alloc, stdout, name, cellar_bin, session)) ok = false;
+                    // Declared binaries are the formula's own contract — an
+                    // unresponsive one fails the package.
+                    switch (probeExecutableCommand(alloc, stdout, name, cellar_bin, session, .fail)) {
+                        .answered => active_checks += 1,
+                        .unresponsive => {
+                            active_checks += 1;
+                            ok = false;
+                        },
+                        .skipped => {},
+                    }
                 } else {
                     ok = false;
                 }
@@ -2458,6 +2509,12 @@ fn probeInstalledFormula(
         // No declared binaries in metadata: discover executable files in keg/bin
         // and verify any that exist are linked. Library-only kegs can pass the
         // structural check, but cannot produce active executable evidence.
+        // Verdict policy (#317): discovered extras that don't answer are
+        // warnings only — perl ships interactive utilities (cpan, instmodsh)
+        // that never answer argv probes even on a healthy install. The package
+        // fails when the primary binary (basename == formula name) is
+        // unresponsive, or when nothing probed answers at all.
+        var any_answered = false;
         var bin_buf: [512]u8 = undefined;
         const bin_dir = std.fmt.bufPrint(&bin_buf, "{s}/bin", .{keg_dir}) catch return false;
         if (std.Io.Dir.openDirAbsolute(g_io, bin_dir, .{ .iterate = true })) |d| {
@@ -2469,6 +2526,10 @@ fn probeInstalledFormula(
                 var keg_bin_buf: [512]u8 = undefined;
                 const keg_bin = std.fmt.bufPrint(&keg_bin_buf, "{s}/{s}", .{ bin_dir, entry.name }) catch continue;
                 std.Io.Dir.accessAbsolute(g_io, keg_bin, .{ .execute = true }) catch continue;
+                if (platform.relocate.placeholder.fileContainsPlaceholder(keg_bin)) {
+                    if (stdout) |out| out.print("  ✗ {s}: unreplaced @@HOMEBREW_*@@ placeholder in {s}\n", .{ name, keg_bin }) catch {};
+                    ok = false;
+                }
                 var linked_buf: [512]u8 = undefined;
                 const linked = std.fmt.bufPrint(&linked_buf, "{s}/bin/{s}", .{ PREFIX, entry.name }) catch {
                     ok = false;
@@ -2485,15 +2546,31 @@ fn probeInstalledFormula(
                     continue;
                 }
                 if (mode == .active) {
-                    active_checks += 1;
                     if (active_session) |*session| {
-                        if (!probeExecutableCommand(alloc, stdout, name, keg_bin, session)) ok = false;
+                        const is_primary = std.mem.eql(u8, entry.name, name);
+                        const severity: ExecProbeSeverity = if (is_primary) .fail else .warn;
+                        switch (probeExecutableCommand(alloc, stdout, name, keg_bin, session, severity)) {
+                            .answered => {
+                                active_checks += 1;
+                                any_answered = true;
+                            },
+                            .unresponsive => {
+                                active_checks += 1;
+                                if (is_primary) ok = false;
+                            },
+                            .skipped => {},
+                        }
                     } else {
                         ok = false;
                     }
                 }
             }
         } else |_| {}
+
+        if (mode == .active and active_checks > 0 and !any_answered) {
+            if (stdout) |out| out.print("  ✗ {s}: no probed executable answered\n", .{name}) catch {};
+            ok = false;
+        }
     }
 
     if (mode == .active and active_checks == 0) {
