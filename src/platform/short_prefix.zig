@@ -80,6 +80,25 @@ pub fn ensureShortPrefixLink(io: std.Io) bool {
     return false;
 }
 
+/// Per-thread count of files whose relocation was knowingly left incomplete
+/// because /opt/nb was unavailable (.rodata fallback, skipped static
+/// archives). Each install worker relocates its keg on one thread, so
+/// main.zig brackets relocateKeg with reset/read to decide whether the keg
+/// may be snapshot-cached or reported as successfully installed (#355/#356).
+threadlocal var incomplete_file_count: usize = 0;
+
+pub fn resetIncompleteCount() void {
+    incomplete_file_count = 0;
+}
+
+pub fn incompleteCount() usize {
+    return incomplete_file_count;
+}
+
+pub fn noteIncompleteFile() void {
+    incomplete_file_count += 1;
+}
+
 /// Overwrite every occurrence of `needle` in `data` with `replacement`,
 /// padding the freed tail bytes with '/' so the total byte length is
 /// unchanged. `replacement.len` must be <= `needle.len`. The '/' padding is

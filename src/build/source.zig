@@ -24,6 +24,45 @@ fn archiveSuffixFromUrl(url: []const u8) []const u8 {
     return ".tar.gz";
 }
 
+/// Upstream basename of a download URL (query string stripped). Raw
+/// `using: :nounzip` assets are staged under this name so formula install
+/// globs like `Dir["omp-*"]` match (#361).
+fn urlBasename(url: []const u8) []const u8 {
+    const path = blk: {
+        if (std.mem.indexOfScalar(u8, url, '?')) |q| break :blk url[0..q];
+        break :blk url;
+    };
+    const base = std.fs.path.basename(path);
+    return if (base.len > 0) base else "payload";
+}
+
+/// Minimal shell-style glob: `*` matches any run, `?` any single byte.
+/// Enough for the `Dir["name-*"]` patterns tap formulas use.
+fn globMatch(pattern: []const u8, name: []const u8) bool {
+    var p: usize = 0;
+    var n: usize = 0;
+    var star: ?usize = null;
+    var mark: usize = 0;
+    while (n < name.len) {
+        if (p < pattern.len and (pattern[p] == '?' or pattern[p] == name[n])) {
+            p += 1;
+            n += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            mark = n;
+            p += 1;
+        } else if (star) |s| {
+            p = s + 1;
+            mark += 1;
+            n = mark;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
 const BuildSystem = enum {
     cmake,
     autotools,
@@ -49,11 +88,17 @@ pub fn buildFromSource(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !
     if (formula.source_url.len == 0) return error.NoSourceUrl;
 
     // 1. Download source archive (extension follows URL — .tar.xz, .zip, etc.; #112)
+    // `using: :nounzip` downloads are raw files, so the cache entry keeps the
+    // upstream basename instead of a fabricated archive suffix (#361).
     var tarball_buf: [512]u8 = undefined;
-    const arc_suffix = archiveSuffixFromUrl(formula.source_url);
-    const tarball_path = std.fmt.bufPrint(&tarball_buf, "{s}/{s}-{s}{s}", .{
-        CACHE_TMP, formula.name, formula.version, arc_suffix,
-    }) catch return error.PathTooLong;
+    const tarball_path = if (formula.source_nounzip)
+        std.fmt.bufPrint(&tarball_buf, "{s}/{s}-{s}-{s}", .{
+            CACHE_TMP, formula.name, formula.version, urlBasename(formula.source_url),
+        }) catch return error.PathTooLong
+    else
+        std.fmt.bufPrint(&tarball_buf, "{s}/{s}-{s}{s}", .{
+            CACHE_TMP, formula.name, formula.version, archiveSuffixFromUrl(formula.source_url),
+        }) catch return error.PathTooLong;
 
     std.Io.Dir.createDirAbsolute(lib_io, CACHE_TMP, .default_dir) catch {};
 
@@ -113,12 +158,23 @@ pub fn buildFromSource(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !
         CACHE_TMP, formula.name, formula.version,
     }) catch return error.PathTooLong;
 
-    printOut(lib_io, "==> Extracting source...\n", .{});
     // Clean previous build dir
     std.Io.Dir.cwd().deleteTree(lib_io, build_dir) catch {};
     std.Io.Dir.createDirAbsolute(lib_io, build_dir, .default_dir) catch {};
 
-    {
+    if (formula.source_nounzip) {
+        // Raw asset: stage it under its upstream basename, no extraction (#361).
+        printOut(lib_io, "==> Staging raw asset...\n", .{});
+        var staged_buf: [1024]u8 = undefined;
+        const staged_path = std.fmt.bufPrint(&staged_buf, "{s}/{s}", .{
+            build_dir, urlBasename(formula.source_url),
+        }) catch return error.PathTooLong;
+        std.Io.Dir.copyFileAbsolute(tarball_path, staged_path, lib_io, .{}) catch |err| {
+            printErr(lib_io, "nb: staging raw asset failed: {}\n", .{err});
+            return error.ExtractFailed;
+        };
+    } else {
+        printOut(lib_io, "==> Extracting source...\n", .{});
         const argv: []const []const u8 = if (std.mem.endsWith(u8, tarball_path, ".zip"))
             &.{ "unzip", "-q", tarball_path, "-d", build_dir }
         else
@@ -184,7 +240,7 @@ pub fn buildFromSource(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !
             try runBuildCmd(alloc, lib_io, src_root, &.{ "make", std.fmt.allocPrint(alloc, "PREFIX={s}", .{keg_path}) catch return error.OutOfMemory, "install" });
         },
         .unknown => {
-            if (formula.install_binaries.len > 0) {
+            if (formula.install_binaries.len > 0 or formula.install_bin_renames.len > 0) {
                 try installDeclaredBinaries(alloc, lib_io, src_root, keg_path, formula);
                 printOut(lib_io, "==> Installed declared upstream binaries for {s}\n", .{formula.name});
                 std.Io.Dir.cwd().deleteTree(lib_io, build_dir) catch {};
@@ -372,6 +428,87 @@ fn installDeclaredBinaries(
         std.Io.Dir.copyFileAbsolute(src_path, dst_path, lib_io, .{}) catch return error.InstallBinaryFailed;
         runCommand(lib_io, .inherit, &.{ "chmod", "+x", dst_path }) catch return error.InstallBinaryFailed;
     }
+
+    // `bin.install Dir["<glob>"].first => "<dest>"` (#361): install the first
+    // staged file matching the glob under the destination name.
+    for (formula.install_bin_renames) |rename| {
+        if (rename.dest.len == 0 or rename.dest[0] == '/' or std.mem.indexOf(u8, rename.dest, "..") != null) {
+            return error.InvalidBinaryArtifact;
+        }
+        if (rename.pattern.len == 0 or rename.pattern[0] == '/' or std.mem.indexOf(u8, rename.pattern, "..") != null) {
+            return error.InvalidBinaryArtifact;
+        }
+        // Directory components in the pattern must be literal; only the
+        // basename is globbed.
+        const dir_part = std.fs.path.dirname(rename.pattern);
+        const base_pattern = std.fs.path.basename(rename.pattern);
+        if (dir_part) |d| {
+            if (std.mem.indexOfScalar(u8, d, '*') != null or std.mem.indexOfScalar(u8, d, '?') != null) {
+                return error.InvalidBinaryArtifact;
+            }
+        }
+
+        var search_buf: [1024]u8 = undefined;
+        const search_dir = if (dir_part) |d|
+            std.fmt.bufPrint(&search_buf, "{s}/{s}", .{ src_root, d }) catch return error.PathTooLong
+        else
+            src_root;
+
+        var matched = false;
+        var dir = std.Io.Dir.openDirAbsolute(lib_io, search_dir, .{ .iterate = true }) catch
+            return error.InstallBinaryFailed;
+        var iter = dir.iterate();
+        while (iter.next(lib_io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!globMatch(base_pattern, entry.name)) continue;
+
+            var src_buf: [1024]u8 = undefined;
+            const src_path = std.fmt.bufPrint(&src_buf, "{s}/{s}", .{ search_dir, entry.name }) catch {
+                dir.close(lib_io);
+                return error.PathTooLong;
+            };
+            var dst_buf: [1024]u8 = undefined;
+            const dst_path = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ bin_dir, rename.dest }) catch {
+                dir.close(lib_io);
+                return error.PathTooLong;
+            };
+            std.Io.Dir.copyFileAbsolute(src_path, dst_path, lib_io, .{}) catch {
+                dir.close(lib_io);
+                return error.InstallBinaryFailed;
+            };
+            runCommand(lib_io, .inherit, &.{ "chmod", "+x", dst_path }) catch {
+                dir.close(lib_io);
+                return error.InstallBinaryFailed;
+            };
+            matched = true;
+            break;
+        }
+        dir.close(lib_io);
+        if (!matched) {
+            printErr(lib_io, "nb: no staged file matches install glob '{s}'\n", .{rename.pattern});
+            return error.InstallBinaryFailed;
+        }
+    }
+}
+
+const testing = std.testing;
+
+test "globMatch - prefix wildcard matches raw asset name (#361)" {
+    try testing.expect(globMatch("omp-*", "omp-darwin-arm64"));
+    try testing.expect(!globMatch("omp-*", "other-darwin-arm64"));
+    try testing.expect(globMatch("*", "anything"));
+    try testing.expect(globMatch("a?c", "abc"));
+    try testing.expect(!globMatch("a?c", "abbc"));
+    try testing.expect(globMatch("pre-*-post", "pre-middle-post"));
+    try testing.expect(!globMatch("pre-*-post", "pre-middle-past"));
+}
+
+test "urlBasename - strips query and keeps upstream file name (#361)" {
+    try testing.expectEqualStrings(
+        "omp-darwin-arm64",
+        urlBasename("https://github.com/can1357/oh-my-pi/releases/download/v17.1.6/omp-darwin-arm64"),
+    );
+    try testing.expectEqualStrings("asset", urlBasename("https://example.com/asset?sig=abc"));
 }
 
 fn runCommand(lib_io: std.Io, cwd: std.process.Child.Cwd, argv: []const []const u8) !void {

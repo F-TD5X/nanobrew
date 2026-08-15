@@ -6,6 +6,14 @@
 const std = @import("std");
 
 pub const Formula = struct {
+    /// Static capture of `bin.install Dir["<glob>"].first => "<dest>"` tap
+    /// install lines (#361): the glob is applied to the staged payload at
+    /// source-install time and the first match lands as bin/<dest>.
+    pub const BinRename = struct {
+        pattern: []const u8,
+        dest: []const u8,
+    };
+
     name: []const u8,
     version: []const u8,
     revision: u32 = 0,
@@ -18,8 +26,13 @@ pub const Formula = struct {
     bottle_sha256: []const u8 = "",
     source_url: []const u8 = "",
     source_sha256: []const u8 = "",
+    /// Tap `url ..., using: :nounzip` (#361): the source download is a raw
+    /// file (usually a prebuilt executable), not an archive — stage it under
+    /// its upstream basename instead of extracting.
+    source_nounzip: bool = false,
     build_deps: []const []const u8 = &.{},
     install_binaries: []const []const u8 = &.{},
+    install_bin_renames: []const BinRename = &.{},
     caveats: []const u8 = "",
     post_install_defined: bool = false,
     /// True when this metadata came from a revoked registry pin's fallback
@@ -30,8 +43,14 @@ pub const Formula = struct {
     /// Effective Cellar version including the formula revision suffix.
     /// Bottle rebuilds identify bottle artifacts but do not change the Cellar path.
     /// e.g. "3.1.0" or "3.1.0_1" if revision > 0
+    /// Idempotent: some registry pins capture the keg version with the
+    /// revision suffix already baked in (e.g. "1.29.0_2" with revision 2);
+    /// appending again would name a keg dir the bottle does not contain (#354).
     pub fn effectiveVersion(self: *const Formula, buf: []u8) []const u8 {
         if (self.revision > 0) {
+            var suffix_buf: [16]u8 = undefined;
+            const suffix = std.fmt.bufPrint(&suffix_buf, "_{d}", .{self.revision}) catch return self.version;
+            if (std.mem.endsWith(u8, self.version, suffix)) return self.version;
             return std.fmt.bufPrint(buf, "{s}_{d}", .{ self.version, self.revision }) catch self.version;
         }
         return self.version;
@@ -52,6 +71,11 @@ pub const Formula = struct {
         alloc.free(self.source_sha256);
         for (self.install_binaries) |bin| alloc.free(bin);
         if (self.install_binaries.len > 0) alloc.free(self.install_binaries);
+        for (self.install_bin_renames) |r| {
+            alloc.free(r.pattern);
+            alloc.free(r.dest);
+        }
+        if (self.install_bin_renames.len > 0) alloc.free(self.install_bin_renames);
         alloc.free(self.caveats);
     }
 
@@ -127,6 +151,22 @@ test "effectiveVersion - revision appends suffix" {
     var buf: [128]u8 = undefined;
     const v = f.effectiveVersion(&buf);
     try testing.expectEqualStrings("1.4rc5_2", v);
+}
+
+test "effectiveVersion - pre-suffixed version is not doubled (#354)" {
+    // Registry pins like rustup store resolved.version "1.29.0_2" while also
+    // carrying revision 2; the keg dir inside the bottle is "1.29.0_2".
+    const f = Formula{ .name = "rustup", .version = "1.29.0_2", .revision = 2 };
+    var buf: [128]u8 = undefined;
+    const v = f.effectiveVersion(&buf);
+    try testing.expectEqualStrings("1.29.0_2", v);
+}
+
+test "effectiveVersion - dotted tail is not mistaken for a revision suffix" {
+    const f = Formula{ .name = "example", .version = "1.2", .revision = 2 };
+    var buf: [128]u8 = undefined;
+    const v = f.effectiveVersion(&buf);
+    try testing.expectEqualStrings("1.2_2", v);
 }
 
 test "effectiveVersion - bottle rebuild does not change Cellar version" {

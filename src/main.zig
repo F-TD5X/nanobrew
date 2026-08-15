@@ -154,7 +154,7 @@ fn milliTimestamp() i64 {
 
 const ROOT = paths.ROOT;
 const PREFIX = paths.PREFIX;
-const VERSION = "0.1.206";
+const VERSION = "0.1.207";
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
@@ -989,6 +989,10 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     defer alloc.free(probe_results);
     @memset(probe_results, .not_run);
     stdout.print("==> Downloading + installing {d} packages...\n", .{pkg_count}) catch {};
+    // Remembered past the pipeline block so the process can exit nonzero when
+    // any package failed (#361: `nb install` used to report failure text but
+    // still exit 0).
+    var pipeline_failed = false;
     {
         // Allocate per-package phase tracking
         const phases = alloc.alloc(std.atomic.Value(u8), pkg_count) catch {
@@ -1116,6 +1120,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
         }
 
         if (had_error.load(.acquire)) {
+            pipeline_failed = true;
             stderr.print("nb: some packages failed to install\n", .{}) catch {};
             // Re-print which packages failed so the user sees them after progress display
             for (names, 0..) |name, i| {
@@ -1211,6 +1216,7 @@ fn runInstall(alloc: std.mem.Allocator, args: []const []const u8) void {
     const elapsed_ns: u64 = timer.read();
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
     stdout.print("==> Done in {d:.1}ms\n", .{elapsed_ms}) catch {};
+    if (pipeline_failed) std.process.exit(1);
 }
 
 /// Render live progress UI with spinners and checkmarks.
@@ -1473,6 +1479,12 @@ fn fullInstallOne(
             nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
                 stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
             };
+            // Cached reinstalls must still produce health evidence (#356).
+            const fast_probe_passed = probeInstalledFormula(alloc, null, f.name, expected_ver, f.install_binaries, .active);
+            probe_result.* = if (fast_probe_passed) .passed else .failed;
+            if (!fast_probe_passed) {
+                stderr.print("nb: {s}: post-install probe warning: declared binaries or linked executables missing\n", .{f.name}) catch {};
+            }
             phase.store(@intFromEnum(Phase.done), .release);
             return;
         }
@@ -1571,6 +1583,14 @@ fn fullInstallOne(
             nb.postinstall.runPostInstall(alloc, g_io, f) catch |err| {
                 stderr.print("nb: {s}: post-install warning: {}\n", .{ f.name, err }) catch {};
             };
+            // Cached reinstalls must still produce health evidence — a
+            // poisoned or drifted snapshot otherwise sails through with a
+            // 179ms "✓" and no probe at all (#356).
+            const fast_probe_passed = probeInstalledFormula(alloc, null, f.name, fv, f.install_binaries, .active);
+            probe_result.* = if (fast_probe_passed) .passed else .failed;
+            if (!fast_probe_passed) {
+                stderr.print("nb: {s}: post-install probe warning: declared binaries or linked executables missing\n", .{f.name}) catch {};
+            }
             if (bench) std.debug.print("[nb-bench] {s} postinstall: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
             phase.store(@intFromEnum(Phase.done), .release);
             return;
@@ -1591,6 +1611,7 @@ fn fullInstallOne(
     var ver_buf: [256]u8 = undefined;
     const actual_ver = nb.cellar.detectKegVersion(f.name, expected_ver, &ver_buf) orelse expected_ver;
     if (bench) bench_t = milliTimestamp();
+    platform.relocate.short.resetIncompleteCount();
     platform.relocate.relocateKeg(alloc, g_io, f.name, actual_ver) catch |err| {
         stderr.print("nb: {s}: relocate failed: {}\n", .{ f.name, err }) catch {};
         fail_reason.* = "relocate failed";
@@ -1598,12 +1619,28 @@ fn fullInstallOne(
         phase.store(@intFromEnum(Phase.failed), .release);
         return;
     };
+    // Known-incomplete relocation must fail the package instead of warning
+    // and continuing: a keg whose loadable files keep foreign runtime paths
+    // silently borrows Homebrew's modules when both managers are installed,
+    // or breaks outright when they aren't (#355). Failing here also keeps
+    // the keg out of the relocated-snapshot cache (#356).
+    if (platform.relocate.short.incompleteCount() > 0) {
+        stderr.print(
+            "nb: {s}: {d} file(s) kept foreign runtime paths because the /opt/nb short-prefix symlink is unavailable; run `sudo nb init`, then reinstall\n",
+            .{ f.name, platform.relocate.short.incompleteCount() },
+        ) catch {};
+        nb.cellar.remove(f.name, actual_ver) catch {};
+        fail_reason.* = "incomplete relocation (run `sudo nb init` and retry)";
+        had_error.store(true, .release);
+        phase.store(@intFromEnum(Phase.failed), .release);
+        return;
+    }
     if (bench) {
         std.debug.print("[nb-bench] {s} relocate: {d}ms\n", .{ f.name, milliTimestamp() - bench_t });
         bench_t = milliTimestamp();
     }
     // 4b. Replace @@HOMEBREW_*@@ placeholders in text files (shebangs, scripts, configs)
-    platform.relocate.replaceKegPlaceholders(g_io, f.name, actual_ver);
+    platform.relocate.replaceKegPlaceholders(g_io, f.name, actual_ver, f.dependencies);
     // 4c. Re-seal framework bundles AFTER every file mutation so the
     //     sealed-resource signature matches the final on-disk state.
     platform.relocate.sealKegBundles(alloc, g_io, f.name, actual_ver);
@@ -1612,7 +1649,7 @@ fn fullInstallOne(
         bench_t = milliTimestamp();
     }
     // Save post-relocation snapshot so future reinstalls skip steps 4/4b/4c (~1500ms → ~10ms)
-    const relocated_cache_key = if (is_source_build and f.install_binaries.len > 0 and nb.store.isValidSha256(f.source_sha256))
+    const relocated_cache_key = if (is_source_build and (f.install_binaries.len > 0 or f.install_bin_renames.len > 0) and nb.store.isValidSha256(f.source_sha256))
         f.source_sha256
     else
         f.bottle_sha256;
@@ -2226,10 +2263,47 @@ fn runLeaves(alloc: std.mem.Allocator, args: []const []const u8) void {
 
 // ── nb info ──
 
-fn probeExecutableCommand(alloc: std.mem.Allocator, stdout: ?StdoutWriter, owner: []const u8, path: []const u8, session: *nb.trust_probe.Session) bool {
-    if (session.executableAnswers(alloc, path)) return true;
-    if (stdout) |out| out.print("  ✗ {s}: binary did not answer within the package-wide 2s probe budget: {s}\n", .{ owner, path }) catch {};
-    return false;
+/// Package-wide active-probe budget: bounds total probe wall time per keg.
+const PROBE_PACKAGE_BUDGET: std.Io.Clock.Duration = .{
+    .raw = std.Io.Duration.fromSeconds(10),
+    .clock = .awake,
+};
+/// Per-executable slice so one interactive tool can't starve the rest (#317).
+const PROBE_BINARY_BUDGET: std.Io.Clock.Duration = .{
+    .raw = std.Io.Duration.fromSeconds(2),
+    .clock = .awake,
+};
+
+const ExecProbeOutcome = enum { answered, unresponsive, skipped };
+const ExecProbeSeverity = enum { fail, warn };
+
+fn probeExecutableCommand(
+    alloc: std.mem.Allocator,
+    stdout: ?StdoutWriter,
+    owner: []const u8,
+    path: []const u8,
+    session: *nb.trust_probe.Session,
+    severity: ExecProbeSeverity,
+) ExecProbeOutcome {
+    // Restricted login shells never answer argv probes (#317 field note).
+    if (nb.trust_probe.isInteractiveShellLike(std.fs.path.basename(path))) {
+        if (stdout) |out| out.print("  - {s}: skipped interactive shell: {s}\n", .{ owner, path }) catch {};
+        return .skipped;
+    }
+    switch (session.probe(alloc, path)) {
+        .answered => return .answered,
+        .budget_exhausted => {
+            if (stdout) |out| out.print("  - {s}: package probe budget exhausted; skipped: {s}\n", .{ owner, path }) catch {};
+            return .skipped;
+        },
+        .unresponsive => {
+            switch (severity) {
+                .fail => if (stdout) |out| out.print("  ✗ {s}: binary did not answer within its 2s probe slice: {s}\n", .{ owner, path }) catch {},
+                .warn => if (stdout) |out| out.print("  ! {s}: discovered binary did not answer (informational): {s}\n", .{ owner, path }) catch {},
+            }
+            return .unresponsive;
+        },
+    }
 }
 
 fn verifyCaskSignature(alloc: std.mem.Allocator, stdout: ?StdoutWriter, token: []const u8, app_path: []const u8, session: *nb.trust_probe.Session) bool {
@@ -2305,10 +2379,7 @@ fn probeInstalledCask(
     var ok = true;
     var active_checks: usize = 0;
     var active_session: ?nb.trust_probe.Session = if (mode == .active)
-        nb.trust_probe.Session.init(g_io, .{
-            .raw = std.Io.Duration.fromSeconds(2),
-            .clock = .awake,
-        }) catch return false
+        nb.trust_probe.Session.init(g_io, PROBE_PACKAGE_BUDGET, PROBE_BINARY_BUDGET) catch return false
     else
         null;
     defer if (active_session) |*session| session.deinit();
@@ -2369,9 +2440,15 @@ fn probeInstalledCask(
             continue;
         };
         if (mode == .active) {
-            active_checks += 1;
             if (active_session) |*session| {
-                if (!probeExecutableCommand(alloc, stdout, cask.token, target, session)) ok = false;
+                switch (probeExecutableCommand(alloc, stdout, cask.token, target, session, .fail)) {
+                    .answered => active_checks += 1,
+                    .unresponsive => {
+                        active_checks += 1;
+                        ok = false;
+                    },
+                    .skipped => {},
+                }
             } else {
                 ok = false;
             }
@@ -2399,10 +2476,7 @@ fn probeInstalledFormula(
     var ok = true;
     var active_checks: usize = 0;
     var active_session: ?nb.trust_probe.Session = if (mode == .active)
-        nb.trust_probe.Session.init(g_io, .{
-            .raw = std.Io.Duration.fromSeconds(2),
-            .clock = .awake,
-        }) catch return false
+        nb.trust_probe.Session.init(g_io, PROBE_PACKAGE_BUDGET, PROBE_BINARY_BUDGET) catch return false
     else
         null;
     defer if (active_session) |*session| session.deinit();
@@ -2424,6 +2498,12 @@ fn probeInstalledFormula(
                 if (stdout) |out| out.print("  ✗ {s}: declared binary not executable: {s}\n", .{ name, cellar_bin }) catch {};
                 ok = false;
             };
+            // Leftover @@HOMEBREW_*@@ tokens mean an unrecognized placeholder
+            // survived relocation (e.g. the pre-fix @@HOMEBREW_JAVA@@, #358).
+            if (platform.relocate.placeholder.fileContainsPlaceholder(cellar_bin)) {
+                if (stdout) |out| out.print("  ✗ {s}: unreplaced @@HOMEBREW_*@@ placeholder in {s}\n", .{ name, cellar_bin }) catch {};
+                ok = false;
+            }
             var linked_buf: [512]u8 = undefined;
             const linked = std.fmt.bufPrint(&linked_buf, "{s}/bin/{s}", .{ PREFIX, base }) catch {
                 ok = false;
@@ -2440,9 +2520,17 @@ fn probeInstalledFormula(
                 continue;
             }
             if (mode == .active) {
-                active_checks += 1;
                 if (active_session) |*session| {
-                    if (!probeExecutableCommand(alloc, stdout, name, cellar_bin, session)) ok = false;
+                    // Declared binaries are the formula's own contract — an
+                    // unresponsive one fails the package.
+                    switch (probeExecutableCommand(alloc, stdout, name, cellar_bin, session, .fail)) {
+                        .answered => active_checks += 1,
+                        .unresponsive => {
+                            active_checks += 1;
+                            ok = false;
+                        },
+                        .skipped => {},
+                    }
                 } else {
                     ok = false;
                 }
@@ -2452,6 +2540,12 @@ fn probeInstalledFormula(
         // No declared binaries in metadata: discover executable files in keg/bin
         // and verify any that exist are linked. Library-only kegs can pass the
         // structural check, but cannot produce active executable evidence.
+        // Verdict policy (#317): discovered extras that don't answer are
+        // warnings only — perl ships interactive utilities (cpan, instmodsh)
+        // that never answer argv probes even on a healthy install. The package
+        // fails when the primary binary (basename == formula name) is
+        // unresponsive, or when nothing probed answers at all.
+        var any_answered = false;
         var bin_buf: [512]u8 = undefined;
         const bin_dir = std.fmt.bufPrint(&bin_buf, "{s}/bin", .{keg_dir}) catch return false;
         if (std.Io.Dir.openDirAbsolute(g_io, bin_dir, .{ .iterate = true })) |d| {
@@ -2463,6 +2557,10 @@ fn probeInstalledFormula(
                 var keg_bin_buf: [512]u8 = undefined;
                 const keg_bin = std.fmt.bufPrint(&keg_bin_buf, "{s}/{s}", .{ bin_dir, entry.name }) catch continue;
                 std.Io.Dir.accessAbsolute(g_io, keg_bin, .{ .execute = true }) catch continue;
+                if (platform.relocate.placeholder.fileContainsPlaceholder(keg_bin)) {
+                    if (stdout) |out| out.print("  ✗ {s}: unreplaced @@HOMEBREW_*@@ placeholder in {s}\n", .{ name, keg_bin }) catch {};
+                    ok = false;
+                }
                 var linked_buf: [512]u8 = undefined;
                 const linked = std.fmt.bufPrint(&linked_buf, "{s}/bin/{s}", .{ PREFIX, entry.name }) catch {
                     ok = false;
@@ -2479,14 +2577,40 @@ fn probeInstalledFormula(
                     continue;
                 }
                 if (mode == .active) {
-                    active_checks += 1;
                     if (active_session) |*session| {
-                        if (!probeExecutableCommand(alloc, stdout, name, keg_bin, session)) ok = false;
+                        const is_primary = std.mem.eql(u8, entry.name, name);
+                        const severity: ExecProbeSeverity = if (is_primary) .fail else .warn;
+                        switch (probeExecutableCommand(alloc, stdout, name, keg_bin, session, severity)) {
+                            .answered => {
+                                active_checks += 1;
+                                any_answered = true;
+                            },
+                            .unresponsive => {
+                                active_checks += 1;
+                                if (is_primary) ok = false;
+                            },
+                            .skipped => {},
+                        }
                     } else {
                         ok = false;
                     }
                 }
             }
+        } else |_| {}
+
+        if (mode == .active and active_checks > 0 and !any_answered) {
+            if (stdout) |out| out.print("  ✗ {s}: no probed executable answered\n", .{name}) catch {};
+            ok = false;
+        }
+    }
+
+    // Static archives are byte-pass relocated at install time; a remaining
+    // Homebrew prefix means the keg predates the fix or its relocation was
+    // incomplete — reinstalling repairs it (#357).
+    if (mode == .active) {
+        var lib_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&lib_buf, "{s}/lib", .{keg_dir})) |lib_dir| {
+            if (!scanStaticArchivesClean(stdout, name, lib_dir, 0)) ok = false;
         } else |_| {}
     }
 
@@ -2498,6 +2622,34 @@ fn probeInstalledFormula(
         if (stdout) |out| out.print("  ✓ {s} {s}: local probe passed\n", .{ name, version }) catch {};
     }
     return ok;
+}
+
+/// Walk `dir_path` for static .a archives and report any that still carry a
+/// foreign (Homebrew) prefix (#357). Returns false when at least one is found.
+fn scanStaticArchivesClean(stdout: ?StdoutWriter, name: []const u8, dir_path: []const u8, depth: u32) bool {
+    if (depth > 4) return true;
+    var clean = true;
+    var dir = std.Io.Dir.openDirAbsolute(g_io, dir_path, .{ .iterate = true }) catch return true;
+    defer dir.close(g_io);
+    var iter = dir.iterate();
+    while (iter.next(g_io) catch null) |entry| {
+        var child_buf: [1024]u8 = undefined;
+        const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        switch (entry.kind) {
+            .directory => {
+                if (!scanStaticArchivesClean(stdout, name, child, depth + 1)) clean = false;
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".a")) continue;
+                if (platform.relocate.placeholder.fileContainsForeignPrefix(child)) {
+                    if (stdout) |out| out.print("  ✗ {s}: static archive retains a foreign prefix (reinstall to repair): {s}\n", .{ name, child }) catch {};
+                    clean = false;
+                }
+            },
+            else => {},
+        }
+    }
+    return clean;
 }
 
 fn runInfo(alloc: std.mem.Allocator, args: []const []const u8) void {
@@ -4619,7 +4771,7 @@ fn runRollback(alloc: std.mem.Allocator, args: []const []const u8) void {
         var ver_buf: [256]u8 = undefined;
         const actual_ver = nb.cellar.detectKegVersion(name, prev.version, &ver_buf) orelse prev.version;
         platform.relocate.relocateKeg(alloc, g_io, name, actual_ver) catch {};
-        platform.relocate.replaceKegPlaceholders(g_io, name, actual_ver);
+        platform.relocate.replaceKegPlaceholders(g_io, name, actual_ver, &.{});
         platform.relocate.sealKegBundles(alloc, g_io, name, actual_ver);
         nb.linker.linkKeg(name, actual_ver) catch {};
         db.recordInstall(name, prev.version, prev.sha256) catch {};
@@ -4716,7 +4868,7 @@ fn runSwitch(alloc: std.mem.Allocator, args: []const []const u8) void {
             };
             const v = nb.cellar.detectKegVersion(name, prev.version, &ver_buf) orelse prev.version;
             platform.relocate.relocateKeg(alloc, g_io, name, v) catch {};
-            platform.relocate.replaceKegPlaceholders(g_io, name, v);
+            platform.relocate.replaceKegPlaceholders(g_io, name, v, &.{});
             platform.relocate.sealKegBundles(alloc, g_io, name, v);
             break :blk v;
         };
