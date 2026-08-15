@@ -51,6 +51,12 @@ const HOMEBREW_LITERAL_PREFIX = "/opt/homebrew/";
 const INTEL_CELLAR_LITERAL = "/usr/local/Cellar/";
 const INTEL_OPT_LITERAL = "/usr/local/opt/";
 
+/// BSD ar archive magic — static .a libraries. Their Mach-O members carry
+/// the same baked .rodata paths as dylibs, and the length-preserving byte
+/// pass is valid inside an archive too: no member offset and no symbol-table
+/// index entry ever shifts (#357).
+const AR_MAGIC = "!<arch>\n";
+
 comptime {
     if (SHORT_PREFIX_SLASH.len > HOMEBREW_LITERAL_PREFIX.len or
         SHORT_CELLAR_SLASH.len > INTEL_CELLAR_LITERAL.len or
@@ -297,14 +303,15 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
 
     // Probe magic before allocating/reading the whole file: most files under
     // lib/ are not Mach-O.
-    var magic_buf: [4]u8 = undefined;
+    var magic_buf: [8]u8 = undefined;
     const magic_n = probe.readPositional(io, &.{magic_buf[0..]}, 0) catch return false;
     if (magic_n < 4) return false;
     const magic_le = std.mem.readInt(u32, magic_buf[0..4], .little);
     const magic_be = std.mem.readInt(u32, magic_buf[0..4], .big);
     const is_macho_64 = magic_le == MH_MAGIC_64 or magic_le == MH_CIGAM_64;
     const is_fat = magic_be == FAT_MAGIC or magic_be == FAT_CIGAM;
-    if (!is_macho_64 and !is_fat) return false;
+    const is_archive = magic_n >= AR_MAGIC.len and std.mem.eql(u8, magic_buf[0..AR_MAGIC.len], AR_MAGIC);
+    if (!is_macho_64 and !is_fat and !is_archive) return false;
 
     probe.close(io);
     probe_open = false;
@@ -370,6 +377,9 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
         // relocator. Text-file shebangs/.pc are handled by the placeholder
         // walker, which skips binaries.
         if (changed) file.writePositionalAll(io, data, 0) catch return false;
+        // Static archives carry no code signature — report them unmodified so
+        // the caller's batch codesign pass skips them (#357).
+        if (is_archive) return false;
         return changed;
     }
 
@@ -384,6 +394,9 @@ fn relocateFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     file.close(io);
     file_open = false;
     warnNoShortPrefix(io);
+    // Only the byte pass can rewrite ar members; install_name_tool cannot.
+    // Without /opt/nb the archive is left as-is, like .rodata (#357).
+    if (is_archive) return false;
     if (is_macho_64) return relocateMachO64(alloc, io, path, data);
     return relocateFat(alloc, io, path, data);
 }
@@ -873,6 +886,29 @@ test "byte-pass - LIBRARY placeholder is intentionally left in place" {
     short.rewriteAllInPlace(&buf, "@@HOMEBREW_CELLAR@@", "/opt/nb/Cellar");
     try testing.expectEqual(before_len, buf.len);
     try testing.expect(std.mem.indexOf(u8, &buf, "@@HOMEBREW_LIBRARY@@") != null);
+}
+
+test "byte-pass - ar archive member paths rewritten in place, offsets preserved (#357)" {
+    // A minimal BSD ar layout: global magic, one member header (60 bytes),
+    // then member data with a baked .rodata Homebrew path. The byte pass must
+    // keep every offset identical (ar member headers and the symbol table
+    // index the file by absolute offset) and leave the magic intact.
+    var buf = ("!<arch>\n" ++
+        "libcrypto.o    0           0     0     100644  64        `\n" ++
+        "OPENSSLDIR: \"/opt/homebrew/etc/openssl@3\"\x00/usr/local/opt/x\x00").*;
+    const before_len = buf.len;
+    short.rewriteAllInPlace(&buf, HOMEBREW_LITERAL_PREFIX, SHORT_PREFIX_SLASH);
+    short.rewriteAllInPlace(&buf, INTEL_CELLAR_LITERAL, SHORT_CELLAR_SLASH);
+    short.rewriteAllInPlace(&buf, INTEL_OPT_LITERAL, SHORT_OPT_SLASH);
+    try testing.expectEqual(before_len, buf.len);
+    try testing.expect(std.mem.startsWith(u8, &buf, AR_MAGIC));
+    try testing.expect(std.mem.indexOf(u8, &buf, "libcrypto.o") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/opt/homebrew/") == null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/usr/local/opt/") == null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "/opt/nb") != null);
+    try testing.expect(std.mem.indexOf(u8, &buf, "etc/openssl@3") != null);
+    // NUL terminators inside member data stay where they were.
+    try testing.expectEqual(@as(u8, 0), buf[buf.len - 1]);
 }
 
 test "byte-pass - whole-file pass mirrors relocateFile (placeholder + literal)" {

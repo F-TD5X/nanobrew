@@ -2573,6 +2573,16 @@ fn probeInstalledFormula(
         }
     }
 
+    // Static archives are byte-pass relocated at install time; a remaining
+    // Homebrew prefix means the keg predates the fix or its relocation was
+    // incomplete — reinstalling repairs it (#357).
+    if (mode == .active) {
+        var lib_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&lib_buf, "{s}/lib", .{keg_dir})) |lib_dir| {
+            if (!scanStaticArchivesClean(stdout, name, lib_dir, 0)) ok = false;
+        } else |_| {}
+    }
+
     if (mode == .active and active_checks == 0) {
         if (stdout) |out| out.print("  ✗ {s}: no executable artifact was actively checked\n", .{name}) catch {};
         return false;
@@ -2581,6 +2591,34 @@ fn probeInstalledFormula(
         if (stdout) |out| out.print("  ✓ {s} {s}: local probe passed\n", .{ name, version }) catch {};
     }
     return ok;
+}
+
+/// Walk `dir_path` for static .a archives and report any that still carry a
+/// foreign (Homebrew) prefix (#357). Returns false when at least one is found.
+fn scanStaticArchivesClean(stdout: ?StdoutWriter, name: []const u8, dir_path: []const u8, depth: u32) bool {
+    if (depth > 4) return true;
+    var clean = true;
+    var dir = std.Io.Dir.openDirAbsolute(g_io, dir_path, .{ .iterate = true }) catch return true;
+    defer dir.close(g_io);
+    var iter = dir.iterate();
+    while (iter.next(g_io) catch null) |entry| {
+        var child_buf: [1024]u8 = undefined;
+        const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        switch (entry.kind) {
+            .directory => {
+                if (!scanStaticArchivesClean(stdout, name, child, depth + 1)) clean = false;
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".a")) continue;
+                if (platform.relocate.placeholder.fileContainsForeignPrefix(child)) {
+                    if (stdout) |out| out.print("  ✗ {s}: static archive retains a foreign prefix (reinstall to repair): {s}\n", .{ name, child }) catch {};
+                    clean = false;
+                }
+            },
+            else => {},
+        }
+    }
+    return clean;
 }
 
 fn runInfo(alloc: std.mem.Allocator, args: []const []const u8) void {

@@ -105,6 +105,38 @@ pub fn fileContainsPlaceholder(path: []const u8) bool {
     return result;
 }
 
+/// Scan a file for the foreign-prefix byte patterns the binary relocator
+/// rewrites (literal Homebrew install paths). Used by `nb doctor --probe`
+/// to flag static archives that kept Homebrew runtime paths (#357).
+pub fn fileContainsForeignPrefix(path: []const u8) bool {
+    const lib_io = paths.safe_io;
+    var file = std.Io.Dir.openFileAbsolute(lib_io, path, .{}) catch return false;
+    var buf: [65536]u8 = undefined;
+    var overlap: usize = 0;
+    var file_offset: u64 = 0;
+    const needles = [_][]const u8{ HOMEBREW_PREFIX_LITERAL, HOMEBREW_USRLOCAL_CELLAR, HOMEBREW_USRLOCAL_OPT };
+    const max_needle = HOMEBREW_USRLOCAL_CELLAR.len;
+    const result: bool = blk: {
+        while (true) {
+            if (overlap > 0) {
+                const src = buf[buf.len - overlap ..];
+                std.mem.copyForwards(u8, buf[0..overlap], src);
+            }
+            const n = file.readPositional(lib_io, &.{buf[overlap..]}, file_offset) catch break :blk false;
+            if (n == 0) break;
+            const total = overlap + n;
+            for (needles) |needle| {
+                if (std.mem.indexOf(u8, buf[0..total], needle) != null) break :blk true;
+            }
+            overlap = @min(max_needle - 1, total);
+            file_offset += @intCast(n);
+        }
+        break :blk false;
+    };
+    file.close(lib_io);
+    return result;
+}
+
 /// Replace placeholders in text config files (.pc, .cmake, .la, etc.).
 /// Size cap matches the walker's 4 MiB ceiling so any file the walker
 /// hands us is processed end-to-end. Files past 4 MiB are bounce off
@@ -552,6 +584,24 @@ test "relocateTextFile - skips empty files" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_n = tmp_dir.dir.realPathFile(testing.io, "empty", &path_buf) catch unreachable;
     try testing.expect(!relocateTextFile(testing.io, path_buf[0..path_n], null));
+}
+
+test "fileContainsForeignPrefix - detects Homebrew paths in binary payloads (#357)" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const dirty = tmp_dir.dir.createFile(testing.io, "dirty.a", .{}) catch unreachable;
+    dirty.writeStreamingAll(testing.io, "!<arch>\n\x00\x01OPENSSLDIR: \"/opt/homebrew/etc/openssl@3\"\x00") catch unreachable;
+    dirty.close(testing.io);
+    const clean = tmp_dir.dir.createFile(testing.io, "clean.a", .{}) catch unreachable;
+    clean.writeStreamingAll(testing.io, "!<arch>\n\x00\x01OPENSSLDIR: \"/opt/nb//////etc/openssl@3\"\x00") catch unreachable;
+    clean.close(testing.io);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var n = tmp_dir.dir.realPathFile(testing.io, "dirty.a", &path_buf) catch unreachable;
+    try testing.expect(fileContainsForeignPrefix(path_buf[0..n]));
+    n = tmp_dir.dir.realPathFile(testing.io, "clean.a", &path_buf) catch unreachable;
+    try testing.expect(!fileContainsForeignPrefix(path_buf[0..n]));
 }
 
 test "javaHomeForDeps - picks the formula's versioned openjdk dep (#358)" {
