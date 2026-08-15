@@ -18834,7 +18834,7 @@
         "sha256": "required"
       },
       "resolved": {
-        "version": "9.6.0_3",
+        "version": "9.6.0",
         "assets": {
           "macos-arm64": {
             "url": "https://ghcr.io/v2/homebrew/core/mysql/blobs/sha256:ee46fa8655baa8f9083df4c21098b9227ab183634c3918a9a9fe64a75e1ad92e",
@@ -19049,7 +19049,7 @@
         "sha256": "required"
       },
       "resolved": {
-        "version": "1.29.0_2",
+        "version": "1.29.0",
         "assets": {
           "macos-arm64": {
             "url": "https://ghcr.io/v2/homebrew/core/rustup/blobs/sha256:64be4eda51e96b7372ca85f1e9c224a46ed3ff45c1fd6a5f4ec75400d2123841",
@@ -19227,7 +19227,7 @@
         "sha256": "required"
       },
       "resolved": {
-        "version": "2.4_1",
+        "version": "2.4",
         "assets": {
           "macos-arm64": {
             "url": "https://ghcr.io/v2/homebrew/core/lcov/blobs/sha256:31751d5ba63f010f5ba85d996f2a487d8f66210650a95c2bd125af69cb949fc3",
@@ -19356,7 +19356,7 @@
         "sha256": "required"
       },
       "resolved": {
-        "version": "1.37.0_2",
+        "version": "1.37.0",
         "assets": {
           "macos-arm64": {
             "url": "https://ghcr.io/v2/homebrew/core/aria2/blobs/sha256:e02198308a07cc13589297bd682c0f63fe2e4ce09ff61d373696f4157eab89e5",
@@ -19727,7 +19727,7 @@
         "sha256": "required"
       },
       "resolved": {
-        "version": "3.2.4_10",
+        "version": "3.2.4",
         "assets": {
           "macos-arm64": {
             "url": "https://ghcr.io/v2/homebrew/core/httpie/blobs/sha256:31241b4a5d0d8f82bc7c27b3d1936ffa34e2a4f8416bcf93ed0d220b34d13181",
@@ -19977,7 +19977,7 @@
         "sha256": "required"
       },
       "resolved": {
-        "version": "2.4.1_3",
+        "version": "2.4.1",
         "assets": {
           "macos-arm64": {
             "url": "https://ghcr.io/v2/homebrew/core/poetry/blobs/sha256:bc72b2c982312bfeeffeb605b7187975cbe04c4d3aa9b14a577dbf7a8d8f0fae",
