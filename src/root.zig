@@ -76,6 +76,7 @@ comptime {
     _ = deb_resolver;
     _ = deb_extract;
     _ = deb_distro;
+    _ = deb_sources;
     _ = version;
     _ = trust_probe;
     _ = upstream_registry;
