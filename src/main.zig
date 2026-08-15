@@ -154,7 +154,7 @@ fn milliTimestamp() i64 {
 
 const ROOT = paths.ROOT;
 const PREFIX = paths.PREFIX;
-const VERSION = "0.1.206";
+const VERSION = "0.1.207";
 
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
