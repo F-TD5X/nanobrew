@@ -1603,7 +1603,7 @@ fn fullInstallOne(
         bench_t = milliTimestamp();
     }
     // 4b. Replace @@HOMEBREW_*@@ placeholders in text files (shebangs, scripts, configs)
-    platform.relocate.replaceKegPlaceholders(g_io, f.name, actual_ver);
+    platform.relocate.replaceKegPlaceholders(g_io, f.name, actual_ver, f.dependencies);
     // 4c. Re-seal framework bundles AFTER every file mutation so the
     //     sealed-resource signature matches the final on-disk state.
     platform.relocate.sealKegBundles(alloc, g_io, f.name, actual_ver);
@@ -4619,7 +4619,7 @@ fn runRollback(alloc: std.mem.Allocator, args: []const []const u8) void {
         var ver_buf: [256]u8 = undefined;
         const actual_ver = nb.cellar.detectKegVersion(name, prev.version, &ver_buf) orelse prev.version;
         platform.relocate.relocateKeg(alloc, g_io, name, actual_ver) catch {};
-        platform.relocate.replaceKegPlaceholders(g_io, name, actual_ver);
+        platform.relocate.replaceKegPlaceholders(g_io, name, actual_ver, &.{});
         platform.relocate.sealKegBundles(alloc, g_io, name, actual_ver);
         nb.linker.linkKeg(name, actual_ver) catch {};
         db.recordInstall(name, prev.version, prev.sha256) catch {};
@@ -4716,7 +4716,7 @@ fn runSwitch(alloc: std.mem.Allocator, args: []const []const u8) void {
             };
             const v = nb.cellar.detectKegVersion(name, prev.version, &ver_buf) orelse prev.version;
             platform.relocate.relocateKeg(alloc, g_io, name, v) catch {};
-            platform.relocate.replaceKegPlaceholders(g_io, name, v);
+            platform.relocate.replaceKegPlaceholders(g_io, name, v, &.{});
             platform.relocate.sealKegBundles(alloc, g_io, name, v);
             break :blk v;
         };

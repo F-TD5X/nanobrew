@@ -209,7 +209,9 @@ fn walkAndRelocateText(io: std.Io, dir_path: []const u8) !void {
             if (std.mem.endsWith(u8, entry.name, ext)) {
                 var path_buf: [2048]u8 = undefined;
                 const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch break;
-                _ = placeholder.relocateTextFile(io, file_path);
+                // null java_home: this supplementary pass has no formula
+                // context; the deps-aware keg pass handles @@HOMEBREW_JAVA@@.
+                _ = placeholder.relocateTextFile(io, file_path, null);
                 break;
             }
         }
@@ -226,7 +228,7 @@ fn relocateLaFiles(io: std.Io, dir_path: []const u8) !void {
         if (!std.mem.endsWith(u8, entry.name, ".la")) continue;
         var path_buf: [2048]u8 = undefined;
         const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-        _ = placeholder.relocateTextFile(io, file_path);
+        _ = placeholder.relocateTextFile(io, file_path, null);
     }
 }
 

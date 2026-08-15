@@ -57,3 +57,8 @@ pub const REAL_LIBRARY = ROOT ++ "/Library";
 // (autoconf, automake, …). Homebrew pours it as <prefix>/opt/perl/bin/perl.
 pub const PLACEHOLDER_PERL = "@@HOMEBREW_PERL@@";
 pub const REAL_PERL = PREFIX ++ "/opt/perl/bin/perl";
+// Java-home placeholder in JVM wrapper scripts (maven, gradle, ...).
+// Homebrew pours it as the formula's openjdk dep's JDK home, so the
+// replacement is computed per-keg from the dependency list (#358);
+// this is only the dep-less fallback shape.
+pub const PLACEHOLDER_JAVA = "@@HOMEBREW_JAVA@@";
