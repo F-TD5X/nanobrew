@@ -6,6 +6,7 @@
 const std = @import("std");
 const Cask = @import("../api/cask.zig").Cask;
 const Artifact = @import("../api/cask.zig").Artifact;
+const PostField = @import("../api/cask.zig").PostField;
 const DownloadFormat = @import("../api/cask.zig").DownloadFormat;
 const paths = @import("../platform/paths.zig");
 const fetch = @import("../net/fetch.zig");
@@ -19,9 +20,10 @@ const APPLICATIONS_DIR = "/Applications";
 const ZIP_LIST_STDOUT_LIMIT = 8 * 1024 * 1024;
 const CASK_DOWNLOAD_ATTEMPTS = 3;
 const CASK_DOWNLOAD_RETRY_BASE_MS = 250;
-const CASK_DOWNLOAD_HEADERS = [_]std.http.Header{
-    .{ .name = "User-Agent", .value = "Homebrew/4 (nanobrew)" },
-};
+
+// Darwin extended-attribute syscall used in place of spawning `/usr/bin/xattr`
+// for the common non-recursive quarantine-removal path.
+extern "c" fn removexattr(path: [*:0]const u8, name: [*:0]const u8, options: c_int) c_int;
 
 pub const DestinationConflict = struct {
     kind: []const u8,
@@ -35,6 +37,70 @@ pub fn firstAppInstallConflict(io: std.Io, cask: Cask) !?[]const u8 {
 pub fn firstInstallConflict(io: std.Io, cask: Cask, conflict_buf: []u8) !?DestinationConflict {
     const home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else null;
     return firstInstallConflictIn(io, APPLICATIONS_DIR, home, &cask, conflict_buf);
+}
+
+/// The version of this cask's payload physically present under `caskroom_dir`
+/// (a `<caskroom_dir>/<token>/<version>` directory), written into `result_buf`.
+/// Prefers an exact match for `want_version`; otherwise returns the first
+/// version directory found. Returns null when nanobrew owns no payload for the
+/// token (i.e. a foreign, manually-installed app it must not adopt).
+///
+/// Used to recover an interrupted install (issue #302): when the destination
+/// already exists and the DB lost the record, the caller adopts the payload
+/// under its REAL on-disk version, never the freshly-fetched API version
+/// (which may be newer and would freeze `nb upgrade` on a stale payload).
+/// `caskroom_dir` may be absolute (production) or relative (tests); access
+/// goes through the cwd handle, which accepts both.
+/// Canonical cask identities from third-party taps can contain slashes, while
+/// Caskroom always uses the final token component as its filesystem directory.
+pub fn filesystemToken(token: []const u8) ?[]const u8 {
+    const basename = if (std.mem.lastIndexOfScalar(u8, token, '/')) |idx|
+        token[idx + 1 ..]
+    else
+        token;
+    if (basename.len == 0 or std.mem.eql(u8, basename, ".") or std.mem.eql(u8, basename, "..")) return null;
+    for (basename) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '@' and c != '+' and c != '_' and c != '.' and c != '-') return null;
+    }
+    return basename;
+}
+
+pub fn ownedCaskVersionOnDisk(
+    io: std.Io,
+    caskroom_dir: []const u8,
+    token: []const u8,
+    want_version: []const u8,
+    result_buf: *[256]u8,
+) ?[]const u8 {
+    // Third-party tap tokens may contain slashes ("indaco/tap/sley"); the
+    // Caskroom dir uses only the basename, matching installCask above.
+    const safe_token = filesystemToken(token) orelse return null;
+
+    // Exact version match first (the common adopt case).
+    var exact_buf: [1024]u8 = undefined;
+    if (std.fmt.bufPrint(&exact_buf, "{s}/{s}/{s}", .{ caskroom_dir, safe_token, want_version })) |exact| {
+        if (std.Io.Dir.cwd().access(io, exact, .{})) |_| {
+            if (want_version.len <= result_buf.len) {
+                @memcpy(result_buf[0..want_version.len], want_version);
+                return result_buf[0..want_version.len];
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // Otherwise adopt whatever version directory is physically present.
+    var token_buf: [1024]u8 = undefined;
+    const token_dir = std.fmt.bufPrint(&token_buf, "{s}/{s}", .{ caskroom_dir, safe_token }) catch return null;
+    var dir = std.Io.Dir.cwd().openDir(io, token_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (entry.name.len > result_buf.len) continue;
+        @memcpy(result_buf[0..entry.name.len], entry.name);
+        return result_buf[0..entry.name.len];
+    }
+    return null;
 }
 
 pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
@@ -56,10 +122,7 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
 
     // For third-party taps, cask.token may contain slashes (e.g. "indaco/tap/sley").
     // Use only the basename for filesystem paths to avoid creating nested directories.
-    const safe_token = if (std.mem.lastIndexOfScalar(u8, cask.token, '/')) |idx|
-        cask.token[idx + 1 ..]
-    else
-        cask.token;
+    const safe_token = filesystemToken(cask.token) orelse return error.UnsafeToken;
 
     // 1. Download artifact
     const format = cask.downloadFormat();
@@ -90,10 +153,13 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
     var caskroom_buf: [512]u8 = undefined;
     const caskroom_path = cask.caskroomPath(&caskroom_buf);
     std.Io.Dir.createDirAbsolute(lib_io, CASKROOM_DIR, .default_dir) catch {};
+    std.Io.Dir.accessAbsolute(lib_io, CASKROOM_DIR, .{ .write = true }) catch return error.CaskroomUnavailable;
     var token_dir_buf: [512]u8 = undefined;
     const token_dir = std.fmt.bufPrint(&token_dir_buf, "{s}/{s}", .{ CASKROOM_DIR, safe_token }) catch return error.PathTooLong;
     std.Io.Dir.createDirAbsolute(lib_io, token_dir, .default_dir) catch {};
+    std.Io.Dir.accessAbsolute(lib_io, token_dir, .{ .write = true }) catch return error.CaskroomUnavailable;
     std.Io.Dir.createDirAbsolute(lib_io, caskroom_path, .default_dir) catch {};
+    std.Io.Dir.accessAbsolute(lib_io, caskroom_path, .{ .write = true }) catch return error.CaskroomUnavailable;
     traceCaskPhase(trace_enabled, cask.token, "caskroom", phase_timer.read());
 
     // 3. Mount/extract based on format
@@ -323,6 +389,18 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
                     continue;
                 }
 
+                // Don't leave a dangling symlink: the source must exist by now.
+                // Casks list their app/suite payload before the $APPDIR binaries
+                // that point into it, so the bundle is already in place here; if
+                // it is not, fail loudly instead of recording a broken link (#303).
+                std.Io.Dir.accessAbsolute(lib_io, source, .{}) catch {
+                    var _b: [1024]u8 = undefined;
+                    const _m = std.fmt.bufPrint(&_b, "nb: binary source {s} not found (app payload missing?); skipping {s}\n", .{ source, bin.target }) catch "nb: binary source not found\n";
+                    std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    any_artifact_failed = true;
+                    continue;
+                };
+
                 var link_buf: [512]u8 = undefined;
                 const link_path = std.fmt.bufPrint(&link_buf, "{s}/bin/{s}", .{ PREFIX, bin.target }) catch continue;
 
@@ -365,23 +443,41 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
                     clearQuarantineIfPresent(alloc, lib_io, pkg_path, false);
                 }
 
-                const result = std.process.run(alloc, lib_io, .{
-                    .argv = &.{ "sudo", "installer", "-pkg", pkg_path, "-target", "/" },
-                }) catch {
-                    var _b: [512]u8 = undefined;
-                    const _m = std.fmt.bufPrint(&_b, "nb: pkg install failed for {s}\n", .{pkg_name}) catch "nb: pkg install failed\n";
+                if (std.c.geteuid() != 0) {
+                    var _b: [768]u8 = undefined;
+                    const _m = std.fmt.bufPrint(&_b, "nb: {s} requires elevated privileges; rerun with: sudo nb install --cask {s}\n", .{ pkg_name, cask.token }) catch "nb: this pkg cask requires elevated privileges; rerun with sudo\n";
                     std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    any_artifact_failed = true;
+                    continue;
+                }
+
+                const result = std.process.run(alloc, lib_io, .{
+                    .argv = &.{ "/usr/sbin/installer", "-pkg", pkg_path, "-target", "/" },
+                    .stdout_limit = .limited(64 * 1024),
+                    .stderr_limit = .limited(64 * 1024),
+                }) catch |err| {
+                    var _b: [512]u8 = undefined;
+                    const _m = std.fmt.bufPrint(&_b, "nb: could not launch installer for {s}: {}\n", .{ pkg_name, err }) catch "nb: could not launch pkg installer\n";
+                    std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    any_artifact_failed = true;
                     continue;
                 };
-                alloc.free(result.stdout);
-                alloc.free(result.stderr);
+                defer alloc.free(result.stdout);
+                defer alloc.free(result.stderr);
                 if (switch (result.term) {
                     .exited => |c| c != 0,
                     else => true,
                 }) {
                     var _b: [512]u8 = undefined;
-                    const _m = std.fmt.bufPrint(&_b, "nb: installer failed for {s}\n", .{pkg_name}) catch "nb: installer failed\n";
+                    const _m = std.fmt.bufPrint(&_b, "nb: installer failed for {s} ({})\n", .{ pkg_name, result.term }) catch "nb: installer failed\n";
                     std.Io.File.stderr().writeStreamingAll(lib_io, _m) catch {};
+                    if (result.stderr.len > 0) {
+                        std.Io.File.stderr().writeStreamingAll(lib_io, result.stderr) catch {};
+                        std.Io.File.stderr().writeStreamingAll(lib_io, "\n") catch {};
+                    } else if (result.stdout.len > 0) {
+                        std.Io.File.stderr().writeStreamingAll(lib_io, result.stdout) catch {};
+                        std.Io.File.stderr().writeStreamingAll(lib_io, "\n") catch {};
+                    }
                     any_artifact_failed = true;
                 }
             },
@@ -419,13 +515,13 @@ pub fn installCask(alloc: std.mem.Allocator, io: std.Io, cask: Cask) !void {
                 };
             },
             .artifact => |artifact_rule| {
-                copyGenericArtifact(alloc, lib_io, source_dir, artifact_rule.source, artifact_rule.target) catch {
+                installGenericArtifact(alloc, lib_io, source_dir, artifact_rule.source, artifact_rule.target) catch {
                     writeArtifactWarning(lib_io, "nb: failed to install artifact\n");
                     any_artifact_failed = true;
                 };
             },
             .suite => |suite| {
-                copyGenericArtifact(alloc, lib_io, source_dir, suite.source, suite.target) catch {
+                installGenericArtifact(alloc, lib_io, source_dir, suite.source, suite.target) catch {
                     writeArtifactWarning(lib_io, "nb: failed to install suite artifact\n");
                     any_artifact_failed = true;
                 };
@@ -453,6 +549,7 @@ pub fn removeCask(
     binaries: []const []const u8,
 ) !void {
     const lib_io = io;
+    const safe_token = filesystemToken(token) orelse return error.UnsafeToken;
 
     // 1. Delete apps from /Applications/
     for (apps) |app| {
@@ -474,12 +571,12 @@ pub fn removeCask(
 
     // 3. Delete Caskroom entry
     var caskroom_buf: [512]u8 = undefined;
-    const ver_dir = std.fmt.bufPrint(&caskroom_buf, "{s}/Caskroom/{s}/{s}", .{ PREFIX, token, version }) catch return;
+    const ver_dir = std.fmt.bufPrint(&caskroom_buf, "{s}/Caskroom/{s}/{s}", .{ PREFIX, safe_token, version }) catch return;
     std.Io.Dir.cwd().deleteTree(lib_io, ver_dir) catch {};
 
     // Try to remove parent dir if empty
     var parent_buf: [512]u8 = undefined;
-    const parent = std.fmt.bufPrint(&parent_buf, "{s}/Caskroom/{s}", .{ PREFIX, token }) catch return;
+    const parent = std.fmt.bufPrint(&parent_buf, "{s}/Caskroom/{s}", .{ PREFIX, safe_token }) catch return;
     std.Io.Dir.deleteDirAbsolute(lib_io, parent) catch {};
 }
 
@@ -507,11 +604,27 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
     var client: std.http.Client = .{ .allocator = alloc, .io = io };
     defer client.deinit();
 
+    // Some casks (e.g. segger-jlink) require an HTTP POST with a form body to
+    // accept a license before the real payload is served (#305). Build the
+    // x-www-form-urlencoded body once; null means a plain GET.
+    const post_body: fetch.PostBody = if (cask.isPostDownload())
+        try buildFormBody(alloc, cask.post_data)
+    else
+        null;
+    defer if (post_body) |b| alloc.free(b);
+
+    // Build request headers from the cask's url_specs (user_agent/referer/
+    // cookies/header), falling back to the default UA. Some downloads gate on
+    // these (#305 follow-up).
+    var header_storage = try buildCaskHeaders(alloc, cask);
+    defer header_storage.deinit(alloc);
+    const req_headers = header_storage.headers;
+
     // Verify SHA256 if available
     if (cask.sha256.len == 0 or std.mem.eql(u8, cask.sha256, "no_check")) {
         var attempt: usize = 0;
         while (attempt < CASK_DOWNLOAD_ATTEMPTS) : (attempt += 1) {
-            fetch.downloadWithClientHeaders(&client, url, dest, &CASK_DOWNLOAD_HEADERS) catch |err| {
+            fetch.downloadWithClientHeadersBody(&client, url, dest, req_headers, post_body) catch |err| {
                 std.Io.Dir.deleteFileAbsolute(lib_io, dest) catch {};
                 if (shouldRetryDownload(err, attempt)) {
                     writeDownloadRetryWarning(lib_io, cask, attempt);
@@ -531,7 +644,7 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
 
     var attempt: usize = 0;
     while (attempt < CASK_DOWNLOAD_ATTEMPTS) : (attempt += 1) {
-        fetch.downloadWithClientSha256Headers(&client, url, dest, cask.sha256, &CASK_DOWNLOAD_HEADERS) catch |err| {
+        fetch.downloadWithClientSha256HeadersBody(&client, url, dest, cask.sha256, req_headers, post_body) catch |err| {
             std.Io.Dir.deleteFileAbsolute(lib_io, dest) catch {};
             if (shouldRetryDownload(err, attempt)) {
                 writeDownloadRetryWarning(lib_io, cask, attempt);
@@ -551,6 +664,91 @@ fn downloadArtifact(alloc: std.mem.Allocator, io: std.Io, url: []const u8, dest:
         std.Io.Dir.copyFileAbsolute(dest, cached_path, lib_io, .{}) catch {};
     }
     return true;
+}
+
+/// Owns the request-header slice (and the joined Cookie string it may point
+/// into) built from a cask's url_specs for one download.
+const CaskHeaders = struct {
+    headers: []std.http.Header,
+    cookie_value: ?[]u8 = null,
+
+    fn deinit(self: *CaskHeaders, alloc: std.mem.Allocator) void {
+        alloc.free(self.headers);
+        if (self.cookie_value) |c| alloc.free(c);
+    }
+};
+
+/// Assemble the HTTP headers for a cask download: the User-Agent (cask override
+/// or our default), plus any Referer / Cookie / custom header entries declared
+/// in the cask's url_specs (#305 follow-up). Header name/value slices borrow the
+/// cask's own strings; only the joined Cookie value is allocated here.
+fn buildCaskHeaders(alloc: std.mem.Allocator, cask: Cask) !CaskHeaders {
+    var list: std.ArrayList(std.http.Header) = .empty;
+    errdefer list.deinit(alloc);
+
+    try list.append(alloc, .{
+        .name = "User-Agent",
+        .value = cask.user_agent orelse "Homebrew/4 (nanobrew)",
+    });
+    if (cask.referer) |r| try list.append(alloc, .{ .name = "Referer", .value = r });
+
+    var cookie_value: ?[]u8 = null;
+    errdefer if (cookie_value) |c| alloc.free(c);
+    if (cask.cookies.len > 0) {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(alloc);
+        for (cask.cookies, 0..) |c, i| {
+            if (i > 0) try buf.appendSlice(alloc, "; ");
+            try buf.appendSlice(alloc, c.key);
+            try buf.append(alloc, '=');
+            try buf.appendSlice(alloc, c.value);
+        }
+        cookie_value = try buf.toOwnedSlice(alloc);
+        try list.append(alloc, .{ .name = "Cookie", .value = cookie_value.? });
+    }
+
+    // Each header entry is "Name: Value"; split on the first ':' (value's
+    // leading space trimmed). Slices borrow the cask's string.
+    for (cask.headers) |h| {
+        const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
+        const name = std.mem.trim(u8, h[0..colon], " ");
+        const value = std.mem.trim(u8, h[colon + 1 ..], " ");
+        if (name.len == 0) continue;
+        try list.append(alloc, .{ .name = name, .value = value });
+    }
+
+    return .{ .headers = try list.toOwnedSlice(alloc), .cookie_value = cookie_value };
+}
+
+/// Build an `application/x-www-form-urlencoded` body from a cask's POST data
+/// fields (#305). Caller owns the returned slice.
+fn buildFormBody(alloc: std.mem.Allocator, fields: []const PostField) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    for (fields, 0..) |field, i| {
+        if (i > 0) try buf.append(alloc, '&');
+        try appendFormEncoded(alloc, &buf, field.key);
+        try buf.append(alloc, '=');
+        try appendFormEncoded(alloc, &buf, field.value);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Percent-encode `s` per application/x-www-form-urlencoded rules (spaces as
+/// '+', unreserved chars verbatim, everything else %HH).
+fn appendFormEncoded(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            try buf.append(alloc, c);
+        } else if (c == ' ') {
+            try buf.append(alloc, '+');
+        } else {
+            try buf.append(alloc, '%');
+            try buf.append(alloc, hex[c >> 4]);
+            try buf.append(alloc, hex[c & 0x0f]);
+        }
+    }
 }
 
 fn shouldRetryDownload(err: anyerror, attempt: usize) bool {
@@ -593,7 +791,7 @@ fn caskBlobCacheEnabled(sha256: []const u8) bool {
 fn mountDmg(alloc: std.mem.Allocator, io: std.Io, dmg_path: []const u8, out_buf: []u8) ![]const u8 {
     const lib_io = io;
     const result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "hdiutil", "attach", "-nobrowse", "-noautoopen", "-plist", dmg_path },
+        .argv = &.{ "hdiutil", "attach", "-nobrowse", "-noautoopen", "-noverify", "-noautofsck", "-readonly", "-plist", dmg_path },
         .stdout_limit = .limited(64 * 1024),
     }) catch return error.MountFailed;
     defer alloc.free(result.stdout);
@@ -624,13 +822,16 @@ fn mountDmg(alloc: std.mem.Allocator, io: std.Io, dmg_path: []const u8, out_buf:
 }
 
 fn unmountDmg(alloc: std.mem.Allocator, io: std.Io, mount_point: []const u8) void {
-    const lib_io = io;
-    const result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "hdiutil", "detach", mount_point, "-quiet" },
-        .stdout_limit = .limited(1024),
+    _ = alloc;
+    // Background detach: spawn `hdiutil detach` and drop the Child handle.
+    // The volume unmounts while `nb` is already returning to the user; the
+    // kernel reaps the still-running child when this process exits.
+    _ = std.process.spawn(io, .{
+        .argv = &.{ "hdiutil", "detach", "-force", "-quiet", mount_point },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch return;
-    alloc.free(result.stdout);
-    alloc.free(result.stderr);
 }
 
 fn installFastCaskArtifact(
@@ -930,16 +1131,18 @@ fn firstInstallConflictIn(
             },
             .artifact => |artifact_rule| {
                 var dst_buf: [1024]u8 = undefined;
-                const dst = try genericArtifactDestinationPath(artifact_rule.target, &dst_buf);
-                if (try pathExistsNoFollow(io, dst)) {
-                    return try destinationConflict("artifact", dst, conflict_buf);
+                if (try genericConflictDest(applications_dir, artifact_rule.target, &dst_buf)) |dst| {
+                    if (try pathExistsNoFollow(io, dst)) {
+                        return try destinationConflict("artifact", dst, conflict_buf);
+                    }
                 }
             },
             .suite => |suite| {
                 var dst_buf: [1024]u8 = undefined;
-                const dst = try genericArtifactDestinationPath(suite.target, &dst_buf);
-                if (try pathExistsNoFollow(io, dst)) {
-                    return try destinationConflict("suite", dst, conflict_buf);
+                if (try genericConflictDest(applications_dir, suite.target, &dst_buf)) |dst| {
+                    if (try pathExistsNoFollow(io, dst)) {
+                        return try destinationConflict("suite", dst, conflict_buf);
+                    }
                 }
             },
             .pkg, .installer_script, .uninstall => {},
@@ -1163,24 +1366,26 @@ fn clearQuarantineIfPresent(alloc: std.mem.Allocator, io: std.Io, path: []const 
     if (builtin.os.tag != .macos) return;
     if (!quarantineClearingEnabled()) return;
 
-    const check = std.process.run(alloc, io, .{
-        .argv = &.{ "xattr", "-p", "com.apple.quarantine", path },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(1024),
-    }) catch return;
-    defer alloc.free(check.stdout);
-    defer alloc.free(check.stderr);
-    if (switch (check.term) {
-        .exited => |code| code != 0,
-        else => true,
-    }) return;
+    if (!recursive) {
+        // Direct removexattr syscall: skips two `/usr/bin/xattr` subprocess
+        // spawns (~20 ms each) per non-recursive call. The probe-then-remove
+        // pattern that lived here before was redundant — removexattr returns
+        // -1 with errno=ENOATTR when the attribute is absent, which is the
+        // common case and is silently ignored.
+        if (path.len >= 1024) return;
+        var path_z: [1024]u8 = undefined;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+        _ = removexattr(@ptrCast(&path_z), "com.apple.quarantine", 0);
+        return;
+    }
 
-    const argv: []const []const u8 = if (recursive)
-        &.{ "xattr", "-dr", "com.apple.quarantine", path }
-    else
-        &.{ "xattr", "-d", "com.apple.quarantine", path };
+    // Recursive case (newly-copied .app bundle): keep the subprocess for the
+    // recursive walk, but drop the prior `xattr -p` pre-check. `xattr -dr`
+    // is a silent no-op when the attribute is absent, so probing first was
+    // an unnecessary fork+exec.
     const clear = std.process.run(alloc, io, .{
-        .argv = argv,
+        .argv = &.{ "xattr", "-dr", "com.apple.quarantine", path },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(4096),
     }) catch return;
@@ -1203,6 +1408,59 @@ fn safeRelativePath(path: []const u8) bool {
 fn safeArchiveMemberPath(path: []const u8) bool {
     return safeRelativePath(path) and
         std.mem.indexOfAny(u8, path, "*?[\\") == null;
+}
+
+test "buildCaskHeaders includes UA override, referer, joined cookies, and split headers (#305)" {
+    const cookies = [_]PostField{
+        .{ .key = "a", .value = "1" },
+        .{ .key = "b", .value = "2" },
+    };
+    const hdrs = [_][]const u8{ "X-One: foo", "X-Two: bar" };
+    var cask = std.mem.zeroInit(Cask, .{});
+    cask.user_agent = "Custom/9";
+    cask.referer = "https://ref.example";
+    cask.cookies = &cookies;
+    cask.headers = &hdrs;
+
+    var built = try buildCaskHeaders(std.testing.allocator, cask);
+    defer built.deinit(std.testing.allocator);
+
+    var ua: ?[]const u8 = null;
+    var referer: ?[]const u8 = null;
+    var cookie: ?[]const u8 = null;
+    var x_one: ?[]const u8 = null;
+    for (built.headers) |h| {
+        if (std.mem.eql(u8, h.name, "User-Agent")) ua = h.value;
+        if (std.mem.eql(u8, h.name, "Referer")) referer = h.value;
+        if (std.mem.eql(u8, h.name, "Cookie")) cookie = h.value;
+        if (std.mem.eql(u8, h.name, "X-One")) x_one = h.value;
+    }
+    try std.testing.expectEqualStrings("Custom/9", ua.?);
+    try std.testing.expectEqualStrings("https://ref.example", referer.?);
+    try std.testing.expectEqualStrings("a=1; b=2", cookie.?);
+    try std.testing.expectEqualStrings("foo", x_one.?);
+}
+
+test "buildCaskHeaders defaults the User-Agent when the cask sets none" {
+    const cask = std.mem.zeroInit(Cask, .{});
+    var built = try buildCaskHeaders(std.testing.allocator, cask);
+    defer built.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), built.headers.len);
+    try std.testing.expectEqualStrings("User-Agent", built.headers[0].name);
+    try std.testing.expectEqualStrings("Homebrew/4 (nanobrew)", built.headers[0].value);
+}
+
+test "buildFormBody encodes fields as x-www-form-urlencoded (#305)" {
+    const fields = [_]PostField{
+        .{ .key = "accept_license_agreement", .value = "accepted" },
+        .{ .key = "submit", .value = "Download software" },
+    };
+    const body = try buildFormBody(std.testing.allocator, &fields);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "accept_license_agreement=accepted&submit=Download+software",
+        body,
+    );
 }
 
 test "firstAppInstallConflictIn detects existing app destination" {
@@ -1363,6 +1621,92 @@ fn copyGenericArtifact(
     try copyPath(alloc, io, src, expanded_target);
 }
 
+/// Where a suite/artifact `target` maps on disk. nanobrew only ever writes a
+/// cask payload under its own prefix or into /Applications; anything else
+/// (e.g. /Library/Application Support) is skipped rather than failed (#303).
+const GenericTargetKind = enum { prefix, applications, skip };
+
+fn classifyGenericTarget(target_path: []const u8) GenericTargetKind {
+    if (std.mem.indexOf(u8, target_path, "..") != null) return .skip;
+    if (std.mem.startsWith(u8, target_path, "$HOMEBREW_PREFIX/")) return .prefix;
+    if (std.mem.startsWith(u8, target_path, PREFIX)) return .prefix;
+    if (std.mem.eql(u8, target_path, APPLICATIONS_DIR)) return .applications;
+    if (std.mem.startsWith(u8, target_path, APPLICATIONS_DIR ++ "/")) return .applications;
+    return .skip;
+}
+
+/// True when a suite/artifact `target` installs its payload into /Applications,
+/// so the DB-record side (main.zig) and the install side agree on what landed.
+pub fn artifactInstallsToApplications(target_path: []const u8) bool {
+    return classifyGenericTarget(target_path) == .applications;
+}
+
+/// Resolve where a suite/artifact would be placed (for conflict detection), or
+/// null when it targets neither the prefix nor /Applications (skipped).
+fn genericConflictDest(applications_dir: []const u8, target_path: []const u8, buf: []u8) !?[]const u8 {
+    return switch (classifyGenericTarget(target_path)) {
+        .prefix => try genericArtifactDestinationPath(target_path, buf),
+        .applications => std.fmt.bufPrint(buf, "{s}/{s}", .{ applications_dir, std.fs.path.basename(target_path) }) catch error.PathTooLong,
+        .skip => null,
+    };
+}
+
+/// Install a `suite`/`artifact` payload. /Applications targets go through the
+/// same hardened cp -R + quarantine path as `app` artifacts; prefix targets use
+/// the generic copy; everything else is skipped with a warning (not a failure).
+fn installGenericArtifact(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source_dir: []const u8,
+    source_path: []const u8,
+    target_path: []const u8,
+) !void {
+    switch (classifyGenericTarget(target_path)) {
+        .prefix => try copyGenericArtifact(alloc, io, source_dir, source_path, target_path),
+        .applications => try installApplicationsArtifact(alloc, io, source_dir, source_path, target_path),
+        .skip => {
+            var _b: [1024]u8 = undefined;
+            const _m = std.fmt.bufPrint(&_b, "nb: skipping artifact targeting {s} (outside nanobrew prefix and /Applications)\n", .{target_path}) catch "nb: skipping artifact outside managed directories\n";
+            std.Io.File.stderr().writeStreamingAll(io, _m) catch {};
+        },
+    }
+}
+
+/// Copy a suite/artifact payload to /Applications/<basename(target)>. Mirrors the
+/// `app` artifact safety model: relative source only, basename-only destination,
+/// refuse to overwrite, clear Gatekeeper quarantine.
+fn installApplicationsArtifact(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    source_dir: []const u8,
+    source_path: []const u8,
+    target_path: []const u8,
+) !void {
+    if (!safeRelativePath(source_path)) return error.UnsafePath;
+    const base = std.fs.path.basename(target_path);
+    if (base.len == 0 or std.mem.indexOf(u8, base, "..") != null) return error.UnsafePath;
+
+    var dst_buf: [512]u8 = undefined;
+    const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ APPLICATIONS_DIR, base }) catch return error.PathTooLong;
+    var src_buf: [1024]u8 = undefined;
+    const src = std.fmt.bufPrint(&src_buf, "{s}/{s}", .{ source_dir, source_path }) catch return error.PathTooLong;
+
+    std.Io.Dir.accessAbsolute(io, src, .{}) catch return error.SourceNotFound;
+    if (try pathExistsNoFollow(io, dst)) return error.DestinationAlreadyExists;
+
+    const cp = try std.process.run(alloc, io, .{ .argv = &.{ "cp", "-R", src, dst } });
+    alloc.free(cp.stdout);
+    alloc.free(cp.stderr);
+    if (switch (cp.term) {
+        .exited => |c| c != 0,
+        else => true,
+    }) return error.CopyFailed;
+
+    if (comptime builtin.os.tag == .macos) {
+        clearQuarantineIfPresent(alloc, io, dst, true);
+    }
+}
+
 fn runInstallerScript(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1505,4 +1849,79 @@ fn extractTarXz(alloc: std.mem.Allocator, io: std.Io, tar_path: []const u8, dest
         .exited => |c| c != 0,
         else => true,
     }) return error.ExtractFailed;
+}
+
+test "classifyGenericTarget routes prefix, applications, and skip" {
+    try std.testing.expectEqual(GenericTargetKind.applications, classifyGenericTarget("/Applications/KiCad"));
+    try std.testing.expectEqual(GenericTargetKind.applications, classifyGenericTarget(APPLICATIONS_DIR));
+    try std.testing.expectEqual(GenericTargetKind.prefix, classifyGenericTarget("$HOMEBREW_PREFIX/etc/x"));
+    try std.testing.expectEqual(GenericTargetKind.prefix, classifyGenericTarget(PREFIX ++ "/etc/x"));
+    try std.testing.expectEqual(GenericTargetKind.skip, classifyGenericTarget("/Library/Application Support/kicad/demos"));
+    try std.testing.expectEqual(GenericTargetKind.skip, classifyGenericTarget("/Applications/../etc/evil"));
+}
+
+test "artifactInstallsToApplications only true for /Applications targets" {
+    try std.testing.expect(artifactInstallsToApplications("/Applications/KiCad"));
+    try std.testing.expect(!artifactInstallsToApplications(PREFIX ++ "/share/foo"));
+    try std.testing.expect(!artifactInstallsToApplications("/Library/Foo"));
+    try std.testing.expect(!artifactInstallsToApplications("/Applications/../etc/evil"));
+}
+
+test "ownedCaskVersionOnDisk adopts the exact on-disk version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "firefox/120.0");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "firefox", "120.0", &ver_buf);
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("120.0", v.?);
+}
+
+test "ownedCaskVersionOnDisk recovers an older payload when the API moved on" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // An interrupted run left 119.0 on disk; the API has since advanced to 120.0.
+    try tmp.dir.createDirPath(std.testing.io, "firefox/119.0");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    // Must report the REAL on-disk version so `nb upgrade` brings it current,
+    // not the freshly-fetched 120.0 that was never installed.
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "firefox", "120.0", &ver_buf);
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("119.0", v.?);
+}
+
+test "ownedCaskVersionOnDisk returns null for a foreign app (no Caskroom payload)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // No token directory created: nanobrew owns nothing here, so a pre-existing
+    // /Applications app must stay refused rather than adopted.
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "firefox", "120.0", &ver_buf);
+    try std.testing.expect(v == null);
+}
+
+test "ownedCaskVersionOnDisk uses the basename for third-party tap tokens" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sley/1.2.3");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const caskroom_dir = try std.fmt.bufPrint(&root_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var ver_buf: [256]u8 = undefined;
+    const v = ownedCaskVersionOnDisk(std.testing.io, caskroom_dir, "indaco/tap/sley", "1.2.3", &ver_buf);
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("1.2.3", v.?);
 }

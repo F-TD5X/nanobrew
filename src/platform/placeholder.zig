@@ -8,10 +8,36 @@ const paths = @import("paths.zig");
 
 /// Literal /opt/homebrew/ paths hardcoded in some Homebrew bottles (not using @@HOMEBREW_*@@ placeholders).
 const HOMEBREW_PREFIX_LITERAL = "/opt/homebrew/";
+const HOMEBREW_USRLOCAL_CELLAR = "/usr/local/Cellar/";
+const HOMEBREW_USRLOCAL_OPT = "/usr/local/opt/";
+const HOMEBREW_LINUXBREW = "/home/linuxbrew/.linuxbrew/";
 const REAL_PREFIX_SLASH = paths.REAL_PREFIX ++ "/";
+const REAL_CELLAR_SLASH = paths.REAL_CELLAR ++ "/";
+const REAL_OPT_SLASH = paths.REAL_PREFIX ++ "/opt/";
 
 pub fn hasPlaceholder(s: []const u8) bool {
     return std.mem.indexOf(u8, s, "@@HOMEBREW") != null;
+}
+
+/// Java home substituted for @@HOMEBREW_JAVA@@ (#358). Homebrew pours the
+/// placeholder as the formula's openjdk dependency's JDK home, so the right
+/// keg is whichever openjdk/openjdk@N the formula depends on; plain
+/// "openjdk" is the fallback when no dependency list is available
+/// (rollback/switch re-pours).
+pub fn javaHomeForDeps(deps: []const []const u8, buf: []u8) []const u8 {
+    var dep: []const u8 = "openjdk";
+    for (deps) |d| {
+        if (std.mem.eql(u8, d, "openjdk") or std.mem.startsWith(u8, d, "openjdk@")) {
+            dep = d;
+            break;
+        }
+    }
+    const suffix = if (@import("builtin").os.tag == .macos)
+        "/libexec/openjdk.jdk/Contents/Home"
+    else
+        "/libexec";
+    return std.fmt.bufPrint(buf, "{s}/opt/{s}{s}", .{ paths.REAL_PREFIX, dep, suffix }) catch
+        paths.REAL_PREFIX ++ "/opt/openjdk/libexec";
 }
 
 pub fn replacePlaceholders(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -39,6 +65,11 @@ pub fn replacePlaceholders(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
         {
             try result.appendSlice(alloc, paths.REAL_LIBRARY);
             i += paths.PLACEHOLDER_LIBRARY.len;
+        } else if (i + paths.PLACEHOLDER_PERL.len <= input.len and
+            std.mem.eql(u8, input[i..][0..paths.PLACEHOLDER_PERL.len], paths.PLACEHOLDER_PERL))
+        {
+            try result.appendSlice(alloc, paths.REAL_PERL);
+            i += paths.PLACEHOLDER_PERL.len;
         } else {
             try result.append(alloc, input[i]);
             i += 1;
@@ -49,7 +80,7 @@ pub fn replacePlaceholders(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 
 /// Scan a file for @@HOMEBREW placeholder bytes.
 pub fn fileContainsPlaceholder(path: []const u8) bool {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    const lib_io = paths.safe_io;
     var file = std.Io.Dir.openFileAbsolute(lib_io, path, .{}) catch return false;
     var buf: [65536]u8 = undefined;
     var overlap: usize = 0;
@@ -74,12 +105,50 @@ pub fn fileContainsPlaceholder(path: []const u8) bool {
     return result;
 }
 
-/// Replace placeholders in text config files (.pc, .cmake, .la, etc.)
-pub fn relocateTextFile(io: std.Io, path: []const u8) bool {
+/// Scan a file for the foreign-prefix byte patterns the binary relocator
+/// rewrites (literal Homebrew install paths). Used by `nb doctor --probe`
+/// to flag static archives that kept Homebrew runtime paths (#357).
+pub fn fileContainsForeignPrefix(path: []const u8) bool {
+    const lib_io = paths.safe_io;
+    var file = std.Io.Dir.openFileAbsolute(lib_io, path, .{}) catch return false;
+    var buf: [65536]u8 = undefined;
+    var overlap: usize = 0;
+    var file_offset: u64 = 0;
+    const needles = [_][]const u8{ HOMEBREW_PREFIX_LITERAL, HOMEBREW_USRLOCAL_CELLAR, HOMEBREW_USRLOCAL_OPT };
+    const max_needle = HOMEBREW_USRLOCAL_CELLAR.len;
+    const result: bool = blk: {
+        while (true) {
+            if (overlap > 0) {
+                const src = buf[buf.len - overlap ..];
+                std.mem.copyForwards(u8, buf[0..overlap], src);
+            }
+            const n = file.readPositional(lib_io, &.{buf[overlap..]}, file_offset) catch break :blk false;
+            if (n == 0) break;
+            const total = overlap + n;
+            for (needles) |needle| {
+                if (std.mem.indexOf(u8, buf[0..total], needle) != null) break :blk true;
+            }
+            overlap = @min(max_needle - 1, total);
+            file_offset += @intCast(n);
+        }
+        break :blk false;
+    };
+    file.close(lib_io);
+    return result;
+}
+
+/// Replace placeholders in text config files (.pc, .cmake, .la, etc.).
+/// Size cap matches the walker's 4 MiB ceiling so any file the walker
+/// hands us is processed end-to-end. Files past 4 MiB are bounce off
+/// the walker before reaching us, so this branch is just a safety net.
+/// `java_home` is the substitution for @@HOMEBREW_JAVA@@, or null to leave
+/// that token untouched (supplementary passes without formula context must
+/// not bake in a wrong default before the deps-aware keg pass runs, #358).
+pub fn relocateTextFile(io: std.Io, path: []const u8, java_home: ?[]const u8) bool {
     // Single open for stat + binary check
     const probe = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
     const stat = probe.stat(io) catch { probe.close(io); return false; };
-    if (stat.size == 0 or stat.size > 1024 * 1024) { probe.close(io); return false; }
+    if (stat.size == 0 or stat.size > 4 * 1024 * 1024) { probe.close(io); return false; }
 
     // Quick binary check on first 4 bytes without reading the whole file
     var magic: [4]u8 = undefined;
@@ -114,8 +183,21 @@ pub fn relocateTextFile(io: std.Io, path: []const u8) bool {
         if (needs_chmod) _ = std.c.fchmod(file.handle, @intCast(orig_mode));
         file.close(io);
     }
-    var buf: [1024 * 1024]u8 = undefined;
-    const n = file.readPositionalAll(io, &buf, 0) catch return false;
+
+    // Heap-allocate read+result buffers. Stack-allocating 4 MiB×2 here
+    // is unsafe: this runs on per-package install worker threads whose
+    // pthread stack is 512 KiB by default on macOS. Earlier this used
+    // a 1 MiB fixed array and silently truncated any file larger than
+    // 1 MiB (vulkan-headers/include/vulkan/vulkan.hpp ≈ 1.1 MiB,
+    // gnutls/ChangeLog ≈ 1.9 MiB) — placeholders past the 1 MiB mark
+    // were unreplaced, AND files 1-X MiB with placeholders before 1
+    // MiB had their post-replace length silently capped at the buffer
+    // size, corrupting the file.
+    const file_size: usize = @intCast(stat.size);
+    const alloc = std.heap.smp_allocator;
+    const buf = alloc.alloc(u8, file_size) catch return false;
+    defer alloc.free(buf);
+    const n = file.readPositionalAll(io, buf, 0) catch return false;
     if (n == 0) return false;
     const content = buf[0..n];
 
@@ -131,12 +213,20 @@ pub fn relocateTextFile(io: std.Io, path: []const u8) bool {
     }
     if (std.mem.indexOf(u8, content[0..@min(n, 512)], &[_]u8{0}) != null) return false;
     const has_placeholder = std.mem.indexOf(u8, content, "@@HOMEBREW") != null;
-    const has_homebrew_path = std.mem.indexOf(u8, content, "/opt/homebrew/") != null;
+    const has_homebrew_path = std.mem.indexOf(u8, content, "/opt/homebrew/") != null or
+        std.mem.indexOf(u8, content, "/usr/local/Cellar/") != null or
+        std.mem.indexOf(u8, content, "/usr/local/opt/") != null or
+        std.mem.indexOf(u8, content, "/home/linuxbrew/.linuxbrew/") != null;
     if (!has_placeholder and !has_homebrew_path) return false;
 
-    // Replace in-place
-    var result: [1024 * 1024]u8 = undefined;
-    const result_cap = result.len;
+    // Worst-case growth is `@@HOMEBREW_JAVA@@` (17 bytes) → a JDK home
+    // path of ~70 bytes, i.e. a bit over 4x. 5x the input size + a small
+    // constant comfortably covers any pathological all-placeholders
+    // content; genuine wrappers carry a handful of tokens at most.
+    const result_cap = n * 5 + 4096;
+    const result = alloc.alloc(u8, result_cap) catch return false;
+    defer alloc.free(result);
+
     var out_len: usize = 0;
     var i: usize = 0;
     while (i < n) {
@@ -168,6 +258,42 @@ pub fn relocateTextFile(io: std.Io, path: []const u8) bool {
             @memcpy(result[out_len..][0..paths.REAL_LIBRARY.len], paths.REAL_LIBRARY);
             out_len += paths.REAL_LIBRARY.len;
             i += paths.PLACEHOLDER_LIBRARY.len;
+        } else if (i + paths.PLACEHOLDER_PERL.len <= n and
+            std.mem.eql(u8, content[i..][0..paths.PLACEHOLDER_PERL.len], paths.PLACEHOLDER_PERL))
+        {
+            if (out_len + paths.REAL_PERL.len > result_cap) return false;
+            @memcpy(result[out_len..][0..paths.REAL_PERL.len], paths.REAL_PERL);
+            out_len += paths.REAL_PERL.len;
+            i += paths.PLACEHOLDER_PERL.len;
+        } else if (java_home != null and i + paths.PLACEHOLDER_JAVA.len <= n and
+            std.mem.eql(u8, content[i..][0..paths.PLACEHOLDER_JAVA.len], paths.PLACEHOLDER_JAVA))
+        {
+            const home = java_home.?;
+            if (out_len + home.len > result_cap) return false;
+            @memcpy(result[out_len..][0..home.len], home);
+            out_len += home.len;
+            i += paths.PLACEHOLDER_JAVA.len;
+        } else if (i + HOMEBREW_USRLOCAL_CELLAR.len <= n and
+            std.mem.eql(u8, content[i..][0..HOMEBREW_USRLOCAL_CELLAR.len], HOMEBREW_USRLOCAL_CELLAR))
+        {
+            if (out_len + REAL_CELLAR_SLASH.len > result_cap) return false;
+            @memcpy(result[out_len..][0..REAL_CELLAR_SLASH.len], REAL_CELLAR_SLASH);
+            out_len += REAL_CELLAR_SLASH.len;
+            i += HOMEBREW_USRLOCAL_CELLAR.len;
+        } else if (i + HOMEBREW_USRLOCAL_OPT.len <= n and
+            std.mem.eql(u8, content[i..][0..HOMEBREW_USRLOCAL_OPT.len], HOMEBREW_USRLOCAL_OPT))
+        {
+            if (out_len + REAL_OPT_SLASH.len > result_cap) return false;
+            @memcpy(result[out_len..][0..REAL_OPT_SLASH.len], REAL_OPT_SLASH);
+            out_len += REAL_OPT_SLASH.len;
+            i += HOMEBREW_USRLOCAL_OPT.len;
+        } else if (i + HOMEBREW_LINUXBREW.len <= n and
+            std.mem.eql(u8, content[i..][0..HOMEBREW_LINUXBREW.len], HOMEBREW_LINUXBREW))
+        {
+            if (out_len + REAL_PREFIX_SLASH.len > result_cap) return false;
+            @memcpy(result[out_len..][0..REAL_PREFIX_SLASH.len], REAL_PREFIX_SLASH);
+            out_len += REAL_PREFIX_SLASH.len;
+            i += HOMEBREW_LINUXBREW.len;
         } else if (i + HOMEBREW_PREFIX_LITERAL.len <= n and
             std.mem.eql(u8, content[i..][0..HOMEBREW_PREFIX_LITERAL.len], HOMEBREW_PREFIX_LITERAL))
         {
@@ -192,13 +318,18 @@ pub fn relocateTextFile(io: std.Io, path: []const u8) bool {
 /// Walk all files in a keg directory and replace Homebrew placeholders in text files.
 /// This handles shebangs, scripts, and other text files that contain @@HOMEBREW_*@@ markers.
 /// Called after binary relocation (Mach-O/ELF) but before symlinking.
-pub fn replaceKegPlaceholders(io: std.Io, name: []const u8, version: []const u8) void {
+/// `deps` is the formula's runtime dependency list, used to resolve the
+/// @@HOMEBREW_JAVA@@ substitution (#358); pass an empty slice when no
+/// formula context is available (rollback/switch re-pours).
+pub fn replaceKegPlaceholders(io: std.Io, name: []const u8, version: []const u8, deps: []const []const u8) void {
     var keg_buf: [512]u8 = undefined;
     const keg_dir = std.fmt.bufPrint(&keg_buf, "{s}/{s}/{s}", .{ paths.CELLAR_DIR, name, version }) catch return;
-    walkAndReplaceText(io, keg_dir);
+    var java_buf: [512]u8 = undefined;
+    const java_home = javaHomeForDeps(deps, &java_buf);
+    walkAndReplaceText(io, keg_dir, java_home);
 }
 
-fn walkAndReplaceText(io: std.Io, dir_path: []const u8) void {
+fn walkAndReplaceText(io: std.Io, dir_path: []const u8, java_home: ?[]const u8) void {
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
 
@@ -209,11 +340,16 @@ fn walkAndReplaceText(io: std.Io, dir_path: []const u8) void {
 
         switch (entry.kind) {
             .directory => {
-                // Skip directories that never contain executable path placeholders.
-                if (std.mem.eql(u8, entry.name, "locale") or
-                    std.mem.eql(u8, entry.name, "charset"))
-                    continue;
-                walkAndReplaceText(io, child_path);
+                // Recurse into every directory. The per-file extension
+                // skip list already excludes .mo/.gmo/.wmo gettext files,
+                // and the binary-magic + NUL probe filters non-text data.
+                // Earlier versions skipped 'locale' wholesale, but libx11
+                // ships text Compose files at share/X11/locale/*/Compose
+                // that include "@@HOMEBREW_CELLAR@@/libx11/...". Skipping
+                // the directory left those placeholders unreplaced and
+                // broke libx11-dependent installs (see smoke-test.sh
+                // "no @@HOMEBREW_*@@ placeholders" check).
+                walkAndReplaceText(io, child_path, java_home);
             },
             .sym_link => {
                 // Resolve symlink target and process if it's a regular file
@@ -230,7 +366,7 @@ fn walkAndReplaceText(io: std.Io, dir_path: []const u8) void {
                 const file_stat = file.stat(io) catch { file.close(io); continue; };
                 file.close(io);
                 if (file_stat.kind != .file) continue;
-                _ = relocateTextFile(io, target_path);
+                _ = relocateTextFile(io, target_path, java_home);
             },
             .file => {
                 // Fast skip: known binary/data extensions (no syscalls needed)
@@ -265,7 +401,13 @@ fn walkAndReplaceText(io: std.Io, dir_path: []const u8) void {
                 // Single open: stat + probe in one fd
                 const file = std.Io.Dir.openFileAbsolute(io, child_path, .{}) catch continue;
                 const file_stat = file.stat(io) catch { file.close(io); continue; };
-                if (file_stat.size == 0 or file_stat.size > 1024 * 1024) { file.close(io); continue; }
+                // Cap at 4 MiB — large enough for auto-generated single-
+                // header libraries (e.g. vulkan-headers' vulkan.hpp at
+                // 1.1 MiB) and verbose ChangeLogs (e.g. gnutls at 1.9 MiB)
+                // that reference @@HOMEBREW_*@@ paths. Files larger than
+                // this are almost always datasets / locale tables / pdfs
+                // that wouldn't contain placeholders.
+                if (file_stat.size == 0 or file_stat.size > 4 * 1024 * 1024) { file.close(io); continue; }
 
                 var probe: [512]u8 = undefined;
                 const probe_n = file.readPositionalAll(io, &probe, 0) catch { file.close(io); continue; };
@@ -287,9 +429,12 @@ fn walkAndReplaceText(io: std.Io, dir_path: []const u8) void {
                 // Only skip if we read the entire file and found no placeholder or literal path
                 if (file_stat.size <= probe_n and
                     std.mem.indexOf(u8, probe[0..probe_n], "@@HOMEBREW") == null and
-                    std.mem.indexOf(u8, probe[0..probe_n], "/opt/homebrew/") == null) continue;
+                    std.mem.indexOf(u8, probe[0..probe_n], "/opt/homebrew/") == null and
+                    std.mem.indexOf(u8, probe[0..probe_n], "/usr/local/Cellar/") == null and
+                    std.mem.indexOf(u8, probe[0..probe_n], "/usr/local/opt/") == null and
+                    std.mem.indexOf(u8, probe[0..probe_n], "/home/linuxbrew/.linuxbrew/") == null) continue;
 
-                _ = relocateTextFile(io, child_path);
+                _ = relocateTextFile(io, child_path, java_home);
             },
             else => {},
         }
@@ -345,7 +490,7 @@ test "relocateTextFile - replaces shebangs in text files" {
     const path_n = tmp_dir.dir.realPathFile(testing.io, "test_script", &path_buf) catch unreachable;
     const abs_path = path_buf[0..path_n];
 
-    const changed = relocateTextFile(testing.io, abs_path);
+    const changed = relocateTextFile(testing.io, abs_path, null);
     try testing.expect(changed);
 
     const verify_file = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
@@ -363,7 +508,7 @@ test "relocateTextFile - no change returns false" {
     f.close(testing.io);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_n = tmp_dir.dir.realPathFile(testing.io, "no_placeholder", &path_buf) catch unreachable;
-    try testing.expect(!relocateTextFile(testing.io, path_buf[0..path_n]));
+    try testing.expect(!relocateTextFile(testing.io, path_buf[0..path_n], null));
 }
 
 test "relocateTextFile - handles read-only files" {
@@ -378,7 +523,7 @@ test "relocateTextFile - handles read-only files" {
     const ro = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
     _ = std.c.fchmod(ro.handle, 0o555);
     ro.close(testing.io);
-    try testing.expect(relocateTextFile(testing.io, abs_path));
+    try testing.expect(relocateTextFile(testing.io, abs_path, null));
     const v = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
     defer v.close(testing.io);
     var buf: [256]u8 = undefined;
@@ -394,7 +539,7 @@ test "relocateTextFile - skips binary files with null bytes" {
     f.close(testing.io);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_n = tmp_dir.dir.realPathFile(testing.io, "binary_file", &path_buf) catch unreachable;
-    try testing.expect(!relocateTextFile(testing.io, path_buf[0..path_n]));
+    try testing.expect(!relocateTextFile(testing.io, path_buf[0..path_n], null));
 }
 
 test "relocateTextFile - replaces LIBRARY placeholder" {
@@ -406,7 +551,7 @@ test "relocateTextFile - replaces LIBRARY placeholder" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_n = tmp_dir.dir.realPathFile(testing.io, "config_file", &path_buf) catch unreachable;
     const abs_path = path_buf[0..path_n];
-    try testing.expect(relocateTextFile(testing.io, abs_path));
+    try testing.expect(relocateTextFile(testing.io, abs_path, null));
     const v = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
     defer v.close(testing.io);
     var buf: [256]u8 = undefined;
@@ -423,7 +568,7 @@ test "relocateTextFile - replaces multiple placeholders in one file" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_n = tmp_dir.dir.realPathFile(testing.io, "multi", &path_buf) catch unreachable;
     const abs_path = path_buf[0..path_n];
-    try testing.expect(relocateTextFile(testing.io, abs_path));
+    try testing.expect(relocateTextFile(testing.io, abs_path, null));
     const v = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
     defer v.close(testing.io);
     var buf: [512]u8 = undefined;
@@ -438,7 +583,80 @@ test "relocateTextFile - skips empty files" {
     f.close(testing.io);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_n = tmp_dir.dir.realPathFile(testing.io, "empty", &path_buf) catch unreachable;
-    try testing.expect(!relocateTextFile(testing.io, path_buf[0..path_n]));
+    try testing.expect(!relocateTextFile(testing.io, path_buf[0..path_n], null));
+}
+
+test "fileContainsForeignPrefix - detects Homebrew paths in binary payloads (#357)" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const dirty = tmp_dir.dir.createFile(testing.io, "dirty.a", .{}) catch unreachable;
+    dirty.writeStreamingAll(testing.io, "!<arch>\n\x00\x01OPENSSLDIR: \"/opt/homebrew/etc/openssl@3\"\x00") catch unreachable;
+    dirty.close(testing.io);
+    const clean = tmp_dir.dir.createFile(testing.io, "clean.a", .{}) catch unreachable;
+    clean.writeStreamingAll(testing.io, "!<arch>\n\x00\x01OPENSSLDIR: \"/opt/nb//////etc/openssl@3\"\x00") catch unreachable;
+    clean.close(testing.io);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var n = tmp_dir.dir.realPathFile(testing.io, "dirty.a", &path_buf) catch unreachable;
+    try testing.expect(fileContainsForeignPrefix(path_buf[0..n]));
+    n = tmp_dir.dir.realPathFile(testing.io, "clean.a", &path_buf) catch unreachable;
+    try testing.expect(!fileContainsForeignPrefix(path_buf[0..n]));
+}
+
+test "javaHomeForDeps - picks the formula's versioned openjdk dep (#358)" {
+    var buf: [512]u8 = undefined;
+    const deps = [_][]const u8{ "giflib", "openjdk@21", "harfbuzz" };
+    const home = javaHomeForDeps(&deps, &buf);
+    if (@import("builtin").os.tag == .macos) {
+        try testing.expectEqualStrings("/opt/nanobrew/prefix/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home", home);
+    } else {
+        try testing.expectEqualStrings("/opt/nanobrew/prefix/opt/openjdk@21/libexec", home);
+    }
+}
+
+test "javaHomeForDeps - falls back to plain openjdk without deps" {
+    var buf: [512]u8 = undefined;
+    const home = javaHomeForDeps(&.{}, &buf);
+    if (@import("builtin").os.tag == .macos) {
+        try testing.expectEqualStrings("/opt/nanobrew/prefix/opt/openjdk/libexec/openjdk.jdk/Contents/Home", home);
+    } else {
+        try testing.expectEqualStrings("/opt/nanobrew/prefix/opt/openjdk/libexec", home);
+    }
+}
+
+test "relocateTextFile - replaces @@HOMEBREW_JAVA@@ with the resolved JDK home (#358)" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const f = tmp_dir.dir.createFile(testing.io, "mvn", .{}) catch unreachable;
+    f.writeStreamingAll(testing.io, "#!/bin/bash\nJAVA_HOME=\"${JAVA_HOME:-@@HOMEBREW_JAVA@@}\" exec mvn \"$@\"\n") catch unreachable;
+    f.close(testing.io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_n = tmp_dir.dir.realPathFile(testing.io, "mvn", &path_buf) catch unreachable;
+    const abs_path = path_buf[0..path_n];
+    try testing.expect(relocateTextFile(testing.io, abs_path, "/opt/nanobrew/prefix/opt/openjdk/libexec/openjdk.jdk/Contents/Home"));
+    const v = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
+    defer v.close(testing.io);
+    var buf: [512]u8 = undefined;
+    const n = v.readPositionalAll(testing.io, &buf, 0) catch unreachable;
+    try testing.expectEqualStrings("#!/bin/bash\nJAVA_HOME=\"${JAVA_HOME:-/opt/nanobrew/prefix/opt/openjdk/libexec/openjdk.jdk/Contents/Home}\" exec mvn \"$@\"\n", buf[0..n]);
+}
+
+test "relocateTextFile - null java_home leaves @@HOMEBREW_JAVA@@ untouched" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const f = tmp_dir.dir.createFile(testing.io, "wrapper", .{}) catch unreachable;
+    f.writeStreamingAll(testing.io, "JAVA_HOME=@@HOMEBREW_JAVA@@ prefix=@@HOMEBREW_PREFIX@@\n") catch unreachable;
+    f.close(testing.io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_n = tmp_dir.dir.realPathFile(testing.io, "wrapper", &path_buf) catch unreachable;
+    const abs_path = path_buf[0..path_n];
+    try testing.expect(relocateTextFile(testing.io, abs_path, null));
+    const v = std.Io.Dir.openFileAbsolute(testing.io, abs_path, .{}) catch unreachable;
+    defer v.close(testing.io);
+    var buf: [512]u8 = undefined;
+    const n = v.readPositionalAll(testing.io, &buf, 0) catch unreachable;
+    try testing.expectEqualStrings("JAVA_HOME=@@HOMEBREW_JAVA@@ prefix=/opt/nanobrew/prefix\n", buf[0..n]);
 }
 
 test "replaceKegPlaceholders handles relative symlink targets" {
@@ -456,7 +674,7 @@ test "replaceKegPlaceholders handles relative symlink targets" {
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_n = tmp_dir.dir.realPathFile(testing.io, "Cellar/awscli/1.0.0", &root_buf) catch unreachable;
-    walkAndReplaceText(testing.io, root_buf[0..root_n]);
+    walkAndReplaceText(testing.io, root_buf[0..root_n], null);
 
     var script_buf: [std.fs.max_path_bytes]u8 = undefined;
     const script_n = tmp_dir.dir.realPathFile(testing.io, "Cellar/awscli/1.0.0/libexec/bin/aws", &script_buf) catch unreachable;

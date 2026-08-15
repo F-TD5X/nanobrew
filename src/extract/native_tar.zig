@@ -12,6 +12,7 @@
 //   - Path traversal protection (rejects ".." components and absolute paths)
 
 const std = @import("std");
+const paths = @import("../platform/paths.zig");
 
 const BLOCK_SIZE = 512;
 
@@ -73,10 +74,12 @@ fn fieldStr(field: []const u8) []const u8 {
 
 /// Check if a header block is all zeros (end-of-archive marker).
 fn isZeroBlock(block: *const [BLOCK_SIZE]u8) bool {
-    // Check 8 bytes at a time for speed
-    const words: *const [BLOCK_SIZE / 8]u64 = @ptrCast(@alignCast(block));
-    for (words) |w| {
-        if (w != 0) return false;
+    // Check 8 bytes at a time for speed. readInt performs unaligned loads,
+    // so this is safe for caller-provided buffers of any alignment (the old
+    // @alignCast to *const u64 panicked on align-1 tar data).
+    var i: usize = 0;
+    while (i < BLOCK_SIZE) : (i += 8) {
+        if (std.mem.readInt(u64, block[i..][0..8], .little) != 0) return false;
     }
     return true;
 }
@@ -185,7 +188,7 @@ pub fn listFiles(alloc: std.mem.Allocator, tar_data: []const u8) !TarListResult 
             const name_blocks = alignToBlock(file_size);
             if (pos + name_blocks > tar_data.len) return error.TruncatedArchive;
             // The long name is NUL-terminated in the data blocks
-            const raw_name = tar_data[pos..pos + file_size];
+            const raw_name = tar_data[pos .. pos + file_size];
             const name_end = std.mem.indexOfScalar(u8, raw_name, 0) orelse file_size;
             if (gnu_long_name) |old| alloc.free(old);
             gnu_long_name = try alloc.dupe(u8, raw_name[0..name_end]);
@@ -242,14 +245,22 @@ pub fn listFiles(alloc: std.mem.Allocator, tar_data: []const u8) !TarListResult 
 /// Extract all entries from a tar archive (in memory) into dest_dir.
 /// Returns list of extracted file paths (relative, without leading /).
 /// The tar data must already be decompressed.
-pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []const u8) ![][]const u8 {
+///
+/// `io` must be threadsafe — when this is called from a parallel extract
+/// worker pool (e.g. `nb install --deb` fanning out 8 workers), every
+/// thread shares this `io` to do its createFile/writeStreaming/delete
+/// calls. Earlier versions used `paths.safe_io`
+/// here and the singleton's vtable + pipe-aggregation state would corrupt
+/// under concurrent use, surfacing as `nb install --deb cowsay` SIGSEGV.
+/// Always thread the caller's `g_io` through.
+pub fn extractToDir(alloc: std.mem.Allocator, io: std.Io, tar_data: []const u8, dest_dir: []const u8) ![][]const u8 {
     var files: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (files.items) |f| alloc.free(f);
         files.deinit(alloc);
     }
     var rejected: usize = 0;
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+    const lib_io = io;
     var pos: usize = 0;
     var gnu_long_name: ?[]const u8 = null;
     var gnu_long_link: ?[]const u8 = null;
@@ -269,7 +280,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
             pos += BLOCK_SIZE;
             const name_blocks = alignToBlock(file_size);
             if (pos + name_blocks > tar_data.len) return error.TruncatedArchive;
-            const raw_name = tar_data[pos..pos + file_size];
+            const raw_name = tar_data[pos .. pos + file_size];
             const name_end = std.mem.indexOfScalar(u8, raw_name, 0) orelse file_size;
             if (gnu_long_name) |old| alloc.free(old);
             gnu_long_name = try alloc.dupe(u8, raw_name[0..name_end]);
@@ -282,7 +293,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
             pos += BLOCK_SIZE;
             const name_blocks = alignToBlock(file_size);
             if (pos + name_blocks > tar_data.len) return error.TruncatedArchive;
-            const raw_link = tar_data[pos..pos + file_size];
+            const raw_link = tar_data[pos .. pos + file_size];
             const link_end = std.mem.indexOfScalar(u8, raw_link, 0) orelse file_size;
             if (gnu_long_link) |old| alloc.free(old);
             gnu_long_link = try alloc.dupe(u8, raw_link[0..link_end]);
@@ -339,12 +350,12 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
 
         switch (typeflag) {
             TypeFlag.directory => {
-                makeDirRecursive(abs_path) catch {};
+                makeDirRecursive(lib_io, abs_path) catch {};
             },
             TypeFlag.regular, TypeFlag.regular_alt => {
                 // Ensure parent directory exists
                 if (std.fs.path.dirname(abs_path)) |parent| {
-                    makeDirRecursive(parent) catch {};
+                    makeDirRecursive(lib_io, parent) catch {};
                 }
 
                 const data_end = pos + file_size;
@@ -354,7 +365,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
                 const mode_val = parseOctal(&header.mode);
                 const mode: std.posix.mode_t = @intCast(mode_val & 0o0777);
 
-                writeFile(abs_path, tar_data[pos..data_end], mode) catch {
+                writeFile(lib_io, abs_path, tar_data[pos..data_end], mode) catch {
                     // Skip files we can't write (permission errors, etc.)
                     pos += alignToBlock(file_size);
                     continue;
@@ -368,7 +379,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
                 }
 
                 if (std.fs.path.dirname(abs_path)) |parent| {
-                    makeDirRecursive(parent) catch {};
+                    makeDirRecursive(lib_io, parent) catch {};
                 }
 
                 // Remove existing file/symlink before creating
@@ -390,7 +401,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
             },
             TypeFlag.hardlink => {
                 if (std.fs.path.dirname(abs_path)) |parent| {
-                    makeDirRecursive(parent) catch {};
+                    makeDirRecursive(lib_io, parent) catch {};
                 }
 
                 // Resolve the link target relative to dest_dir
@@ -424,7 +435,7 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
     }
 
     if (rejected > 0) {
-        const lib_io2 = std.Io.Threaded.global_single_threaded.io();
+        const lib_io2 = io;
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "    warning: rejected {d} unsafe paths from archive\n", .{rejected}) catch msg_buf[0..0];
         std.Io.File.stderr().writeStreamingAll(lib_io2, msg) catch {};
@@ -433,9 +444,212 @@ pub fn extractToDir(alloc: std.mem.Allocator, tar_data: []const u8, dest_dir: []
     return try files.toOwnedSlice(alloc);
 }
 
+/// Streaming variant of `extractToDir`: consumes tar bytes incrementally
+/// from `reader` (already decompressed) instead of requiring the whole
+/// archive in memory. Regular-file payloads stream straight to disk in
+/// 64 KiB chunks, so peak memory stays bounded no matter how large the
+/// unpacked archive is (perl / postgresql@17 bottles are 100s of MiB —
+/// the in-memory path used to buffer all of it before writing anything).
+/// Same entry semantics and path-safety rules as `extractToDir`, except
+/// that no file list is returned (callers of the fallback path discarded
+/// it anyway — this also drops a per-file dupe/append from the hot loop).
+/// `io` must be threadsafe; see `extractToDir`'s docs.
+pub fn extractFromReader(alloc: std.mem.Allocator, io: std.Io, reader: *std.Io.Reader, dest_dir: []const u8) !void {
+    const lib_io = io;
+    var rejected: usize = 0;
+    var gnu_long_name: ?[]const u8 = null;
+    var gnu_long_link: ?[]const u8 = null;
+    defer if (gnu_long_name) |n| alloc.free(n);
+    defer if (gnu_long_link) |n| alloc.free(n);
+
+    var block: [BLOCK_SIZE]u8 = undefined;
+    while (true) {
+        const hdr_n = try reader.readSliceShort(&block);
+        // Clean EOF or trailing partial block — tolerated, same as
+        // extractToDir's `pos + BLOCK_SIZE <= tar_data.len` loop condition.
+        if (hdr_n < BLOCK_SIZE) break;
+        if (isZeroBlock(&block)) break;
+
+        const header: *const TarHeader = @ptrCast(&block);
+        const file_size = parseOctal(&header.size);
+        const typeflag = header.typeflag;
+        const payload_padded: u64 = (file_size + BLOCK_SIZE - 1) & ~@as(u64, BLOCK_SIZE - 1);
+
+        // Handle GNU long name extension
+        if (typeflag == TypeFlag.gnu_long_name) {
+            if (file_size > 1 << 20) return error.CorruptArchive;
+            const fsz: usize = @intCast(file_size);
+            const raw = try alloc.alloc(u8, fsz);
+            defer alloc.free(raw);
+            try reader.readSliceAll(raw);
+            try reader.discardAll64(payload_padded - file_size);
+            const name_end = std.mem.indexOfScalar(u8, raw, 0) orelse fsz;
+            if (gnu_long_name) |old| alloc.free(old);
+            gnu_long_name = try alloc.dupe(u8, raw[0..name_end]);
+            continue;
+        }
+
+        // Handle GNU long link name extension
+        if (typeflag == TypeFlag.gnu_long_link) {
+            if (file_size > 1 << 20) return error.CorruptArchive;
+            const fsz: usize = @intCast(file_size);
+            const raw = try alloc.alloc(u8, fsz);
+            defer alloc.free(raw);
+            try reader.readSliceAll(raw);
+            try reader.discardAll64(payload_padded - file_size);
+            const link_end = std.mem.indexOfScalar(u8, raw, 0) orelse fsz;
+            if (gnu_long_link) |old| alloc.free(old);
+            gnu_long_link = try alloc.dupe(u8, raw[0..link_end]);
+            continue;
+        }
+
+        // Skip pax headers
+        if (typeflag == TypeFlag.pax_global or typeflag == TypeFlag.pax_extended) {
+            try reader.discardAll64(payload_padded);
+            if (gnu_long_name) |old| {
+                alloc.free(old);
+                gnu_long_name = null;
+            }
+            if (gnu_long_link) |old| {
+                alloc.free(old);
+                gnu_long_link = null;
+            }
+            continue;
+        }
+
+        // Resolve entry name and link target
+        var name_buf: [512]u8 = undefined;
+        const raw_name = if (gnu_long_name) |ln| ln else buildFullName(header, &name_buf);
+        const entry_name = normalizePath(raw_name);
+        const link_target = if (gnu_long_link) |ll| ll else fieldStr(&header.linkname);
+
+        if (gnu_long_name) |old| {
+            alloc.free(old);
+            gnu_long_name = null;
+        }
+        if (gnu_long_link) |old| {
+            alloc.free(old);
+            gnu_long_link = null;
+        }
+
+        // Bytes the stream still has to skip past after this entry's
+        // handler runs. Regular files consume their payload by streaming;
+        // everything else leaves the full padded payload to discard.
+        var payload_remaining: u64 = payload_padded;
+
+        // Path safety check
+        if (!isPathSafe(entry_name)) {
+            rejected += 1;
+            try reader.discardAll64(payload_remaining);
+            continue;
+        }
+
+        // Build absolute destination path
+        var path_buf: [4096]u8 = undefined;
+        const abs_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dest_dir, entry_name }) catch {
+            try reader.discardAll64(payload_remaining);
+            continue;
+        };
+
+        switch (typeflag) {
+            TypeFlag.directory => {
+                makeDirRecursive(lib_io, abs_path) catch {};
+            },
+            TypeFlag.regular, TypeFlag.regular_alt => {
+                // Ensure parent directory exists
+                if (std.fs.path.dirname(abs_path)) |parent| {
+                    makeDirRecursive(lib_io, parent) catch {};
+                }
+
+                // Extract file mode from header
+                const mode_val = parseOctal(&header.mode);
+                const mode: std.posix.mode_t = @intCast(mode_val & 0o0777);
+
+                // Stream the payload straight to disk. A create failure
+                // (permissions, etc.) leaves the stream untouched at the
+                // payload start so we can skip the entry exactly like
+                // extractToDir does; a mid-stream failure is fatal — the
+                // archive and filesystem are out of sync either way.
+                const wrote = try writeFileStreaming(lib_io, abs_path, reader, file_size, mode);
+                payload_remaining = if (wrote) payload_padded - file_size else payload_padded;
+            },
+            TypeFlag.symlink => {
+                if (isLinkTargetSafe(entry_name, link_target, dest_dir)) {
+                    if (std.fs.path.dirname(abs_path)) |parent| {
+                        makeDirRecursive(lib_io, parent) catch {};
+                    }
+
+                    // Remove existing file/symlink before creating
+                    std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
+
+                    // Null-terminate both strings for the C symlink call
+                    path_buf[abs_path.len] = 0;
+                    const abs_path_z: [*:0]const u8 = @ptrCast(abs_path.ptr);
+                    var lt_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+                    const lt_len = @min(link_target.len, std.fs.max_path_bytes);
+                    @memcpy(lt_buf[0..lt_len], link_target[0..lt_len]);
+                    lt_buf[lt_len] = 0;
+                    const link_target_z: [*:0]const u8 = @ptrCast(&lt_buf);
+                    _ = std.c.symlink(link_target_z, abs_path_z);
+                }
+            },
+            TypeFlag.hardlink => {
+                if (std.fs.path.dirname(abs_path)) |parent| {
+                    makeDirRecursive(lib_io, parent) catch {};
+                }
+
+                // Resolve the link target relative to dest_dir
+                const normalized_target = normalizePath(link_target);
+                if (isPathSafe(normalized_target)) {
+                    var target_buf: [4096]u8 = undefined;
+                    if (std.fmt.bufPrint(&target_buf, "{s}/{s}", .{ dest_dir, normalized_target })) |abs_target| {
+                        std.Io.Dir.deleteFileAbsolute(lib_io, abs_path) catch {};
+                        target_buf[abs_target.len] = 0;
+                        path_buf[abs_path.len] = 0;
+                        const abs_target_z: [*:0]const u8 = @ptrCast(abs_target.ptr);
+                        const abs_path_z2: [*:0]const u8 = @ptrCast(abs_path.ptr);
+                        _ = std.c.link(abs_target_z, abs_path_z2);
+                    } else |_| {}
+                }
+            },
+            else => {
+                // Unknown type flag — skip
+            },
+        }
+
+        if (payload_remaining > 0) try reader.discardAll64(payload_remaining);
+    }
+
+    if (rejected > 0) {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "    warning: rejected {d} unsafe paths from archive\n", .{rejected}) catch msg_buf[0..0];
+        std.Io.File.stderr().writeStreamingAll(lib_io, msg) catch {};
+    }
+}
+
+/// Create a file and stream `size` bytes from `reader` into it. Returns
+/// `false` (with the reader untouched) if the file could not be created;
+/// mid-stream failures are errors since the payload can no longer be
+/// skipped cleanly.
+fn writeFileStreaming(io: std.Io, path: []const u8, reader: *std.Io.Reader, size: u64, mode: std.posix.mode_t) !bool {
+    const lib_io = io;
+    const perms: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(mode);
+    const file = std.Io.Dir.createFileAbsolute(lib_io, path, .{ .permissions = perms }) catch return false;
+    defer file.close(lib_io);
+    var buf: [65536]u8 = undefined;
+    var file_writer = file.writer(lib_io, &buf);
+    reader.streamExact64(&file_writer.interface, size) catch |err| switch (err) {
+        error.EndOfStream => return error.TruncatedArchive,
+        else => |e| return e,
+    };
+    try file_writer.interface.flush();
+    return true;
+}
+
 /// Create a file with the given content and mode.
-fn writeFile(path: []const u8, data: []const u8, mode: std.posix.mode_t) !void {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+/// `io` must be threadsafe; see `extractToDir`'s docs.
+fn writeFile(io: std.Io, path: []const u8, data: []const u8, mode: std.posix.mode_t) !void {
+    const lib_io = io;
     const perms: std.Io.File.Permissions = std.Io.File.Permissions.fromMode(mode);
     const file = try std.Io.Dir.createFileAbsolute(lib_io, path, .{ .permissions = perms });
     defer file.close(lib_io);
@@ -443,14 +657,15 @@ fn writeFile(path: []const u8, data: []const u8, mode: std.posix.mode_t) !void {
 }
 
 /// Recursively create directories (like mkdir -p).
-fn makeDirRecursive(path: []const u8) !void {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+/// `io` must be threadsafe; see `extractToDir`'s docs.
+fn makeDirRecursive(io: std.Io, path: []const u8) !void {
+    const lib_io = io;
     std.Io.Dir.createDirAbsolute(lib_io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         error.FileNotFound => {
             // Parent doesn't exist — create it first
             if (std.fs.path.dirname(path)) |parent| {
-                try makeDirRecursive(parent);
+                try makeDirRecursive(io, parent);
                 std.Io.Dir.createDirAbsolute(lib_io, path, .default_dir) catch |e| switch (e) {
                     error.PathAlreadyExists => return,
                     else => return e,
@@ -514,7 +729,7 @@ test "alignToBlock rounds up correctly" {
 
 test "listFiles parses minimal tar" {
     // Build a minimal tar with one regular file entry
-    var tar_data: [BLOCK_SIZE * 4]u8 = .{0} ** (BLOCK_SIZE * 4);
+    var tar_data: [BLOCK_SIZE * 4]u8 = @splat(0);
 
     // Header block for "hello.txt", 5 bytes, regular file
     const name = "hello.txt";
@@ -540,7 +755,7 @@ test "listFiles parses minimal tar" {
     @memcpy(tar_data[148..156], &cksum_buf);
 
     // Data block: "hello"
-    @memcpy(tar_data[BLOCK_SIZE..BLOCK_SIZE + 5], "hello");
+    @memcpy(tar_data[BLOCK_SIZE .. BLOCK_SIZE + 5], "hello");
 
     // Two zero blocks for end-of-archive
     // (already zeroed)
@@ -562,10 +777,10 @@ test "listFiles parses minimal tar" {
 fn writeHeader(buf: *[BLOCK_SIZE]u8, name: []const u8, mode: []const u8, size: u64, typeflag: u8, linkname: []const u8) void {
     @memset(buf, 0);
     @memcpy(buf[0..name.len], name);
-    @memcpy(buf[100..100 + mode.len], mode);
+    @memcpy(buf[100 .. 100 + mode.len], mode);
     _ = std.fmt.bufPrint(buf[124..136], "{o:0>11}", .{size}) catch unreachable;
     buf[156] = typeflag;
-    @memcpy(buf[157..157 + linkname.len], linkname);
+    @memcpy(buf[157 .. 157 + linkname.len], linkname);
 
     // USTAR magic + version
     @memcpy(buf[257..263], "ustar\x00");
@@ -590,21 +805,23 @@ test "extractToDir - hardlink entry creates a link to an earlier regular file (i
 
     // Build a tar with: directory "bin/", regular file "bin/a" (5 bytes),
     // hardlink "bin/b" -> "bin/a", and two zero-terminator blocks.
-    var tar_data: [BLOCK_SIZE * 6]u8 = .{0} ** (BLOCK_SIZE * 6);
+    var tar_data: [BLOCK_SIZE * 6]u8 = @splat(0);
     writeHeader(tar_data[0..BLOCK_SIZE], "bin/", "0000755", 0, TypeFlag.directory, "");
-    writeHeader(tar_data[BLOCK_SIZE..BLOCK_SIZE * 2], "bin/a", "0000755", 5, TypeFlag.regular, "");
-    @memcpy(tar_data[BLOCK_SIZE * 2..BLOCK_SIZE * 2 + 5], "AAAAA");
-    writeHeader(tar_data[BLOCK_SIZE * 3..BLOCK_SIZE * 4], "bin/b", "0000755", 0, TypeFlag.hardlink, "bin/a");
+    writeHeader(tar_data[BLOCK_SIZE .. BLOCK_SIZE * 2], "bin/a", "0000755", 5, TypeFlag.regular, "");
+    @memcpy(tar_data[BLOCK_SIZE * 2 .. BLOCK_SIZE * 2 + 5], "AAAAA");
+    writeHeader(tar_data[BLOCK_SIZE * 3 .. BLOCK_SIZE * 4], "bin/b", "0000755", 0, TypeFlag.hardlink, "bin/a");
     // tar_data[BLOCK_SIZE * 4 ..] already zeroed — end-of-archive marker
 
     // Extract into a unique temp dir
     var tmp_buf: [128]u8 = undefined;
     const tmp_dir = std.fmt.bufPrint(&tmp_buf, "/tmp/nb-test-hardlink-{d}", .{std.c.getpid()}) catch unreachable;
+    // Test path: single-threaded use, the singleton is fine. The hot
+    // path uses `paths.safe_io` (initialized in main) instead.
     const lib_io = std.Io.Threaded.global_single_threaded.io();
     std.Io.Dir.createDirAbsolute(lib_io, tmp_dir, .default_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(lib_io, tmp_dir) catch {};
 
-    const files = try extractToDir(alloc, &tar_data, tmp_dir);
+    const files = try extractToDir(alloc, lib_io, &tar_data, tmp_dir);
     defer {
         for (files) |f| alloc.free(f);
         alloc.free(files);

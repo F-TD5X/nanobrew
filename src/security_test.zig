@@ -15,8 +15,6 @@ const placeholder = @import("platform/placeholder.zig");
 const store = @import("store/store.zig");
 const client = @import("api/client.zig");
 
-
-
 const postinstall = @import("build/postinstall.zig");
 const launchd = @import("services/launchd.zig");
 const sandbox = @import("build/sandbox.zig");
@@ -83,22 +81,22 @@ test "isPathSafe rejects paths with null bytes" {
 }
 test "writeJsonEscaped handles very long input" {
     // 10KB of input data — must not crash or overflow
-    const input = "A" ** 10240;
+    const input: [10240]u8 = @splat('A');
     var w: TestBufWriter = .{};
     _ = &w;
 
-    Database.writeJsonEscaped(&w, input);
+    Database.writeJsonEscaped(&w, &input);
     try testing.expectEqual(@as(usize, 10240), w.written().len);
 }
 
 test "writeJsonEscaped handles long input with many escapes" {
     // 1KB of characters that all need escaping (control chars)
-    const input = "\x01" ** 1024;
+    const input: [1024]u8 = @splat(0x01);
     // Each \x01 becomes \u0001 (6 chars), so we need 6 * 1024 = 6144 bytes
     var w: TestBufWriter = .{};
     _ = &w;
 
-    Database.writeJsonEscaped(&w, input);
+    Database.writeJsonEscaped(&w, &input);
     try testing.expectEqual(@as(usize, 6144), w.written().len);
 }
 
@@ -184,7 +182,7 @@ test "placeholder replacement does not crash on very long input" {
     const alloc = testing.allocator;
 
     // 64KB of 'A' with a placeholder at the end
-    const prefix = "A" ** (64 * 1024);
+    const prefix: [64 * 1024]u8 = @splat('A');
     const input = prefix ++ "@@HOMEBREW_PREFIX@@";
     const result = try placeholder.replacePlaceholders(alloc, input);
     defer alloc.free(result);
@@ -308,11 +306,11 @@ test "isPathSafe handles paths with special characters" {
 
 test "isPathSafe handles very long paths" {
     // A very long but safe path should not crash
-    const long_path = "a/" ** 512 ++ "file.txt";
+    const long_path = @as([1024]u8, @bitCast(@as([512][2]u8, @splat("a/".*)))) ++ "file.txt";
     try testing.expect(extract.isPathSafe(long_path));
 
     // A very long path with traversal at the end
-    const long_bad = "a/" ** 512 ++ "../etc/passwd";
+    const long_bad = @as([1024]u8, @bitCast(@as([512][2]u8, @splat("a/".*)))) ++ "../etc/passwd";
     try testing.expect(!extract.isPathSafe(long_bad));
 }
 
@@ -334,7 +332,6 @@ test "tar extraction strips setuid and setgid bits from mode" {
     try testing.expectEqual(@as(u32, 0o0755), raw_mode3 & 0o0777);
 }
 
-
 // ────────────────────────────────────────────────────────────────────────
 // 9. SHA256 validation in store paths
 // ────────────────────────────────────────────────────────────────────────
@@ -346,8 +343,6 @@ test "isValidSha256 rejects non-hex strings" {
     try testing.expect(!store.isValidSha256("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
     try testing.expect(store.isValidSha256("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
 }
-
-
 
 // 11. HTTPS enforcement for API and bottle domain env var overrides
 // ────────────────────────────────────────────────────────────────────────
@@ -446,7 +441,6 @@ const TestBufWriter = struct {
     }
 };
 
-
 test "isServiceFileSafe rejects User=root" {
     const content =
         \\[Unit]
@@ -540,8 +534,6 @@ test "sandboxedArgv prepends sandbox-exec on macOS" {
         try testing.expectEqual(original.len, result.argv.len);
     }
 }
-
-
 
 // ────────────────────────────────────────────────────────────────────────
 // 15. Formula cache hash pinning

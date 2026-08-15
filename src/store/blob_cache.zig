@@ -23,7 +23,7 @@ threadlocal var path_buf_tls: [512]u8 = undefined;
 pub fn has(sha256: []const u8) bool {
     var buf: [512]u8 = undefined;
     const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ BLOBS_DIR, sha256 }) catch return false;
-    std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), p, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(paths.safe_io, p, .{}) catch return false;
     return true;
 }
 
@@ -31,7 +31,7 @@ pub fn has(sha256: []const u8) bool {
 pub fn evict(sha256: []const u8) void {
     var buf: [512]u8 = undefined;
     const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ BLOBS_DIR, sha256 }) catch return;
-    std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), p) catch {};
+    std.Io.Dir.deleteFileAbsolute(paths.safe_io, p) catch {};
 }
 
 const testing = std.testing;

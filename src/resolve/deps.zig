@@ -8,6 +8,7 @@
 // cycle detection.
 
 const std = @import("std");
+const paths = @import("../platform/paths.zig");
 const api = @import("../api/client.zig");
 const Formula = @import("../api/formula.zig").Formula;
 
@@ -22,7 +23,7 @@ pub const DepResolver = struct {
             .alloc = alloc,
             .formulae = std.StringHashMap(Formula).init(alloc),
             .edges = std.StringHashMap([]const []const u8).init(alloc),
-            .client = std.http.Client{ .allocator = alloc, .io = std.Io.Threaded.global_single_threaded.io() },
+            .client = std.http.Client{ .allocator = alloc, .io = paths.safe_io },
         };
     }
 
@@ -38,12 +39,23 @@ pub const DepResolver = struct {
     /// Each BFS level fetches all unknown deps in parallel.
     /// Shares one HTTP client across all fetches for TLS connection reuse.
     pub fn resolve(self: *DepResolver, name: []const u8) !void {
-        if (self.formulae.contains(name) or self.formulae.contains(tapShortName(name))) return;
+        return self.resolveMany(&.{name});
+    }
 
-        // Seed the frontier with the requested name
+    /// Resolve multiple independent roots in one BFS. This exposes root metadata
+    /// fetches to the existing worker pool instead of resolving CLI arguments
+    /// serially, and deduplicates shared roots/dependencies before any I/O.
+    pub fn resolveMany(self: *DepResolver, names: []const []const u8) !void {
         var frontier: std.ArrayList([]const u8) = .empty;
         defer frontier.deinit(self.alloc);
-        try frontier.append(self.alloc, name);
+        // Membership set makes root and next-level deduplication O(1).
+        var queued_names = std.StringHashMap(void).init(self.alloc);
+        defer queued_names.deinit();
+        for (names) |name| {
+            if (self.formulae.contains(name) or self.formulae.contains(tapShortName(name))) continue;
+            const gop = try queued_names.getOrPut(name);
+            if (!gop.found_existing) try frontier.append(self.alloc, name);
+        }
 
         const client_ptr: ?*std.http.Client = if (self.client != null) &self.client.? else null;
         // BFS: each iteration fetches all frontier names in parallel
@@ -74,7 +86,7 @@ pub const DepResolver = struct {
                     fn run(ctx: WorkerCtx) void {
                         var client: std.http.Client = .{
                             .allocator = ctx.alloc_,
-                            .io = std.Io.Threaded.global_single_threaded.io(),
+                            .io = paths.safe_io,
                         };
                         defer client.deinit();
                         while (true) {
@@ -111,8 +123,9 @@ pub const DepResolver = struct {
                 }
             }
 
-            // Collect results, discover next frontier
+            // Collect results, discover next frontier.
             frontier.clearRetainingCapacity();
+            queued_names.clearRetainingCapacity();
             for (results) |maybe_f| {
                 const f = maybe_f orelse continue;
                 if (self.formulae.contains(f.name)) {
@@ -126,21 +139,33 @@ pub const DepResolver = struct {
                 // Queue any unseen deps for next BFS level
                 for (f.dependencies) |dep| {
                     if (!self.formulae.contains(dep)) {
-                        // Avoid duplicates in frontier
-                        var already_queued = false;
-                        for (frontier.items) |queued| {
-                            if (std.mem.eql(u8, queued, dep)) {
-                                already_queued = true;
-                                break;
-                            }
-                        }
-                        if (!already_queued) {
-                            frontier.append(self.alloc, dep) catch continue;
+                        const gop = queued_names.getOrPut(dep) catch continue;
+                        if (!gop.found_existing) {
+                            frontier.append(self.alloc, dep) catch {
+                                _ = queued_names.remove(dep);
+                                continue;
+                            };
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Inject an already-resolved Formula (e.g. a version-pinned bottle whose
+    /// metadata we built ourselves) and resolve its transitive dependencies.
+    /// Takes ownership of `f` — it will be freed by `deinit`. If a formula with
+    /// the same name is already present, `f` is freed and this is a no-op.
+    pub fn addResolved(self: *DepResolver, f: Formula) !void {
+        if (self.formulae.contains(f.name)) {
+            f.deinit(self.alloc);
+            return;
+        }
+        try self.formulae.put(f.name, f);
+        try self.edges.put(f.name, f.dependencies);
+        // Pull in the dependency tree (the injected node itself is now present,
+        // so resolve() below short-circuits for it and only fetches deps).
+        for (f.dependencies) |dep| try self.resolve(dep);
     }
 
     pub fn hasFormula(self: *DepResolver, name: []const u8) bool {

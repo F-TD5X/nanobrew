@@ -12,9 +12,11 @@ const native_tar = @import("native_tar.zig");
 
 const STORE_DIR = paths.STORE_DIR;
 
-/// Extract a gzipped tar blob into the store at store/<sha256>/
-pub fn extractToStore(alloc: std.mem.Allocator, blob_path: []const u8, sha256: []const u8) !void {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+/// Extract a gzipped tar blob into the store at store/<sha256>/.
+/// `io` must be threadsafe when invoked from a parallel install worker —
+/// see `native_tar.extractToDir`'s docs.
+pub fn extractToStore(alloc: std.mem.Allocator, io: std.Io, blob_path: []const u8, sha256: []const u8) !void {
+    const lib_io = io;
     if (!store.isValidSha256(sha256)) return error.InvalidSha256;
 
     var dest_buf: [512]u8 = undefined;
@@ -83,7 +85,7 @@ fn extractTarGzOwnParser(alloc: std.mem.Allocator, io: std.Io, blob_path: []cons
         try tar_bytes.appendSlice(alloc, chunk[0..n]);
     }
 
-    const files = try native_tar.extractToDir(alloc, tar_bytes.items, dest_dir);
+    const files = try native_tar.extractToDir(alloc, io, tar_bytes.items, dest_dir);
     defer {
         for (files) |f| alloc.free(f);
         alloc.free(files);
@@ -93,5 +95,6 @@ fn extractTarGzOwnParser(alloc: std.mem.Allocator, io: std.Io, blob_path: []cons
 const testing = std.testing;
 
 test "extractToStore rejects invalid sha256" {
-    try testing.expectError(error.InvalidSha256, extractToStore(testing.allocator, "/tmp/blob", "invalid"));
+    const lib_io = paths.safe_io;
+    try testing.expectError(error.InvalidSha256, extractToStore(testing.allocator, lib_io, "/tmp/blob", "invalid"));
 }

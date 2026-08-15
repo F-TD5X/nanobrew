@@ -18,50 +18,75 @@ const AR_HEADER_SIZE = 60;
 const Compression = enum { none, gzip, xz, zstd };
 
 /// Extract a .deb to a destination directory.
-pub fn extractDeb(alloc: std.mem.Allocator, deb_path: []const u8, dest_dir: []const u8) !void {
-    const tar_data = try decompressDataTar(alloc, deb_path);
+/// `io` must be threadsafe when invoked from a parallel worker pool —
+/// see `native_tar.extractToDir` for the full rationale.
+pub fn extractDeb(alloc: std.mem.Allocator, io: std.Io, deb_path: []const u8, dest_dir: []const u8) !void {
+    const tar_data = try decompressDataTar(alloc, io, deb_path);
     defer alloc.free(tar_data);
 
-    const files = native_tar.extractToDir(alloc, tar_data, dest_dir) catch return error.ExtractFailed;
+    const files = native_tar.extractToDir(alloc, io, tar_data, dest_dir) catch return error.ExtractFailed;
     for (files) |f| alloc.free(f);
     alloc.free(files);
 }
 
 /// Extract a .deb directly to / (for system packages in Docker).
-pub fn extractDebToPrefix(alloc: std.mem.Allocator, deb_path: []const u8) !void {
-    const tar_data = try decompressDataTar(alloc, deb_path);
+pub fn extractDebToPrefix(alloc: std.mem.Allocator, io: std.Io, deb_path: []const u8) !void {
+    const tar_data = try decompressDataTar(alloc, io, deb_path);
     defer alloc.free(tar_data);
 
-    const files = native_tar.extractToDir(alloc, tar_data, "/") catch return error.ExtractFailed;
+    const files = native_tar.extractToDir(alloc, io, tar_data, "/") catch return error.ExtractFailed;
     for (files) |f| alloc.free(f);
     alloc.free(files);
 }
 
 /// Extract a .deb directly to / and return the list of installed file paths.
-/// Caller owns the returned slice and its strings.
-pub fn extractDebToPrefixWithFiles(alloc: std.mem.Allocator, deb_path: []const u8) ![][]const u8 {
-    const tar_data = try decompressDataTar(alloc, deb_path);
+/// Caller owns the returned slice and its strings. Paths are absolute
+/// (prefixed with `/`) so `nb remove --deb` doesn't depend on the caller's
+/// cwd — `native_tar.extractToDir`'s isPathSafe rejects absolute tar
+/// entries, so the entries it returns are always relative-to-dest_dir
+/// (`usr/bin/hello`) and `std.Io.Dir.deleteFileAbsolute` against those
+/// would resolve relative to cwd at remove time. Storing absolute paths
+/// in the DB makes the file list a stable, cwd-independent record.
+pub fn extractDebToPrefixWithFiles(alloc: std.mem.Allocator, io: std.Io, deb_path: []const u8) ![][]const u8 {
+    const tar_data = try decompressDataTar(alloc, io, deb_path);
     defer alloc.free(tar_data);
 
-    return native_tar.extractToDir(alloc, tar_data, "/") catch return error.ExtractFailed;
+    const relative = native_tar.extractToDir(alloc, io, tar_data, "/") catch return error.ExtractFailed;
+    errdefer {
+        for (relative) |f| alloc.free(f);
+        alloc.free(relative);
+    }
+
+    // Re-allocate each entry with a leading "/" prefix and free the original.
+    for (relative, 0..) |entry, i| {
+        const absolute = std.fmt.allocPrint(alloc, "/{s}", .{entry}) catch return error.OutOfMemory;
+        alloc.free(entry);
+        relative[i] = absolute;
+    }
+    return relative;
 }
 
 /// Extract the control.tar from a .deb to a temp directory and run postinst if present.
 /// Non-fatal — returns void and prints warnings on failure.
 /// If skip_postinst is true, logs a message and skips execution.
-pub fn runPostinst(alloc: std.mem.Allocator, deb_path: []const u8, pkg_name: []const u8, skip_postinst: bool) void {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+pub fn runPostinst(alloc: std.mem.Allocator, io: std.Io, deb_path: []const u8, pkg_name: []const u8, skip_postinst: bool) void {
+    // Thread the caller's io rather than paths.safe_io.
+    // Zig 0.16's std.process.run rejects the unsynchronized singleton — under load
+    // it surfaces as error.OutOfMemory (and sometimes error.CopyFailed, see #276) when
+    // pipe-read aggregation tries to wait on the singleton's executor that has no
+    // worker threads available. Using the main thread's io fixes both classes.
+    const lib_io = io;
 
     const printErr = struct {
-        fn f(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+        fn f(p_io: std.Io, comptime fmt: []const u8, args: anytype) void {
             const msg = std.fmt.allocPrint(std.heap.smp_allocator, fmt, args) catch return;
             defer std.heap.smp_allocator.free(msg);
-            std.Io.File.stderr().writeStreamingAll(io, msg) catch {};
+            std.Io.File.stderr().writeStreamingAll(p_io, msg) catch {};
         }
     }.f;
 
     // Decompress control.tar in memory
-    const ctrl_tar_data = decompressControlTar(alloc, deb_path) catch return;
+    const ctrl_tar_data = decompressControlTar(alloc, lib_io, deb_path) catch return;
     defer alloc.free(ctrl_tar_data);
 
     // Extract control.tar to temp directory using native tar
@@ -74,7 +99,7 @@ pub fn runPostinst(alloc: std.mem.Allocator, deb_path: []const u8, pkg_name: []c
     std.Io.Dir.createDirAbsolute(lib_io, ctrl_dir, .default_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(lib_io, ctrl_dir) catch {};
 
-    const files = native_tar.extractToDir(alloc, ctrl_tar_data, ctrl_dir) catch return;
+    const files = native_tar.extractToDir(alloc, lib_io, ctrl_tar_data, ctrl_dir) catch return;
     for (files) |f| alloc.free(f);
     alloc.free(files);
 
@@ -94,18 +119,37 @@ pub fn runPostinst(alloc: std.mem.Allocator, deb_path: []const u8, pkg_name: []c
 
         printErr(lib_io, "    running: postinst for {s}\n", .{pkg_name});
 
-        _ = std.process.run(alloc, lib_io, .{
+        if (std.process.run(alloc, lib_io, .{
             .argv = &.{ "chmod", "+x", postinst_path },
             .stdout_limit = .limited(256),
             .stderr_limit = .limited(256),
-        }) catch {};
+        })) |chmod_result| {
+            alloc.free(chmod_result.stdout);
+            alloc.free(chmod_result.stderr);
+        } else |_| {}
+
+        // Postinst scripts in real Debian packages routinely shell out to
+        // `update-alternatives`, `ldconfig`, `systemctl`, etc. — without an
+        // explicit PATH the spawned shell sees whatever `nb` was launched
+        // with, which on container shells like Ubuntu's slim init is just
+        // /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        // anyway, but on minimal Alpine/musl init or a sudo-stripped
+        // environment it can be empty and the script silently fails to
+        // find its tools. Force a sane sysadmin PATH plus DEBIAN_FRONTEND
+        // so the scripts don't try to launch interactive prompts.
+        var env_map = std.process.Environ.Map.init(alloc);
+        defer env_map.deinit();
+        env_map.put("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") catch {};
+        env_map.put("DEBIAN_FRONTEND", "noninteractive") catch {};
+        env_map.put("HOME", "/root") catch {};
 
         const run_result = std.process.run(alloc, lib_io, .{
             .argv = &.{ postinst_path, "configure" },
+            .environ_map = &env_map,
             .stdout_limit = .limited(1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
-        }) catch {
-            printErr(lib_io, "    warning: postinst failed for {s}\n", .{pkg_name});
+        }) catch |err| {
+            printErr(lib_io, "    warning: postinst failed for {s}: {s}\n", .{ pkg_name, @errorName(err) });
             return;
         };
         alloc.free(run_result.stdout);
@@ -141,11 +185,11 @@ pub fn isPathSafe(path: []const u8) bool {
 
 /// List files inside a tar archive (in memory, already decompressed).
 /// Rejects paths with traversal components ("..") for safety.
-pub fn listTarFiles(alloc: std.mem.Allocator, tar_data: []const u8) ![][]const u8 {
+pub fn listTarFiles(alloc: std.mem.Allocator, io: std.Io, tar_data: []const u8) ![][]const u8 {
     const result = native_tar.listFiles(alloc, tar_data) catch return error.ListFailed;
 
     if (result.rejected > 0) {
-        const lib_io = std.Io.Threaded.global_single_threaded.io();
+        const lib_io = io;
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "    warning: rejected {d} unsafe paths from archive\n", .{result.rejected}) catch msg_buf[0..0];
         std.Io.File.stderr().writeStreamingAll(lib_io, msg) catch {};
@@ -156,8 +200,8 @@ pub fn listTarFiles(alloc: std.mem.Allocator, tar_data: []const u8) ![][]const u
 
 /// Decompress the data.tar member from a .deb into memory.
 /// Returns the plain tar data. Caller owns the returned slice.
-fn decompressDataTar(alloc: std.mem.Allocator, deb_path: []const u8) ![]u8 {
-    const member = try readArMember(alloc, deb_path, "data.tar");
+fn decompressDataTar(alloc: std.mem.Allocator, io: std.Io, deb_path: []const u8) ![]u8 {
+    const member = try readArMember(alloc, io, deb_path, "data.tar");
     defer alloc.free(member.data);
 
     return switch (member.compression) {
@@ -167,14 +211,14 @@ fn decompressDataTar(alloc: std.mem.Allocator, deb_path: []const u8) ![]u8 {
         },
         .zstd => try decompressZstd(alloc, member.data),
         .gzip => try decompressGzip(alloc, member.data),
-        .xz => try decompressXzFallback(alloc, deb_path, "data.tar"),
+        .xz => try decompressXz(alloc, member.data),
     };
 }
 
 /// Decompress the control.tar member from a .deb into memory.
 /// Returns the plain tar data. Caller owns the returned slice.
-fn decompressControlTar(alloc: std.mem.Allocator, deb_path: []const u8) ![]u8 {
-    const member = try readArMember(alloc, deb_path, "control.tar");
+fn decompressControlTar(alloc: std.mem.Allocator, io: std.Io, deb_path: []const u8) ![]u8 {
+    const member = try readArMember(alloc, io, deb_path, "control.tar");
     defer alloc.free(member.data);
 
     return switch (member.compression) {
@@ -184,7 +228,7 @@ fn decompressControlTar(alloc: std.mem.Allocator, deb_path: []const u8) ![]u8 {
         },
         .zstd => try decompressZstd(alloc, member.data),
         .gzip => try decompressGzip(alloc, member.data),
-        .xz => try decompressXzFallback(alloc, deb_path, "control.tar"),
+        .xz => try decompressXz(alloc, member.data),
     };
 }
 
@@ -194,8 +238,9 @@ const ArMember = struct {
 };
 
 /// Read an ar archive member whose name starts with `prefix` into memory.
-fn readArMember(alloc: std.mem.Allocator, ar_path: []const u8, prefix: []const u8) !ArMember {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
+/// `io` must be threadsafe when invoked from a parallel worker.
+fn readArMember(alloc: std.mem.Allocator, io: std.Io, ar_path: []const u8, prefix: []const u8) !ArMember {
+    const lib_io = io;
     const file = try std.Io.Dir.openFileAbsolute(lib_io, ar_path, .{});
     defer file.close(lib_io);
 
@@ -217,6 +262,12 @@ fn readArMember(alloc: std.mem.Allocator, ar_path: []const u8, prefix: []const u
         const member_name = std.mem.trim(u8, header[0..16], " /");
         const size_str = std.mem.trim(u8, header[48..58], " ");
         const member_size = std.fmt.parseInt(u64, size_str, 10) catch break;
+
+        // Reject hostile member sizes. The ar size field is decimal text up
+        // to 10 chars wide, so a malicious .deb could claim ~1e10 bytes; the
+        // skip computation below adds 1 for odd sizes which would wrap a u64
+        // at maxInt back to 0 and trap the loop. Cap well below that.
+        if (member_size > max_member_size) break;
 
         if (std.mem.startsWith(u8, member_name, prefix)) {
             const compression: Compression = if (std.mem.endsWith(u8, member_name, ".zst"))
@@ -247,13 +298,18 @@ fn readArMember(alloc: std.mem.Allocator, ar_path: []const u8, prefix: []const u
             return .{ .data = data, .compression = compression };
         }
 
-        // Skip to next member (padded to even byte boundary)
+        // Skip to next member (padded to even byte boundary). Capped above
+        // so `member_size + 1` cannot wrap.
         const skip = member_size + (member_size % 2);
         offset += skip;
     }
 
     return error.MemberNotFound;
 }
+
+/// Hard ceiling on a single ar member's claimed size. Anything larger is
+/// treated as a malformed/hostile .deb to keep the parser bounded.
+const max_member_size: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Decompress zstd data in memory using Zig's native zstd decompressor.
 const max_decompressed_size: usize = 1 << 30;
@@ -264,71 +320,56 @@ fn decompressZstd(alloc: std.mem.Allocator, compressed: []const u8) ![]u8 {
     defer alloc.free(window_buf);
 
     var zstd_stream: std.compress.zstd.Decompress = .init(&in, window_buf, .{});
-    var out: std.Io.Writer.Allocating = .init(alloc);
-
-    _ = zstd_stream.reader.streamRemaining(&out.writer) catch return error.DecompressFailed;
-
-    if (out.written().len > max_decompressed_size) return error.DecompressionBombDetected;
-    return out.toOwnedSlice() catch return error.OutOfMemory;
+    return streamBounded(alloc, &zstd_stream.reader, max_decompressed_size);
 }
 
 /// Decompress gzip data in memory using Zig's native deflate decompressor.
 pub fn decompressGzip(alloc: std.mem.Allocator, compressed: []const u8) ![]u8 {
     var in: std.Io.Reader = .fixed(compressed);
-    var decomp: std.compress.flate.Decompress = .init(&in, .gzip, &.{});
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    _ = decomp.reader.streamRemaining(&out.writer) catch return error.DecompressFailed;
-
-    if (out.written().len > max_decompressed_size) return error.DecompressionBombDetected;
-    return out.toOwnedSlice() catch return error.OutOfMemory;
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decomp: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+    return streamBounded(alloc, &decomp.reader, max_decompressed_size);
 }
 
-/// For xz, fall back to the system xz command since Zig's xz may need LZMA2.
-fn decompressXzFallback(alloc: std.mem.Allocator, deb_path: []const u8, member_prefix: []const u8) ![]u8 {
-    const lib_io = std.Io.Threaded.global_single_threaded.io();
-    var member_buf: [128]u8 = undefined;
-    const member_name = std.fmt.bufPrint(&member_buf, "{s}.xz", .{member_prefix}) catch
-        return error.PathTooLong;
+/// Drain `reader` into a freshly allocated slice, capping at `max` bytes.
+/// Returns `error.DecompressionBombDetected` *during* the stream so an
+/// attacker cannot force us to materialize a multi-gigabyte buffer before
+/// we notice. Caller owns the returned slice.
+fn streamBounded(alloc: std.mem.Allocator, reader: *std.Io.Reader, max: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
 
-    const ar_result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "ar", "p", deb_path, member_name },
-        .stdout_limit = .limited(512 * 1024 * 1024),
-        .stderr_limit = .limited(4096),
-    }) catch return error.DecompressFailed;
-    alloc.free(ar_result.stderr);
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = reader.readSliceShort(&chunk) catch return error.DecompressFailed;
+        if (n == 0) break;
+        if (out.items.len + n > max) return error.DecompressionBombDetected;
+        try out.appendSlice(alloc, chunk[0..n]);
+    }
+    return out.toOwnedSlice(alloc) catch error.OutOfMemory;
+}
 
-    if (switch (ar_result.term) { .exited => |c| c != 0, else => true }) {
-        alloc.free(ar_result.stdout);
+/// Decompress xz data in memory using Zig's native xz/LZMA2 decompressor.
+/// This used to shell out to the system `ar` and `xz` binaries, but `ar` is
+/// not pre-installed on minimal images (e.g. ubuntu:24.04) and the singleton
+/// io path was hitting the same OOM/CopyFailed issues as the postinst path.
+fn decompressXz(alloc: std.mem.Allocator, compressed: []const u8) ![]u8 {
+    var in: std.Io.Reader = .fixed(compressed);
+    // std.compress.xz.Decompress takes ownership of this buffer and may
+    // realloc it via `alloc` once the decompressed payload exceeds the
+    // initial size. We must release it through `decomp.deinit()` — calling
+    // `alloc.free(buffer)` on the original slice would free a pointer that
+    // Decompress has already realloc'd away, corrupting the gpa free-list
+    // and causing a SIGSEGV on the next allocation in the same process
+    // (only reproducible on multi-package reinstalls where the .deb cache
+    // is warm and parallel extract workers fire allocations back-to-back).
+    const buffer = try alloc.alloc(u8, 64 * 1024);
+    var decomp = std.compress.xz.Decompress.init(&in, alloc, buffer) catch {
+        alloc.free(buffer);
         return error.DecompressFailed;
-    }
-
-    var xz_buf: [512]u8 = undefined;
-    const xz_tmp = std.fmt.bufPrint(&xz_buf, "{s}/xz_input.tmp", .{paths.TMP_DIR}) catch
-        return error.PathTooLong;
-
-    {
-        const tmp_file = std.Io.Dir.createFileAbsolute(lib_io, xz_tmp, .{}) catch return error.DecompressFailed;
-        tmp_file.writeStreamingAll(lib_io, ar_result.stdout) catch {
-            tmp_file.close(lib_io);
-            return error.DecompressFailed;
-        };
-        tmp_file.close(lib_io);
-    }
-    alloc.free(ar_result.stdout);
-    defer std.Io.Dir.deleteFileAbsolute(lib_io, xz_tmp) catch {};
-
-    const xz_result = std.process.run(alloc, lib_io, .{
-        .argv = &.{ "xz", "-d", "--stdout", xz_tmp },
-        .stdout_limit = .limited(512 * 1024 * 1024),
-        .stderr_limit = .limited(4096),
-    }) catch return error.DecompressFailed;
-    alloc.free(xz_result.stderr);
-
-    if (switch (xz_result.term) { .exited => |c| c != 0, else => true }) {
-        alloc.free(xz_result.stdout);
-        return error.DecompressFailed;
-    }
-    return xz_result.stdout;
+    };
+    defer decomp.deinit();
+    return streamBounded(alloc, &decomp.reader, max_decompressed_size);
 }
 
 const testing = std.testing;
@@ -408,7 +449,7 @@ test "isPathSafe allows normal deb paths" {
     try testing.expect(isPathSafe("usr/bin/program"));
 }
 
-test "xz fallback does not use shell interpolation" {
-    const T = @TypeOf(decompressXzFallback);
+test "xz decompress is a pure-Zig in-memory routine" {
+    const T = @TypeOf(decompressXz);
     _ = T;
 }

@@ -11,6 +11,7 @@ const fetch = @import("../net/fetch.zig");
 
 const sandbox = @import("sandbox.zig");
 const formula_cache = @import("formula_cache.zig");
+const certs = @import("certs.zig");
 
 pub const ParsedCommand = struct {
     argv: []const []const u8,
@@ -21,29 +22,37 @@ pub const ParsedCommand = struct {
     }
 };
 
-pub fn runPostInstall(alloc: std.mem.Allocator, formula: Formula) !void {
-    const _io = std.Io.Threaded.global_single_threaded.io();
+pub fn runPostInstall(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !void {
+    const lib_io = io;
+
+    // Native post-install steps first: things Homebrew does in Ruby that
+    // the heuristic script parser below can't execute (install_symlink,
+    // keychain extraction). Runs even when post_install_defined is false
+    // or the formula source can't be fetched — TLS trust wiring must not
+    // depend on a network round trip to raw.githubusercontent.com.
+    certs.nativePostInstall(lib_io, formula.name);
 
     // Execute post_install if defined
     if (formula.post_install_defined) {
-        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "==> Running post-install for {s}...\n", .{formula.name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stdout().writeStreamingAll(_io, _tmp) catch {}; });
-        runPostInstallScript(alloc, formula) catch |err| {
-            ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: {s}: post-install script failed: {}\n", .{ formula.name, err }) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(_io, _tmp) catch {}; });
+        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "==> Running post-install for {s}...\n", .{formula.name}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stdout().writeStreamingAll(lib_io, _tmp) catch {}; });
+        runPostInstallScript(alloc, lib_io, formula) catch |err| {
+            ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: {s}: post-install script failed: {}\n", .{ formula.name, err }) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(lib_io, _tmp) catch {}; });
         };
     }
 
     // Display caveats
     if (formula.caveats.len > 0) {
-        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "==> Caveats\n{s}", .{formula.caveats}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stdout().writeStreamingAll(_io, _tmp) catch {}; });
+        ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "==> Caveats\n{s}", .{formula.caveats}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stdout().writeStreamingAll(lib_io, _tmp) catch {}; });
         // Ensure trailing newline
         if (formula.caveats[formula.caveats.len - 1] != '\n') {
-            ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "\n", .{}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stdout().writeStreamingAll(_io, _tmp) catch {}; });
+            ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "\n", .{}) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stdout().writeStreamingAll(lib_io, _tmp) catch {}; });
         }
     }
 }
 
-fn runPostInstallScript(alloc: std.mem.Allocator, formula: Formula) !void {
-    const _io = std.Io.Threaded.global_single_threaded.io();
+fn runPostInstallScript(alloc: std.mem.Allocator, io: std.Io, formula: Formula) !void {
+    const lib_io = io;
+
     // Compute effective version early (needed for cache key)
     var ver_buf: [128]u8 = undefined;
     const eff_ver = formula.effectiveVersion(&ver_buf);
@@ -76,13 +85,13 @@ fn runPostInstallScript(alloc: std.mem.Allocator, formula: Formula) !void {
 
         if (parseRubyCommand(alloc, trimmed, formula.name, keg_path)) |cmd| {
             defer cmd.deinit(alloc);
-            const result = std.process.run(alloc, _io, .{
+            const result = std.process.run(alloc, lib_io, .{
                 .argv = cmd.argv,
             }) catch continue;
             alloc.free(result.stdout);
             alloc.free(result.stderr);
             if (result.term == .exited and result.term.exited != 0) {
-                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: {s}: post-install command failed (exit {d})\n", .{ formula.name, result.term.exited }) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(_io, _tmp) catch {}; });
+                ({ const _tmp = std.fmt.allocPrint(std.heap.smp_allocator, "nb: {s}: post-install command failed (exit {d})\n", .{ formula.name, result.term.exited }) catch ""; defer std.heap.smp_allocator.free(_tmp); std.Io.File.stderr().writeStreamingAll(lib_io, _tmp) catch {}; });
             }
         }
     }

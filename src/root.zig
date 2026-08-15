@@ -18,6 +18,7 @@
 
 pub const api_client = @import("api/client.zig");
 pub const formula = @import("api/formula.zig");
+pub const ghcr = @import("api/ghcr.zig");
 pub const deps = @import("resolve/deps.zig");
 pub const downloader = @import("net/downloader.zig");
 pub const fetch = @import("net/fetch.zig");
@@ -28,15 +29,19 @@ pub const blob_cache = @import("store/blob_cache.zig");
 pub const store = @import("store/store.zig");
 pub const cellar = @import("cellar/cellar.zig");
 pub const linker = @import("linker/linker.zig");
+pub const purge = @import("platform/purge.zig");
 pub const database = @import("db/database.zig");
 pub const cask = @import("api/cask.zig");
 pub const cask_installer = @import("cask/install.zig");
 pub const source_builder = @import("build/source.zig");
 pub const postinstall = @import("build/postinstall.zig");
+pub const certs = @import("build/certs.zig");
 pub const search_api = @import("api/search.zig");
+pub const bulk_versions = @import("api/bulk_versions.zig");
 pub const tap = @import("api/tap.zig");
 pub const services = @import("services/services.zig");
 pub const version = @import("version.zig");
+pub const trust_probe = @import("trust/probe.zig");
 pub const upstream_registry = @import("upstream/registry.zig");
 pub const upstream_github = @import("upstream/github.zig");
 
@@ -62,6 +67,7 @@ pub const security_test = @import("security_test.zig");
 comptime {
     _ = api_client;
     _ = formula;
+    _ = ghcr;
     _ = cask;
     _ = cask_installer;
     _ = tap;
@@ -71,11 +77,16 @@ comptime {
     _ = deb_extract;
     _ = deb_distro;
     _ = version;
+    _ = trust_probe;
     _ = upstream_registry;
     _ = upstream_github;
+    _ = search_api;
+    _ = bulk_versions;
     _ = telemetry;
     _ = tar;
     _ = native_tar;
+    _ = certs;
+    _ = linker;
     _ = @import("platform/copy.zig");
     _ = @import("platform/placeholder.zig");
     _ = security_test;

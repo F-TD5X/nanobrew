@@ -14,15 +14,18 @@ if [[ ! -f "$FORMULA" ]]; then
   exit 1
 fi
 
-VERSION=$(grep -E '^\s*version\s' "$FORMULA" | sed -E 's/.*[\"'"'"']([^\"'"'"']+)[\"'"'"'].*/\1/')
-ARM_URL=$(grep 'nb-arm64-apple-darwin.tar.gz' "$FORMULA" | grep url | sed -E 's/.*[\"'"'"']([^\"'"'"']+)[\"'"'"'].*/\1/')
-X86_URL=$(grep 'nb-x86_64-apple-darwin.tar.gz' "$FORMULA" | grep url | sed -E 's/.*[\"'"'"']([^\"'"'"']+)[\"'"'"'].*/\1/')
-ARM_SHA=$(awk '/nb-arm64-apple-darwin\.tar\.gz/{p=1} p&&/sha256/{gsub(/"/,"",$2); print $2; exit}' "$FORMULA" 2>/dev/null || true)
-# Fallback: line after arm url block
-if [[ -z "${ARM_SHA:-}" ]]; then
-  ARM_SHA=$(grep -A3 'nb-arm64-apple-darwin.tar.gz' "$FORMULA" | grep sha256 | head -1 | sed -E 's/.*sha256[[:space:]]+[\"'"'"']([^\"'"'"']+)[\"'"'"'].*/\1/')
+strip_quotes() { tr -d "\"'"; }
+
+VERSION=$(awk '/^[[:space:]]*version[[:space:]]/ { print $2; exit }' "$FORMULA" | strip_quotes)
+ARM_URL=$(awk '/nb-arm64-apple-darwin\.tar\.gz/ && /url/ { print $2; exit }' "$FORMULA" | strip_quotes)
+X86_URL=$(awk '/nb-x86_64-apple-darwin\.tar\.gz/ && /url/ { print $2; exit }' "$FORMULA" | strip_quotes)
+ARM_SHA=$(awk '/nb-arm64-apple-darwin\.tar\.gz/ { p=1; next } p && /^[[:space:]]*sha256[[:space:]]/ { print $2; exit }' "$FORMULA" | strip_quotes)
+X86_SHA=$(awk '/nb-x86_64-apple-darwin\.tar\.gz/ { p=1; next } p && /^[[:space:]]*sha256[[:space:]]/ { print $2; exit }' "$FORMULA" | strip_quotes)
+
+if [[ -z "$VERSION" || -z "$ARM_URL" || -z "$X86_URL" || -z "$ARM_SHA" || -z "$X86_SHA" ]]; then
+  echo "FAIL: could not parse version, URLs, or SHA256s from $FORMULA" >&2
+  exit 1
 fi
-X86_SHA=$(grep -A3 'nb-x86_64-apple-darwin.tar.gz' "$FORMULA" | grep sha256 | head -1 | sed -E 's/.*sha256[[:space:]]+[\"'"'"']([^\"'"'"']+)[\"'"'"'].*/\1/')
 
 echo "Formula: $FORMULA"
 echo "version=$VERSION"
@@ -33,7 +36,7 @@ check_one() {
   local tmp
   tmp="$(mktemp)"
   echo "Checking $name ..."
-  if ! curl -fsSL -o "$tmp" "$url"; then
+  if ! curl -gfsSL -o "$tmp" "$url"; then
     echo "  FAIL: could not download $url" >&2
     rm -f "$tmp"
     return 1
