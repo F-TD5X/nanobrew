@@ -4,6 +4,14 @@ All notable changes to nanobrew are documented here.
 
 ## [Unreleased]
 
+## [0.1.208] - 2026-08-15
+
+### Added
+- **`nb --deb` honours the system APT configuration** (first half of #245): `install --deb`, `upgrade --deb`, and the deb section of `outdated` now parse `/etc/apt/sources.list` and `/etc/apt/sources.list.d/*` (both one-line lists with `[arch=... signed-by=...]` option blocks and deb822 `.sources` stanzas, including `Enabled: no` and the cartesian product of multi-valued `URIs:`/`Suites:`), filter rows by the host architecture, and fetch every discovered index. Debian/Ubuntu derivatives stop asking the wrong upstream archive for their codename, and third-party repositories (Docker, NodeSource, PPAs, internal mirrors) become installable. Every parsed package is tagged with the mirror it came from so downloads route to the correct repository when several sources merge into one index, and the on-disk index cache format is versioned (NBIX v3) so pre-existing caches rebuild instead of misparsing. `--repo <spec>` still overrides discovery, and systems with no usable APT config keep the distro-default fallback. Verified live on Debian 13: the stock deb822 config plus a legacy `docker.list` produced four sources and `nb install --deb docker-ce-cli` installed 29.7.2 from download.docker.com, a package the Debian archive does not carry. The seven parser tests the contribution shipped were silently excluded from the suite (imported but never referenced in the test-discovery block); they are wired into the all-in-one suite and a new `test-deb-sources` per-module step. (#267)
+
+### Performance
+- **Linux installs no longer fork `cp` per package**: the `cellar.materialize` copy fallback is an in-process walker that tries `ioctl(FICLONE)` per file (instant copy-on-write on btrfs/xfs, exactly what `cp --reflink=auto` does) and falls back to `copy_file_range`-backed `copyFile`, recreating directories, symlinks, and permission bits; any walker failure still falls back to the historical `cp` subprocess so exotic filesystems never regress. Verified on Debian 13 with `/usr/bin/cp` removed from the box: installs succeed and every keg is byte-, permission-, and symlink-identical to its store source. (#266)
+
 ## [0.1.207] - 2026-08-15
 
 ### Fixed
